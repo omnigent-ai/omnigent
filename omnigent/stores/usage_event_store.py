@@ -28,6 +28,8 @@ EVENT_PROPERTIES: dict[str, frozenset[str]] = {
     "role.updated": frozenset({"fields"}),
     "role.deleted": frozenset(),
     "board.read": frozenset({"action"}),
+    # One priced turn's cost in micro-dollars, so spend can be split by when it happened.
+    "cost.recorded": frozenset({"micros"}),
 }
 #: Role fields an edit may name; their values are never stored.
 ROLE_FIELDS = frozenset({"name", "instructions", "agent_id", "model", "effort", "scope"})
@@ -65,6 +67,9 @@ def clean_properties(name: str, props: dict[str, Any] | None) -> dict[str, Any] 
                 cleaned[key] = fields
         elif key == "action" and value in BOARD_READ_ACTIONS:
             cleaned[key] = value
+        elif key == "micros" and isinstance(value, int) and not isinstance(value, bool):
+            if value >= 0:
+                cleaned[key] = value
     return cleaned or None
 
 

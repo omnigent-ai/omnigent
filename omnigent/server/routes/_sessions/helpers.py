@@ -2319,6 +2319,17 @@ def _record_daily_cost(
     from omnigent.db.utils import now_epoch
 
     conversation_store.add_session_daily_cost(conv.id, _utc_day(now_epoch()), delta_usd)
+    from omnigent.server.project_status_spend import usd_to_micros
+    from omnigent.server.usage_events import record_turn_cost
+
+    # The turn's own cost event lets per-ticket spend be split by when it happened.
+    record_turn_cost(
+        conversation_store,
+        conv.id,
+        conv.root_conversation_id or conv.id,
+        conv.project_id,
+        usd_to_micros(delta_usd),
+    )
     owner = conversation_store.get_session_owner_authority(conv.id)
     if owner is None and conv.root_conversation_id != conv.id:
         # Sub-agent: no direct owner grant — fall back to the root session's

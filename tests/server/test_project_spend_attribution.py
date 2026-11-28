@@ -209,3 +209,107 @@ async def test_telemetry_credits_a_helper_to_the_role_that_started_it(
     assert spend["total_usd"] == 3.0
     role = (await project_client.get(f"{path}/telemetry", params={"identity_id": pm["id"]})).json()
     assert role["throughput"]["spend_usd"] == 3.0
+
+
+def test_a_turn_keeps_its_ticket_when_the_session_later_works_on_another() -> None:
+    noon = NOON
+    rows = [("s", DAY, 3_000_000, "identity:pm")]
+    turns = [("s", noon + 10, 1_000_000), ("s", noon + 20, 2_000_000)]
+    acted_a = [("A", "s", noon)]
+    first = spend_by_ticket(rows, {}, acted_a, [], {}, {}, turns=turns)
+    assert {row["ticket_id"]: row["spend_usd"] for row in first["tickets"]} == {"A": 3.0}
+    # No new spend, but the session then works on B and is linked to C.
+    later = spend_by_ticket(
+        rows, {}, [*acted_a, ("B", "s", noon + 30)], [("C", "s", noon + 40)], {}, {}, turns=turns
+    )
+    assert {row["ticket_id"]: row["spend_usd"] for row in later["tickets"]} == {"A": 3.0}
+    # The day-level split it replaces would have moved half of A's spend to B.
+    old = spend_by_ticket(rows, {}, [*acted_a, ("B", "s", noon + 30)], [], {}, {})
+    assert {row["ticket_id"]: row["spend_usd"] for row in old["tickets"]} == {"A": 1.5, "B": 1.5}
+
+
+def test_turn_attribution_adds_up_with_unlogged_spend_and_open_links() -> None:
+    noon = NOON
+    rows = [("s", DAY, 5_000_000, "identity:pm"), ("t", DAY, 1_000_000, "identity:pm")]
+    turns = [
+        # Before any activity: the open linked ticket L takes it.
+        ("s", noon - 100, 1_000_000),
+        # After acting on A.
+        ("s", noon + 10, 2_000_000),
+        # Logged more than the day row recorded: scaled down to fit.
+        ("t", noon, 1_500_000),
+    ]
+    links = [("L", "s", noon - 3600), ("D", "s", noon - 3600)]
+    # D finished before the first turn, so it isn't open then.
+    finished = {"D": noon - 1800}
+    split = spend_by_ticket(rows, {}, [("A", "s", noon)], links, finished, {}, turns=turns)
+    by_ticket = {row["ticket_id"]: row["spend_usd"] for row in split["tickets"]}
+    # s: L $1 and A $2 from turns; its $2 not logged goes by the day rule (A).
+    assert by_ticket == {"A": 4.0, "L": 1.0}
+    # t: $1 scaled from $1.50 logged, no activity or links, so unattributed.
+    assert (split["attributed_usd"], split["unattributed_usd"]) == (5.0, 1.0)
+
+
+def test_a_priced_turn_logs_its_cost_in_the_usage_log(db_uri: str) -> None:
+    from omnigent.server import usage_events
+    from omnigent.server.routes._sessions.helpers import _record_daily_cost
+    from omnigent.stores.usage_event_store import UsageEventStore
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    project_id = uuid4().hex
+    root = conversations.create_conversation(project_id=project_id)
+    child = conversations.create_conversation(parent_conversation_id=root.id)
+    store = UsageEventStore(db_uri)
+    usage_events.set_turn_cost_store(store)
+    try:
+        _record_daily_cost(child, 0.25, conversations)
+        usage_events.record_turn_cost(conversations, child.id, root.id, None, 1).result(timeout=5)
+    finally:
+        usage_events.set_turn_cost_store(None)
+    events = store.events(project_id, since_epoch=None, names=("cost.recorded",))
+    # A sub-agent's turn is filed under its root session's project.
+    assert [(event.session_id, event.props) for event in events] == [
+        (child.id, {"micros": 250_000}),
+        (child.id, {"micros": 1}),
+    ]
+
+
+def test_recording_a_turn_cost_never_blocks_or_fails_the_turn(db_uri: str) -> None:
+    import threading
+    import time
+
+    from omnigent.server import usage_events
+    from omnigent.server.routes._sessions.helpers import _record_daily_cost
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    project_id = uuid4().hex
+    root = conversations.create_conversation(project_id=project_id)
+    child = conversations.create_conversation(parent_conversation_id=root.id)
+    release = threading.Event()
+    written: list[dict] = []
+
+    class SlowThenFailingStore:
+        def record(self, name: str, **fields: object) -> None:
+            release.wait(5)
+            written.append({"name": name, **fields})
+            raise RuntimeError("usage log unavailable")
+
+    usage_events.set_turn_cost_store(SlowThenFailingStore())
+    try:
+        started = time.monotonic()
+        _record_daily_cost(child, 0.25, conversations)
+        assert time.monotonic() - started < 1.0  # The slow write didn't hold the turn.
+        future = usage_events.record_turn_cost(conversations, child.id, root.id, None, 250_000)
+        release.set()
+        assert future.result(timeout=5) is None  # The failure was logged and swallowed.
+    finally:
+        usage_events.set_turn_cost_store(None)
+    # A sub-agent's turn is filed under its root session's project.
+    assert written[0] == {
+        "name": "cost.recorded",
+        "project_id": project_id,
+        "session_id": child.id,
+        "props": {"micros": 250_000},
+        "created_at": written[0]["created_at"],
+    }
+    assert usage_events.record_turn_cost(conversations, child.id, root.id, None, 1) is None

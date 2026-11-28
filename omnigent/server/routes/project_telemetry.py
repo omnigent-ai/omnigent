@@ -58,7 +58,7 @@ from omnigent.server.routes.project_kpis import (
     human_activity,
 )
 from omnigent.server.routes.project_status import _measure, move_member_resolver
-from omnigent.server.usage_events import usage_event_store
+from omnigent.server.usage_events import COST_EVENT, usage_event_store
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 
 if TYPE_CHECKING:
@@ -473,6 +473,7 @@ def create_project_telemetry_router(
         user_id: str | None,
         rows: list[Any] | None,
         identities: list[Any],
+        usage: Any = None,
     ) -> dict[str, Any] | None:
         """Spend by role and by ticket over *rows* (see :class:`SpendSplit`)."""
         if rows is None:
@@ -482,14 +483,28 @@ def create_project_telemetry_router(
             project.id, user_id=user_id, since_epoch=period.since_epoch
         )
         links = ticket_store.ticket_session_links(project.id, user_id=user_id)
+        turns = (
+            []
+            if usage is None
+            else [
+                (event.session_id, event.created_at, int((event.props or {}).get("micros") or 0))
+                for event in usage.events(
+                    project.id, since_epoch=period.since_epoch, names=(COST_EVENT,)
+                )
+                if event.session_id
+            ]
+        )
         sessions.update(session_id for _, session_id, _ in [*activity, *links])
+        sessions.update(session_id for session_id, _, _ in turns)
         found = conversation_store.get_conversations(sorted(sessions)) if sessions else {}
         root_of = {
             session_id: conversation.root_conversation_id or session_id
             for session_id, conversation in found.items()
         }
         histories = ticket_store.stage_histories(project.id, user_id=user_id)
-        by_ticket = spend_by_ticket(rows, root_of, activity, links, finished_at(histories), {})
+        by_ticket = spend_by_ticket(
+            rows, root_of, activity, links, finished_at(histories), {}, turns=turns
+        )
         titles = ticket_store.ticket_titles(
             project.id, [row["ticket_id"] for row in by_ticket["tickets"]], user_id=user_id
         )
@@ -593,7 +608,7 @@ def create_project_telemetry_router(
             "today_utc": period.today_utc,
             **result,
             "throughput": throughput(request, project, period, user_id, histories, stages, role),
-            "spend": spend_split(project, period, user_id, spend_rows, identities),
+            "spend": spend_split(project, period, user_id, spend_rows, identities, usage),
             "daily": None
             if series != "daily"
             else daily_series(request, project, period, user_id, role),

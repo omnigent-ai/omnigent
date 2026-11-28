@@ -9,13 +9,17 @@ created it, walking ``created_by_session_id`` up to the first session that has o
 helpers whose chain ends without one stay "Other agents". The rows sum to the window's
 spend.
 
-**By ticket:** each root session's spend on a day goes to tickets in this order:
+**By ticket:** each turn's cost recorded in the usage log (``cost.recorded``) goes, as of
+that moment, to:
 
-1. Tickets the session (or a sub-agent under it) acted on that day, created, commented,
-   moved or edited, weighted by how many events it made on each.
-2. Else tickets linked to the session by then that weren't already finished before the
-   day began, split evenly.
+1. Tickets the session (or a sub-agent under it) had acted on that day so far, created,
+   commented, moved or edited, weighted by how many events it made on each.
+2. Else tickets linked to the session by then and not yet finished, split evenly.
 3. Else it's unattributed.
+
+Later activity only affects later turns, so a ticket's total never drops. Any spend a
+session-day has beyond its logged turns (before turns were logged, or with the usage log
+off) is split by the same rules applied to the whole day.
 
 Ticket rows plus ``unattributed_usd`` sum to the window's spend. Everything is computed from
 indexed reads already made for telemetry (spend rows, ticket events, links); nothing is
@@ -41,6 +45,10 @@ SpendRow = tuple[str, str, int, MemberKey]
 
 def _usd(micros: int) -> float:
     return micros_to_cents(micros) / 100
+
+
+def _day_of(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, tz=UTC).date().isoformat()
 
 
 def _day_bounds(day_utc: str) -> tuple[int, int]:
@@ -147,6 +155,7 @@ def spend_by_ticket(
     finished: Mapping[str, int],
     titles: Mapping[str, str | None],
     top: int = TOP_TICKETS,
+    turns: Iterable[tuple[str, int, int]] = (),
 ) -> dict[str, Any]:
     """Spend per ticket (see the module docstring), the top *top* tickets first.
 
@@ -154,31 +163,70 @@ def spend_by_ticket(
     :param activity: ``(ticket_id, session_id, at)`` for each ticket event a session made.
     :param links: ``(ticket_id, session_id, linked_at)`` for each ticket-session link.
     :param finished: When each currently finished ticket entered its completed stage.
+    :param turns: ``(session_id, at, micros)`` for each logged turn's cost.
     """
     acted: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    acted_at: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(list)
     for ticket_id, session_id, at in activity:
-        day = datetime.fromtimestamp(at, tz=UTC).date().isoformat()
-        acted[(root_of.get(session_id, session_id), day)][ticket_id] += 1
+        day = _day_of(at)
+        root_id = root_of.get(session_id, session_id)
+        acted[(root_id, day)][ticket_id] += 1
+        acted_at[(root_id, day)].append((at, ticket_id))
+    logged: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+    for session_id, at, micros in turns:
+        logged[(root_of.get(session_id, session_id), _day_of(at))].append((at, micros))
     linked: dict[str, list[tuple[str, int]]] = defaultdict(list)
     for ticket_id, session_id, linked_at in links:
         linked[root_of.get(session_id, session_id)].append((ticket_id, linked_at))
     per_ticket: dict[str, int] = defaultdict(int)
     unattributed = 0
-    for root_id, day, micros, _member in rows:
-        weights: Mapping[str, int] = acted.get((root_id, day)) or {}
-        if not weights:
-            start, end = _day_bounds(day)
-            open_links = {
-                ticket_id
-                for ticket_id, linked_at in linked.get(root_id, ())
-                if linked_at < end and finished.get(ticket_id, end) >= start
-            }
-            weights = dict.fromkeys(open_links, 1)
+
+    def credit(micros: int, weights: Mapping[str, int]) -> None:
+        nonlocal unattributed
         if not weights:
             unattributed += micros
-            continue
+            return
         for ticket_id, share in _split(micros, weights).items():
             per_ticket[ticket_id] += share
+
+    def open_links_at(root_id: str, moment: int) -> dict[str, int]:
+        return dict.fromkeys(
+            {
+                ticket_id
+                for ticket_id, linked_at in linked.get(root_id, ())
+                if linked_at <= moment and finished.get(ticket_id, moment + 1) > moment
+            },
+            1,
+        )
+
+    for root_id, day, micros, _member in rows:
+        key = (root_id, day)
+        turns_today = sorted(logged.get(key, ()))
+        logged_total = sum(amount for _, amount in turns_today)
+        spent = 0
+        for at, amount in turns_today:
+            # Never more than the day's recorded spend, so the totals still add up.
+            share = amount if logged_total <= micros else amount * micros // logged_total
+            so_far = Counter(
+                ticket for event_at, ticket in acted_at.get(key, ()) if event_at <= at
+            )
+            credit(share, so_far or open_links_at(root_id, at))
+            spent += share
+        remainder = micros - spent
+        if remainder <= 0:
+            continue
+        weights: Mapping[str, int] = acted.get(key) or {}
+        if not weights:
+            start, end = _day_bounds(day)
+            weights = dict.fromkeys(
+                {
+                    ticket_id
+                    for ticket_id, linked_at in linked.get(root_id, ())
+                    if linked_at < end and finished.get(ticket_id, end) >= start
+                },
+                1,
+            )
+        credit(remainder, weights)
     ranked = sorted(per_ticket.items(), key=lambda item: (-item[1], item[0]))
     return {
         "tickets": [
