@@ -126,6 +126,11 @@ async def test_roles_write_their_own_and_the_shared_area_and_read_everything(cli
     for extra in ({"identity_id": designer["id"]}, {"project_id": project["id"]}):
         assert (await put(pm_agent, f"/identities/{designer['id']}/x", **extra)).status_code == 422
 
+    # A runner's own call without its session (say, an agent's shell curl) can't pass
+    # as a person to write another role's area.
+    token_only = {k: v for k, v in pm_agent.items() if k != ORCHESTRATION_SOURCE_HEADER}
+    assert (await put(token_only, f"/identities/{designer['id']}/x")).status_code == 403
+
     # People on the project write anywhere in the layout and see the same memory.
     assert (await put(_as_user(BOB), f"/identities/{designer['id']}/brief")).status_code == 200
     listed = (await client.get(f"{base}/entries", headers=lead)).json()

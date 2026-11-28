@@ -26,7 +26,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature
 from omnigent.server.project_memory import ProjectMemoryCaller, require_project_memory_write
@@ -206,6 +206,13 @@ def create_memory_router(
             raise missing
         source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
         if not source_id:
+            # A runner's own call (say, an agent's shell curl) must name its session;
+            # without one it would pass as a person and write any role's area.
+            if RUNNER_TUNNEL_TOKEN_HEADER in request.headers:
+                raise OmnigentError(
+                    "An agent's project memory call must come from its session's memory tools",
+                    code=ErrorCode.FORBIDDEN,
+                )
             # Every project role (owner, Manager, member) edits the project today.
             return ProjectMemoryCaller(project.id, is_agent=False, identity_id=None, may_edit=True)
         if user_id is not None:
