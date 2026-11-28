@@ -52,4 +52,14 @@ describe("useBaseMenuFocusHandoff", () => {
     view.rerender(<Reviews which="second" />);
     expect(screen.getByRole("button", { name: "Elsewhere" })).toHaveFocus();
   });
+
+  it("forgets a trigger the person left for nowhere, so a later swap moves no focus", () => {
+    const view = render(<Reviews which="first" />);
+    const first = screen.getByRole("button", { name: "first" });
+    act(() => first.focus());
+    act(() => first.blur());
+    view.rerender(<Reviews which="second" />);
+    expect(screen.getByRole("button", { name: "second" })).not.toHaveFocus();
+    expect(document.body).toHaveFocus();
+  });
 });

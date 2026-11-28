@@ -41,8 +41,19 @@ export function useBaseMenuFocusHandoff(): void {
       // The menu's own items keep the trigger noted; anywhere else lets it go.
       else if (!target?.closest('[role="menu"]')) focused.current = null;
     };
+    // Focus leaving a trigger that's still on the page for nowhere is the person leaving it.
+    const noteBlur = (event: FocusEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target === focused.current?.trigger && !event.relatedTarget && target.isConnected) {
+        focused.current = null;
+      }
+    };
     document.addEventListener("focusin", noteFocus);
-    return () => document.removeEventListener("focusin", noteFocus);
+    document.addEventListener("focusout", noteBlur);
+    return () => {
+      document.removeEventListener("focusin", noteFocus);
+      document.removeEventListener("focusout", noteBlur);
+    };
   }, []);
   // Every render, since any render can swap the review that holds the trigger.
   useLayoutEffect(() => {
