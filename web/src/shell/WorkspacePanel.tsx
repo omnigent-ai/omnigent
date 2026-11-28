@@ -18,6 +18,7 @@ import {
   type ComponentType,
   type CSSProperties,
   type ReactElement,
+  type ReactNode,
   type Ref,
   type RefObject,
   lazy,
@@ -93,6 +94,7 @@ import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import {
+  findAgentTerminal,
   terminalDisplayLabel,
   terminalTabKey,
   useCreateTerminal,
@@ -117,6 +119,7 @@ import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
+import { useTerminalFirst } from "./TerminalFirstContext";
 import type { RightRailTab } from "./railTabs";
 import {
   WORKSPACE_PANEL_TABS,
@@ -922,6 +925,49 @@ export function RailTerminalView({
 }
 
 /**
+ * A side chat follows the main view's Chat/Terminal choice: in Terminal view it
+ * shows its own agent terminal when it has one. The chat stays mounted behind it
+ * so drafts, queued sends, and a seeded first question survive the switch.
+ */
+function SideChatSurface({
+  childId,
+  terminalReadOnly,
+  children,
+}: {
+  childId: string;
+  terminalReadOnly: boolean;
+  children: ReactNode;
+}) {
+  const terminalFirst = useTerminalFirst();
+  const followTerminal =
+    terminalFirst?.isTerminalFirst === true &&
+    terminalFirst.view === "terminal" &&
+    !terminalFirst.isShellView &&
+    !childId.startsWith("pending:");
+  const { terminals } = useTerminals(followTerminal ? childId : null);
+  const agentTerminal = followTerminal ? findAgentTerminal(terminals) : null;
+  const chatRef = useInertRef<HTMLDivElement>(agentTerminal !== null);
+  return (
+    <div data-testid="side-chat-surface" className="flex min-h-0 flex-1 flex-col">
+      <div
+        ref={chatRef}
+        className={cn("flex min-h-0 flex-1 flex-col", agentTerminal !== null && "hidden")}
+      >
+        {children}
+      </div>
+      {agentTerminal !== null && (
+        <RailTerminalView
+          conversationId={childId}
+          terminalKey={terminalTabKey(agentTerminal)}
+          readOnly={terminalReadOnly}
+          autoFocus={false}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
  * Props for {@link WorkspacePanel}. All state lives in AppShell; this
  * component is a pure view. Handlers wrap the AppShell setters so the
  * shell keeps single-source-of-truth over file/terminal/panel state.
@@ -1587,15 +1633,20 @@ function WorkspacePanelImpl({
       );
     }
     return (
-      <SideChatPane
+      <SideChatSurface
         key={selectedSideChat}
         childId={selectedSideChat}
-        selectionParentId={
-          (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
-        }
-        onStart={(text) => startPendingSideChat(selectedSideChat, text)}
-        pendingHarness={sideChatHarness}
-      />
+        terminalReadOnly={!isOwnerLevel(permissionLevel)}
+      >
+        <SideChatPane
+          childId={selectedSideChat}
+          selectionParentId={
+            (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
+          }
+          onStart={(text) => startPendingSideChat(selectedSideChat, text)}
+          pendingHarness={sideChatHarness}
+        />
+      </SideChatSurface>
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
