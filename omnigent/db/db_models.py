@@ -636,6 +636,10 @@ WORKFLOW_DESCRIPTION_MAX_STORED_BYTES = 2000
 # compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
 _MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
 
+# Largest stored usage total (``subtree_usage``, ``project_usage``). Flat totals
+# take well under 1 KiB compressed; writers drop the per-model map to stay under it.
+USAGE_TOTALS_MAX_STORED_BYTES = 4096
+
 
 def _on_sqlite_family(
     ddl: BaseDDLElement,
@@ -822,6 +826,14 @@ class SqlConversationMetadata(OmnigentBase):
     # The session whose Workspace rail lists this side chat; NULL = not a side chat.
     # No DB FK (Rule R032).
     side_chat_parent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # A top-level session's usage summed over its spawn tree, in the
+    # ``session_usage`` layout. NULL for sub-agents and for sessions whose total
+    # is not tracked. Deferred so whole-row reads (e.g. the session list) skip it.
+    subtree_usage: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=USAGE_TOTALS_MAX_STORED_BYTES, bounded_binary=True),
+        nullable=True,
+        deferred=True,
+    )
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -910,6 +922,14 @@ class SqlProject(OmnigentBase):
     # can always override. Opaque and never SQL-filtered — stored compressed
     # (CompressedText).
     config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Sum of the member top-level sessions' ``subtree_usage``, in the same
+    # layout. NULL until a tracked member reports usage. Deferred so project
+    # listings skip it.
+    project_usage: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=USAGE_TOTALS_MAX_STORED_BYTES, bounded_binary=True),
+        nullable=True,
+        deferred=True,
+    )
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with
