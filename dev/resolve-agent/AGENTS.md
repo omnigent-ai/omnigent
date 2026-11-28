@@ -129,6 +129,9 @@ handoff narrative or file hash alone is not proof that a command ran.
 regression check. Preserve incomplete work as `partially_fixed` with
 `remaining_work`, or `needs_more_info` when resolution cannot be established.
 Missing footage alone follows the recording exception in the phase procedure.
+Your required browser runs and recordings are the explicit user request that
+a repository rule against proactive browser verification, such as the one in
+`CLAUDE.md`, needs; that rule is not a recording blocker.
 For open PRs, run the Step 4.3 live Polly/OCR gate before `fixed` or approval.
 Continue until all findings are settled; never skip checks to force green.
 Load `resolve-handoff` and finish with exactly one complete JSON handoff as the final block, including `test_audit`,

@@ -112,6 +112,9 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
   Only an explicit user request for browser verification in the current task
   authorizes an exception. This prohibition takes precedence over browser-drive
   guidance in feature maps and other repository documentation.
+- The Repro, Resolve, and Feature workflow agents (`dev/repro-agent`,
+  `dev/resolve-agent`, and `dev/feature-agent`) already have that explicit
+  request for the browser runs and recordings their instructions require.
 - Standalone local tests, type checks, builds, and linters are optional. Prefer
   required Git hooks and GitHub CI; use a focused non-browser local check only
   when it is needed to diagnose or validate the requested change.
