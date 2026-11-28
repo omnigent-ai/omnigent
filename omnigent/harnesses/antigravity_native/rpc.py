@@ -1179,12 +1179,16 @@ async def stream_agent_state_updates(
                     yield inner if isinstance(inner, dict) else parsed
 
 
+# Any cmdline mentioning an ``agy`` executable; argv[0] is checked afterwards.
+_AGY_PGREP_PATTERN = r"(^|/)agy( |$)"
+
+
 def _list_agy_pids() -> list[int]:
     """
     Return pids of running ``agy`` processes (best-effort).
 
-    Isolated as a seam so tests can stub it. Matches the agy binary path
-    (``.../bin/agy``) to avoid matching unrelated commands that merely mention
+    Isolated as a seam so tests can stub it. Keeps processes whose executable is
+    named ``agy`` to avoid matching unrelated commands that merely mention
     "agy". Prefers ``pgrep -f`` (portable across Linux + macOS); when ``pgrep``
     is unavailable — e.g. a minimal container image without ``procps`` — falls
     back to a ``/proc`` cmdline scan (:func:`_list_agy_pids_from_proc`) so
@@ -1195,7 +1199,7 @@ def _list_agy_pids() -> list[int]:
     """
     try:
         completed = subprocess.run(
-            ["pgrep", "-f", r"bin/agy"],
+            ["pgrep", "-f", _AGY_PGREP_PATTERN],
             capture_output=True,
             text=True,
             timeout=_LSOF_TIMEOUT_S,
@@ -1223,7 +1227,7 @@ def _list_agy_pids() -> list[int]:
 
 
 def _is_agy_executable(executable: str) -> bool:
-    return executable == "bin/agy" or executable.endswith("/bin/agy")
+    return os.path.basename(executable) == "agy"
 
 
 def _list_agy_pids_from_proc() -> list[int]:
@@ -1231,9 +1235,7 @@ def _list_agy_pids_from_proc() -> list[int]:
     Enumerate agy pids by scanning ``/proc/<pid>/cmdline`` (no ``pgrep`` needed).
 
     The Linux-only fallback for :func:`_list_agy_pids`. Matches the executable
-    rather than wrapper arguments containing ``bin/agy``. The launcher satisfies this because
-    :func:`omnigent.harnesses.antigravity_native.launch.agy_binary_path` resolves to an
-    absolute ``.../bin/agy`` path. Unreadable or vanished ``/proc`` entries are
+    rather than wrapper arguments containing ``agy``. Unreadable or vanished ``/proc`` entries are
     skipped; a missing ``/proc`` (non-Linux) yields ``[]``.
 
     :returns: Candidate agy pids.
@@ -1408,7 +1410,7 @@ def _agy_pid_in_pane_subtree(pane_pid: int) -> int | None:
     sandboxed launch. So: if the pane pid is itself a live agy pid, return it;
     otherwise breadth-first walk the pane pid's descendants and return the first
     that is a live agy pid. The walk is intersected with :func:`_list_agy_pids`
-    (the same ``bin/agy`` cmdline match used everywhere) so a non-agy descendant
+    (the same executable match used everywhere) so a non-agy descendant
     is never mistaken for agy, and is depth- and visited-bounded so a cyclic or
     pathological process table cannot hang it.
 

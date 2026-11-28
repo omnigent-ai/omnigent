@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
@@ -510,6 +510,102 @@ async def test_send_posts_message_event_and_yields_events_until_terminal() -> No
     # If 4 events leak through, the turn-boundary check regressed
     # and downstream consumers will see two turns merged.
     assert yielded == [delta1, delta2, completed]
+
+
+def _status_event(status: str) -> SessionStatusEvent:
+    return SessionStatusEvent(type="session.status", conversation_id="conv_abc", status=status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled_status", ["idle", "waiting"])
+async def test_send_continues_past_delivery_ack_until_session_settles(
+    settled_status: str,
+) -> None:
+    """A native harness's output-less completion while running does not end the turn."""
+    session = _make_session()
+    delivery_ack = _completed_event()
+    reply = OutputTextDeltaEvent(type="response.output_text.delta", delta="native reply")
+    after_turn = OutputTextDeltaEvent(type="response.output_text.delta", delta="next turn")
+    events = [
+        _status_event("running"),
+        delivery_ack,
+        reply,
+        _status_event(settled_status),
+        after_turn,
+    ]
+    ns = _FakeNamespace(stream_scripts=[_StreamScript(events=events)], session_obj=session)
+    chat = SessionsChat(namespace=ns, files_uploader=None, files_getter=None, session=session)
+
+    yielded = [event async for event in chat.send("hi")]
+
+    assert yielded == events[:4]
+
+
+class _StalledNativeNamespace(_FakeNamespace):
+    """Stream a native delivery ack, then only heartbeats."""
+
+    def stream(  # type: ignore[override]
+        self,
+        session_id: str,
+    ) -> AsyncIterator[ServerStreamEvent]:
+        async def _stream() -> AsyncIterator[ServerStreamEvent]:
+            yield _status_event("running")
+            yield _completed_event()
+            while True:
+                await asyncio.sleep(0.01)
+                yield SessionHeartbeatEvent(type="session.heartbeat")
+
+        return _stream()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_status", "expected_code"),
+    [("running", "turn_timeout"), ("failed", "executor_error"), ("idle", None), ("waiting", None)],
+)
+async def test_send_bounds_the_wait_after_delivery_ack(
+    monkeypatch: pytest.MonkeyPatch, snapshot_status: str, expected_code: str | None
+) -> None:
+    """At the settle deadline, a running or failed snapshot raises; a settled one ends the turn."""
+    from omnigent_client._errors import OmnigentError
+
+    monkeypatch.setattr("omnigent_client._sessions_chat._DELIVERY_SETTLE_TIMEOUT_S", 0.1)
+    snapshot = replace(
+        _make_session(status=snapshot_status),
+        last_task_error={"code": "executor_error", "message": "agy exited"},
+    )
+    ns = _StalledNativeNamespace(stream_scripts=[], session_obj=snapshot)
+    chat = SessionsChat(
+        namespace=ns, files_uploader=None, files_getter=None, session=_make_session()
+    )
+    yielded: list[ServerStreamEvent] = []
+
+    async def drain() -> None:
+        async for event in chat.send("hi"):
+            yielded.append(event)
+
+    if expected_code is not None:
+        with pytest.raises(OmnigentError) as raised:
+            await asyncio.wait_for(drain(), timeout=5)
+        assert raised.value.code == expected_code
+    else:
+        await asyncio.wait_for(drain(), timeout=5)
+    assert [event.type for event in yielded[:2]] == ["session.status", "response.completed"]
+    assert any(isinstance(event, SessionHeartbeatEvent) for event in yielded)
+    assert ns.get_calls == ["conv_abc"]
+
+
+@pytest.mark.asyncio
+async def test_send_returns_on_completion_with_output_while_running() -> None:
+    session = _make_session()
+    completed = _completed_event(output=[_ASSISTANT_MESSAGE_ITEM])
+    events = [_status_event("running"), completed, _status_event("idle")]
+    ns = _FakeNamespace(stream_scripts=[_StreamScript(events=events)], session_obj=session)
+    chat = SessionsChat(namespace=ns, files_uploader=None, files_getter=None, session=session)
+
+    yielded = [event async for event in chat.send("hi")]
+
+    assert yielded == events[:2]
 
 
 @pytest.mark.asyncio

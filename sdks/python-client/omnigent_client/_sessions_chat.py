@@ -230,6 +230,24 @@ _RESPONSE_START_EVENT_TYPES = (
     InProgressEvent,
 )
 
+
+def _is_delivery_ack(event: ServerStreamEvent, session_status: str | None) -> bool:
+    """
+    Whether *event* only acknowledges prompt delivery to a still-running harness.
+
+    Native terminal harnesses complete with no output once the prompt reaches the pane.
+    """
+    return (
+        isinstance(event, CompletedEvent)
+        and not event.response.output
+        and session_status == "running"
+    )
+
+
+# Bounds how long ``send()`` waits for a native harness to settle after a delivery ack.
+_DELIVERY_SETTLE_TIMEOUT_S = 1200.0
+
+
 # Newer servers emit an immediate ``session.heartbeat`` after the
 # live-tail subscriber is registered. Older servers do not, so keep a
 # short fallback instead of hanging forever before posting the user's
@@ -520,7 +538,11 @@ class SessionsChat:
         (:class:`CompletedEvent`, :class:`FailedEvent`,
         :class:`IncompleteEvent`, or :class:`CancelledEvent`) is
         observed. The subscription is closed once the terminal
-        event has been yielded.
+        event has been yielded. An output-less completion that only
+        acknowledges delivery to a still-running native harness does
+        not end the turn; the iterator then continues until the
+        session status leaves ``running``. That acknowledgement is
+        still yielded and still fires ``on_response_end``.
 
         Always returns an async iterator: the caller does
         ``async for event in chat.send("hi"): ...`` regardless of
@@ -541,7 +563,9 @@ class SessionsChat:
             :meth:`SessionsNamespace.stream`.
         :raises OmnigentError: If the underlying ``post_event`` or
             ``stream`` call fails (e.g. 404 if the session was
-            deleted out from under us).
+            deleted out from under us), if the turn fails, or with code
+            ``turn_timeout`` if the session is still running 20 minutes
+            after such a delivery acknowledgement.
         :raises RuntimeError: If ``files`` is non-empty but no
             ``files_uploader`` was wired at construction.
         :raises ValueError: If the agent's spec declares a
@@ -573,6 +597,8 @@ class SessionsChat:
         # turns cannot publish all output before this subscriber exists.
         stream_aiter = self._namespace.stream(self._session.id)
         hook_state = _StreamHookState()
+        session_status: str | None = None
+        settle_deadline: float | None = None
         first_event_task = asyncio.ensure_future(stream_aiter.__anext__())
         try:
             first_event: ServerStreamEvent | None
@@ -613,7 +639,11 @@ class SessionsChat:
                 if isinstance(event, OutputItemDoneEvent):
                     await self._maybe_dispatch_tool_call(event, hook_state)
                 if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
-                    return
+                    if not _is_delivery_ack(event, session_status):
+                        return
+                    settle_deadline = (
+                        asyncio.get_running_loop().time() + _DELIVERY_SETTLE_TIMEOUT_S
+                    )
                 # A SETUP-phase failure (spec resolution, spawn-env
                 # build) ends the turn before the LLM stream starts, so
                 # no response.failed / FailedEvent is ever emitted — the
@@ -631,10 +661,33 @@ class SessionsChat:
                     )
                     code = event.error.code if event.error is not None else None
                     raise OmnigentError(message, code=code)
+                if isinstance(event, SessionStatusEvent):
+                    session_status = event.status
+                    if settle_deadline is not None and session_status != "running":
+                        return
+                settle_timeout = asyncio.timeout_at(settle_deadline)
                 try:
-                    event = await stream_aiter.__anext__()
+                    async with settle_timeout:
+                        event = await stream_aiter.__anext__()
                 except StopAsyncIteration:
                     return
+                except TimeoutError:
+                    if not settle_timeout.expired():
+                        raise
+                    # The settling status event may have been missed; trust a fresh snapshot.
+                    snapshot = await self.refresh()
+                    if snapshot.status == "failed":
+                        error = snapshot.last_task_error or {}
+                        raise OmnigentError(
+                            error.get("message") or "turn failed", code=error.get("code")
+                        ) from None
+                    if snapshot.status != "running":
+                        return
+                    raise OmnigentError(
+                        f"session still running {_DELIVERY_SETTLE_TIMEOUT_S:.0f}s after "
+                        "the harness accepted the message",
+                        code="turn_timeout",
+                    ) from None
         finally:
             if not first_event_task.done():
                 first_event_task.cancel()

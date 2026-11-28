@@ -3148,6 +3148,73 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         assert _STREAM_FAILURE_MESSAGE in error["message"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "expected_statuses"),
+    [
+        ("antigravity-native", ["running"]),
+        ("codex-native", ["running"]),
+        (_TEST_HARNESS_NAME, ["running", "waiting"]),
+    ],
+)
+async def test_native_delivery_with_active_child_leaves_turn_end_to_reader(
+    harness: str,
+    expected_statuses: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A native prompt delivery must not publish ``waiting`` while the harness still works."""
+    conv = f"conv_delivery_child_{harness.replace('-', '_')}"
+    child = f"{conv}_child"
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.runner.app._server_version", "0.16.0")
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="delivery-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(
+                _FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED])
+            ),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=conv, child_session_id=child, agent="worker", title="background"
+    )
+    entry.status = "running"
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_delivery",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert response.status_code == 202
+            await _await_bg_turn_task(conv)
+            events = await _drain_status_events(
+                app.state.session_event_queues, conv, until="waiting", timeout=1.0
+            )
+    finally:
+        subagent_work.unregister_subagent_work(child)
+
+    assert [event.get("status") for event in events] == expected_statuses
+
+
 # ── Runner-local OS env dispatch ────────────────────────
 
 
