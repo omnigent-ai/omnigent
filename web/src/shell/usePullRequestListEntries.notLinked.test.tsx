@@ -229,7 +229,8 @@ describe("a row the session's machine won't read because the session doesn't lin
   it("shows the server's refusal of a non-owner in place, keeps Not Linked, and offers no retry", async () => {
     reads.of = refused;
     const asked = vi.fn(
-      async () => new Response(JSON.stringify({ detail: OWNER_ONLY }), { status: 403 }),
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(JSON.stringify({ detail: OWNER_ONLY }), { status: 403 }),
     );
     vi.stubGlobal("fetch", asked);
     // The client still thinks the viewer owns the session; the server knows better.
@@ -238,10 +239,10 @@ describe("a row the session's machine won't read because the session doesn't lin
     act(() => view().link!.run());
 
     await waitFor(() => expect(view().entry.linkFailure).toBe(OWNER_ONLY));
-    expect(asked).toHaveBeenCalledWith(
-      expect.stringContaining(`/v1/sessions/${SESSION}/resources/github/prs`),
-      expect.objectContaining({ method: "POST" }),
-    );
+    const posted = asked.mock.calls
+      .filter(([, init]) => init?.method === "POST")
+      .map(([input]) => new URL(String(input), "http://localhost").pathname);
+    expect(posted).toContain(`/v1/sessions/${SESSION}/resources/github/prs`);
     const { status, link, paletteLink } = view();
     expect(status).toMatchObject({ label: "Not Linked", detail: OWNER_ONLY });
     expect(link).toBeUndefined();
