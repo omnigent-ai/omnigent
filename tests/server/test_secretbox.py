@@ -7,6 +7,7 @@ behaviour. Real KMS semantics are covered by the demo end-to-end verification.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -133,3 +134,32 @@ def test_build_secret_cipher_from_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(CREDENTIAL_KMS_KEY_ENV_VAR, "arn:aws:kms:us-east-1:1:key/abc")
     cipher = build_secret_cipher()
     assert isinstance(cipher, KmsSecretCipher)
+
+
+@pytest.fixture
+def _no_ambient_aws_region(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Remove every region source boto3 reads, so only the key can supply one."""
+    for name in ("AWS_DEFAULT_REGION", "AWS_REGION", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
+
+
+@pytest.mark.usefixtures("_no_ambient_aws_region")
+@pytest.mark.parametrize(
+    "key_id",
+    [
+        "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+        "arn:aws:kms:eu-west-1:111122223333:alias/omnigent-credentials",
+    ],
+)
+def test_kms_client_uses_the_key_arn_region(key_id: str) -> None:
+    client = KmsSecretCipher(key_id)._kms
+    assert client.meta.region_name == "eu-west-1"
+
+
+@pytest.mark.usefixtures("_no_ambient_aws_region")
+def test_kms_client_without_arn_uses_the_default_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-2")
+    client = KmsSecretCipher("alias/omnigent-credentials")._kms
+    assert client.meta.region_name == "us-east-2"

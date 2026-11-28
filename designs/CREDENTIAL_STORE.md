@@ -85,7 +85,7 @@ needed. `decrypt` is `kms:Decrypt` with the same context.
 
 `build_secret_cipher()` is the single seam where a deployment selects the
 backend; it reads the **store-level** key `OMNIGENT_CREDENTIAL_KMS_KEY_ID` (id,
-ARN, or `alias/…`) and returns the cipher, or `None` when unset — the store, and
+ARN, or `alias/…`; an ARN also sets the KMS client's region) and returns the cipher, or `None` when unset — the store, and
 every integration on it, is then disabled. **There is no non-KMS fallback:** no
 key configured means the feature is off, not that it silently encrypts with a
 local key.
