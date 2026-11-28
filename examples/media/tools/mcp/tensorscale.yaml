@@ -1,0 +1,14 @@
+# TensorScale MCP server: asynchronous image and video generation.
+# Auto-discovered by omnigent; no need to reference it from config.yaml.
+name: tensorscale
+description: Image and video generation via the TensorScale MCP server.
+transport: http
+url: https://mcp.tensorscale.io/mcp
+headers:
+  Authorization: Bearer ${TENSORSCALE_API_KEY}
+timeout: 280
+
+# get_task_status is required: generation returns a task_id, not media. The server
+# also has canvas tools that spend credits and account tools that return personal
+# details, which this example leaves out.
+tools: [list_resolutions, text_to_image, text_to_video, get_task_status]
