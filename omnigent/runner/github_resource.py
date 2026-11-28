@@ -310,8 +310,9 @@ def _gate(argv: list[str], scope: str | None, cwd: str | None) -> str:
     target = gh_argv.classify(argv)
     if scope is None:
         raise gh_argv.GhArgvRefused("A gh call runs outside a host scope")
+    checkout_host: str | None = None
     if scope == CHECKOUT_SCOPE:
-        scope = checkout_github_host(cwd) if cwd else None
+        scope = checkout_host = checkout_github_host(cwd) if cwd else None
         if scope is None:
             raise gh_argv.GhArgvRefused("The checkout has no single GitHub host to read")
     if not _known_github_host(scope):
@@ -319,7 +320,8 @@ def _gate(argv: list[str], scope: str | None, cwd: str | None) -> str:
     if target.host is None and not target.from_checkout:
         # gh would pick GH_HOST or a hosts.yml host for it, which the gate doesn't predict.
         raise gh_argv.GhArgvRefused("A gh call that reads no checkout must name its host")
-    goes_to = target.host or (checkout_github_host(cwd) if cwd else None)
+    # Each lookup starts git processes, so the one resolved for the scope is reused.
+    goes_to = target.host or checkout_host or (checkout_github_host(cwd) if cwd else None)
     if goes_to is None or goes_to != scope:
         raise gh_argv.GhArgvRefused(
             f"A gh call for {scope} goes to {goes_to or 'no single GitHub host'}"
