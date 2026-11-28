@@ -108,6 +108,7 @@ import {
 } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { resolveWorkspaceActiveView } from "./workspaceActiveView";
+import { WorkspaceUploadDropRoot, WorkspaceUploadProvider, UploadsTray } from "./WorkspaceUploads";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
@@ -2528,16 +2529,18 @@ function WorkspacePanelImpl({
                   name="this workspace pane"
                   resetKey={JSON.stringify([conversationId, activeView.flat])}
                 >
-                  <FilesPanel
-                    conversationId={contained ? conversationId : undefined}
-                    frameless
-                    onFileSelect={openFileViewer}
-                    flatView={activeView.flat}
-                    showHidden={filesPanelShowHidden}
-                    onShowHiddenChange={onShowHiddenChange}
-                    sort={filesPanelSort}
-                    onSortChange={onSortChange}
-                  />
+                  <WorkspaceUploadDropRoot>
+                    <FilesPanel
+                      conversationId={contained ? conversationId : undefined}
+                      frameless
+                      onFileSelect={openFileViewer}
+                      flatView={activeView.flat}
+                      showHidden={filesPanelShowHidden}
+                      onShowHiddenChange={onShowHiddenChange}
+                      sort={filesPanelSort}
+                      onSortChange={onSortChange}
+                    />
+                  </WorkspaceUploadDropRoot>
                 </RenderErrorBoundary>
               </div>
             )}
@@ -2632,12 +2635,13 @@ function WorkspacePanelImpl({
             ) : null}
           </RenderErrorBoundary>
         </div>
+        <UploadsTray visible={open && !isMobile} />
       </div>
     </aside>
   );
   return (
     <>
-      {rail}
+      <WorkspaceUploadProvider sessionId={conversationId}>{rail}</WorkspaceUploadProvider>
       {isMobile && <GadgetMobileDrawer state={gadgetRail} />}
       {gutterHandle && (
         <WorkspaceRailGutterHandle
