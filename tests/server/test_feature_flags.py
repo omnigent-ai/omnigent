@@ -72,6 +72,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "floating_panes": False,
         "shared_session_updates_socket": False,
         "pull_requests_v2": False,
+        "host_stats": False,
     }
 
 
@@ -333,6 +334,13 @@ def test_a_followed_feature_needs_a_definition_and_no_cycle() -> None:
     assert resolve_effective_features(missing, on) == {Feature.FLOATING_PANES}
     off = {Feature.WORKSPACE_SIDEBAR_V2: FeatureIntent.OFF}
     assert resolve_effective_features(cycle, off) == frozenset()
+
+
+def test_host_stats_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "host_stats"})
+
+    assert flags.enabled(Feature.HOST_STATS)
+    assert flags.frontend_dict()["host_stats"] is True
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:
