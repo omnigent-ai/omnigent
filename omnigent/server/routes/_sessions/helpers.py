@@ -273,6 +273,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
+    _session_status_generation,
+    _session_status_sequence,
     _session_terminal_pending_cache,
     _unbound_managed_launch_tasks,
     build_policy_engine,
@@ -5161,6 +5163,27 @@ def _require_external_status_forward(
         )
 
 
+def _runner_settled_busy_edge(runner_result: _RunnerForwardResult | None) -> bool:
+    """
+    Whether the runner found a forwarded ``running``/``waiting`` edge stale.
+
+    A runner answers ``{"settled_status": "idle"}`` when the turn the edge
+    reported had already ended, so the caller can publish the ``idle`` the
+    harness will not send again.
+
+    :param runner_result: HTTP result returned by the runner, or ``None``
+        when no runner could be reached.
+    :returns: ``True`` only for a 200 answer carrying that settlement.
+    """
+    if runner_result is None or runner_result.status_code != 200:
+        return False
+    try:
+        payload = json.loads(runner_result.body)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("settled_status") == "idle"
+
+
 def _require_collaboration_mode_forward(
     session_id: str,
     enabled: bool,
@@ -5464,6 +5487,7 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    _session_status_generation[session_id] = next(_session_status_sequence)
     if status not in ("running", "waiting"):
         session_live_state.record_child_status(
             session_id, None, status, handoffs=session_live_state.handoff_count(session_id)
@@ -13593,6 +13617,7 @@ __all__ = [
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
+    "_runner_settled_busy_edge",
     "_same_provider_family",
     "_same_provider_family_impl",
     "_seed_missing_title",

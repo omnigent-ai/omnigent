@@ -196,6 +196,7 @@ from omnigent.server.routes._sessions.common import (
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
+    _session_status_generation,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -258,6 +259,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_filesystem_attachment_harness,
     _resolve_harness,
     _response_agent_name_from_store,
+    _runner_settled_busy_edge,
     _session_status_from_cache,
     _set_background_tasks,
     _set_background_work_running,
@@ -3013,6 +3015,7 @@ def register_events_routes(
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            status_generation = _session_status_generation.get(session_id)
             if (
                 conv.parent_conversation_id is not None
                 and status in {"idle", "failed"}
@@ -3065,6 +3068,14 @@ def register_events_routes(
                 runner_router,
                 forward_body,
             )
+            if (
+                status in {"running", "waiting"}
+                and _runner_settled_busy_edge(runner_result)
+                and _session_status_generation.get(session_id) == status_generation
+            ):
+                # The turn this edge reported had already ended; a newer edge
+                # published during the forward takes precedence.
+                _publish_status(session_id, "idle")
             if (
                 conv.kind == "sub_agent"
                 and status in {"idle", "failed"}

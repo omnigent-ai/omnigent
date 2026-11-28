@@ -260,6 +260,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
+    _session_status_generation,
     _session_terminal_pending_cache,
     _unbound_managed_launch_tasks,
     get_caps,
@@ -9868,6 +9869,7 @@ class _RelayTransportLost(Exception):
 def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
+    _session_status_generation.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
     _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)

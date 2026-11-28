@@ -8,6 +8,7 @@ so a single instance is imported by reference across the package.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import math
 import re
@@ -645,6 +646,11 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+# Advances on every edge ``_publish_status`` applies, so a correction computed while
+# a request was in flight can tell that a newer status edge superseded it.
+_session_status_generation: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_session_status_sequence = itertools.count(1)
 
 
 @dataclass
@@ -1324,6 +1330,8 @@ __all__ = [
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",
+    "_session_status_generation",
+    "_session_status_sequence",
     "_session_terminal_pending_cache",
     "_unbound_managed_launch_tasks",
     "get_server_host_registry",
