@@ -248,8 +248,8 @@ When the user asks to review the plan before the work starts:
   way, such as a PR another session will open, CI on your push or a deploy
   you started, even if the step's own goal is met. Keep the step `started`,
   say what it waits for in its status ("Sync started; waiting for its PR"),
-  and check on it with a background timer, as for a session you start (see
-  "Running a step in a nested agent"). Write `done` once it arrives.
+  and check on it each time your progress timer fires (see "Keep the run
+  going"). Write `done` once it arrives.
 - Keep going while any step is ready or started. Don't end your turn until
   everything left is done, failed, waiting for the user, running in another
   session, or waits on one of those, unless the user or your instructions say
@@ -275,12 +275,12 @@ When the user asks to review the plan before the work starts:
   repeating an external action, check whether it already succeeded so a
   retry cannot duplicate it. Don't skip required checks or broaden permissions
   to get past a failure.
-- Keep a step `started` while an external job or review is pending and arrange
-  a completion notification or background check. A slow service or exhausted
-  retry budget alone is not a reason to ask the user what to do. If recovery
-  is exhausted and no work is still progressing, write `failed` with the
-  evidence and continue independent steps. A question must meet "Before
-  asking or declaring a blocker", and the run must be attended.
+- Keep a step `started` while an external job or review is pending, and check
+  on it when your progress timer fires or with a completion notification. A
+  slow service or exhausted retry budget alone is not a reason to ask the user
+  what to do. If recovery is exhausted and no work is still progressing, write
+  `failed` with the evidence and continue independent steps. A question must
+  meet "Before asking or declaring a blocker", and the run must be attended.
 - Write `failed` when a step's own work failed. State the cause and what would
   allow a future retry. Don't mark blocked dependents done or remove required
   dependencies to pretend the workflow completed; report what remains blocked.
@@ -306,6 +306,30 @@ When the user asks to review the plan before the work starts:
 - Keep entries short, and point to files, PRs and sessions instead of pasting
   them.
 
+## Keep the run going
+
+A progress timer brings you back to the run if your turn ends with work still
+pending. When the server saves it, it also survives this session's runner
+restarting.
+
+- When a run starts, resumes or continues, call `sys_timer_set` with
+  `seconds: 180`, `repeat: true` and `note: "workflow progress"`, and record
+  its `timer_id` in a journal note. If the journal already names one, cancel
+  that one with `sys_timer_cancel` first, so the run keeps only one.
+- Each time it fires, a `[System: timer … fired]` message starts your turn.
+  Read the journal, check the work you wait on, such as CI, jobs and nested
+  agents, and go on with any step that can proceed. If nothing changed, end
+  your turn without a reply. A firing during your turn needs nothing.
+- Cancel it with `sys_timer_cancel` when every step left is done, failed or
+  waiting for the user, and when the run is stopped. The user's answer or
+  Continue starts your next turn, and you set it again then.
+- `durable: false` in its result means the timer is kept only in this runner's
+  memory, for example in a sub-agent or side chat, and is lost if the runner
+  restarts. Keep it anyway: it still brings you back while the runner runs.
+- Without `sys_timer_set`, use a background timer with your own tools, such as
+  a background shell that sleeps 3 minutes, and start it again each time it
+  fires.
+
 ## Stop and resume
 
 The workflow's Stop and Continue controls send you instructions. Stopping your
@@ -315,9 +339,10 @@ own turn is not enough: delegated work can keep running independently.
   handle and a way to cancel it. With Codex `exec_command`, use `tty=true` for
   long-running commands so `write_stdin` can send Ctrl+C later. Record the
   handle in the journal; a PID alone may belong to a private process sandbox.
-- On Stop, stop starting new work and cancel this run's timers, retries and
-  queued follow-ups that could restart it. Scope the stop to this workflow
-  run; leave unrelated work and the automation's recurring schedule alone.
+- On Stop, stop starting new work and cancel this run's timers, its progress
+  timer too, and the retries and queued follow-ups that could restart it.
+  Scope the stop to this workflow run; leave unrelated work and the
+  automation's recurring schedule alone.
 - Tell every subagent and other Omnigent session working on this run to stop
   its own background tasks, agents and sessions recursively. Use the harness's
   agent/task controls, `sys_session_send` for your child sessions and
@@ -343,7 +368,8 @@ own turn is not enough: delegated work can keep running independently.
   do the same recursively for its required descendants. Reuse live workers,
   preserve completed results and avoid duplicate work. If a worker cannot
   resume, start a replacement with the recorded context or do its remaining
-  work here. Restore the monitoring needed to finish the workflow.
+  work here. Set the progress timer again, and restore the monitoring needed
+  to finish the workflow.
 
 ## Running a step in a nested agent
 
@@ -434,11 +460,9 @@ or Codex they come from the `omnigent` MCP server: in Claude Code,
 5. Write `started` on the step with `sys_journal_write_status`, naming the
    nested agent in its text, and record the `conversation_id` it returned in
    a note on the step with `sys_journal_write_note`.
-6. Check on it periodically. Start a background timer with your own tools,
-   such as a background shell that sleeps 5 minutes. Each time it fires,
-   read its journal with `sys_journal_read` (`conversation_id`: its session
-   ID), update the step, and start the timer again while it is still
-   working.
+6. Check on it each time your progress timer fires (see "Keep the run
+   going"): read its journal with `sys_journal_read` (`conversation_id`: its
+   session ID) and update the step.
 7. Send it anything it needs with `sys_session_message` (`session_id`: its
    session ID): answers, missing context, and Stop or Continue.
 
@@ -477,9 +501,10 @@ For a goal you can measure, such as "cut p95 latency by 20%":
 
 ## Finish
 
-Before your final reply, write a status for every step you worked on. In the
-reply, lead with anything the user needs to decide, then summarize what was
-done and what is left. If another session started this workflow and your plan
+Before your final reply, write a status for every step you worked on, and
+cancel the progress timer once every step is done or failed. In the reply,
+lead with anything the user needs to decide, then summarize what was done and
+what is left. If another session started this workflow and your plan
 is finished, report back to it now (see "When another workflow started
 you").
 

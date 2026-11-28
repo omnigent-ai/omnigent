@@ -572,6 +572,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
     | _TERMINAL_TOOLS
+    # A timer's wake reaches a native session as a message does, and a saved one
+    # outlives the CLI's own background waits.
+    | _TIMER_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the

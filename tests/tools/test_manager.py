@@ -96,6 +96,10 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
         "sys_reminder_set",
+        # Timers register unless the spec sets ``timers: false``, so a workflow
+        # run can keep its progress timer.
+        "sys_timer_set",
+        "sys_timer_cancel",
         # The session journal's tools are always auto-registered so every
         # agent can keep a plan, step statuses and notes, and ask about a
         # task; runner-dispatched.

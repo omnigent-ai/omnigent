@@ -1222,5 +1222,15 @@ def test_load_agent_def_still_accepts_a_minimal_mapping() -> None:
     assert agent.name == "t"
 
 
+@pytest.mark.parametrize(("data", "expected"), [({}, True), ({"timers": False}, False)])
+def test_load_agent_def_timers_default_on(data: dict[str, object], expected: bool) -> None:
+    """Timers are on unless the YAML sets ``timers: false``, as in the spec parser.
+
+    :param data: Extra top-level YAML keys, e.g. ``{"timers": False}``.
+    :param expected: The resulting ``AgentDef.timers``.
+    """
+    assert load_agent_def({"name": "t", **data}).timers is expected
+
+
 if __name__ == "__main__":
     unittest.main()
