@@ -17,6 +17,12 @@ import {
   type SentDraft,
 } from "./pendingReview";
 import type { PendingHold, PendingSentAs } from "./pendingReviewChanges";
+import { hostPendingIdentity } from "./hostPendingRoute";
+
+/** The same login through the same session's host: the host's own logins are all empty. */
+const sameSender = (left: PendingSentAs, right: PendingSentAs) =>
+  left.login.toLowerCase() === right.login.toLowerCase() &&
+  hostPendingIdentity(left.host) === hostPendingIdentity(right.host);
 
 /**
  * A start that made `reviewId` without adding its comment. While it's kept, the draft at
@@ -50,11 +56,11 @@ export function recordPendingRecovery(
   recovery: Omit<PendingRecovery, "id" | "gone" | "createdAt">,
 ): PendingRecovery {
   for (const [id, existing] of recoveries) {
-    // Only this scope's own pin at this place is replaced; another account's stays kept.
+    // Only this scope's own pin at this place is replaced; another host's stays kept.
     if (
       existing.owner === recovery.owner &&
       existing.prUrl.toLowerCase() === recovery.prUrl.toLowerCase() &&
-      existing.sentAs.login.toLowerCase() === recovery.sentAs.login.toLowerCase() &&
+      sameSender(existing.sentAs, recovery.sentAs) &&
       samePlace(existing.place, recovery.place)
     ) {
       recoveries.delete(id);
@@ -97,7 +103,7 @@ export function resolvePendingRecoveries(
   let moved = false;
   for (const recovery of pendingRecoveriesOf(owner, prUrl)) {
     if (recovery.gone) continue;
-    if (recovery.sentAs.login.toLowerCase() !== sentAs.login.toLowerCase()) continue;
+    if (!sameSender(recovery.sentAs, sentAs)) continue;
     if (read.issued_at === undefined || read.issued_at <= recovery.createdAt) continue;
     if (read.review?.id === recovery.reviewId) continue;
     recoveries.set(recovery.id, { ...recovery, gone: true });

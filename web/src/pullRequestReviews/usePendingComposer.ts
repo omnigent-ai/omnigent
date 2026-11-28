@@ -38,7 +38,7 @@ import {
   useHostPendingChangeInFlight,
   usePendingHolds,
 } from "./pendingReviewChanges";
-import { hostPendingRoute, hostPendingScopeOf } from "./hostPendingRoute";
+import { hostPendingIdentity, hostPendingRoute, hostPendingScopeOf } from "./hostPendingRoute";
 import { invalidatePendingReview, usePendingReview } from "./usePendingReview";
 
 /** One button: its label, whether it can run, and what it does. */
@@ -109,7 +109,11 @@ export function usePendingComposer({
   const { state, refetch } = usePendingReview(prUrl, !!place, conversationId);
   const busy = useHostPendingChangeInFlight(prUrl);
   const holds = usePendingHolds(prUrl);
-  const inScope = (scope: PendingSentAs) => pendingScopeCurrent(scope, prUrl);
+  // Only this session's host, along its current route: another session's sends stay its own.
+  const inScope = (scope: PendingSentAs) => {
+    const current = hostPendingRoute(conversationId, prUrl);
+    return !!current && hostPendingIdentity(scope.host) === hostPendingIdentity(current);
+  };
   const atPlace = (candidate: DraftPlace) => !!place && samePlace(candidate, place);
   const holdHere = (from: PendingHold[]) =>
     from.find(
