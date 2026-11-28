@@ -633,6 +633,64 @@ def test_a_fork_branchs_pull_request_found_by_its_commit_is_read_through_the_gat
     assert any(argv[:5] == ["pr", "view", "17", "-R", f"{KNOWN}/acme/repo"] for argv in started)
 
 
+def test_a_pull_request_found_by_its_commit_never_resets_a_marked_remote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With a remote marked, set-default never runs; it would query the other host's remote."""
+    remotes = {
+        # Sorts first, on a second set-up host: set-default would read its network.
+        "aaa": f"https://{OTHER_KNOWN}/acme/repo.git",
+        "origin": f"https://{KNOWN}/contributor/repo.git",
+    }
+    root = _checkout(tmp_path, remotes, config={"remote.origin.gh-resolved": "base"})
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            root,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "c",
+        ],
+        check=True,
+    )
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", f"{KNOWN},{OTHER_KNOWN}")
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    real_run = github_resource._run
+    started: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> tuple[int | None, str, str]:
+        if argv[0] == "git":
+            return real_run(argv, **kwargs)  # type: ignore[arg-type]
+        started.append(argv[1:])
+        if argv[1:] == ["repo", "set-default", "--view"]:
+            return 0, "contributor/repo\n", ""
+        if argv[1:3] == ["pr", "view"] and argv[3] == "--json":
+            return 1, "", "no pull requests found for branch"
+        if argv[1] == "api" and argv[2].endswith("/pulls"):
+            base = {"ref": "main", "repo": {"full_name": "acme/repo"}}
+            return 0, json.dumps([{"number": 17, "state": "open", "base": base}]), ""
+        if argv[1:4] == ["pr", "view", "17"]:
+            return 0, json.dumps({"number": 17}), ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(github_resource, "_run", run)
+
+    with github_resource.gh_target_host_scope(github_resource.CHECKOUT_SCOPE):
+        data = github_resource._pr_view_json(root, "number")
+
+    assert data == {"number": 17}
+    assert ["repo", "set-default", "--view"] in started
+    assert not [
+        argv for argv in started if argv[:2] == ["repo", "set-default"] and "--view" not in argv
+    ]
+
+
 @pytest.mark.parametrize(
     "origin", [f"https://{KNOWN}/o/r.git", f"git@{KNOWN}:o/r.git", f"{KNOWN}:o/r.git"]
 )
