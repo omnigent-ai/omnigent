@@ -4038,6 +4038,27 @@ def _select_provider_config(
     return selected
 
 
+def _existing_host_credential_refusal(exc: OwnerCredentialMissingError) -> HTTPException:
+    """
+    The 409 for an existing host whose owner's provider credential is unusable.
+
+    A woken or relaunched host may be shared, and anyone with edit access can
+    trigger it, but the sandbox only ever runs as its owner. The provider's
+    message speaks to the owner, so add what everyone else can do.
+
+    :param exc: The launcher's refusal.
+    :returns: The HTTP error to raise.
+    """
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"{exc.message} This sandbox runs as the session owner's account: if you "
+            "are not the owner, ask them to do this, or fork the session to continue "
+            "on your own sandbox."
+        ),
+    )
+
+
 def build_owner_launcher(
     entry: ManagedSandboxConfig,
     deployment: ManagedSandboxDeployment | None,
@@ -4412,7 +4433,7 @@ async def _relaunch_managed_host(
         try:
             await asyncio.to_thread(launcher.terminate, sandbox_id)
         except OwnerCredentialMissingError as exc:
-            raise HTTPException(status_code=409, detail=exc.message) from exc
+            raise _existing_host_credential_refusal(exc) from exc
         except Exception as exc:
             _logger.warning(
                 "Failed to clean up sandbox %s before recovery", sandbox_id, exc_info=True
@@ -4430,7 +4451,7 @@ async def _relaunch_managed_host(
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except OwnerCredentialMissingError as exc:
-        raise HTTPException(status_code=409, detail=exc.message) from exc
+        raise _existing_host_credential_refusal(exc) from exc
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -5057,7 +5078,7 @@ async def resume_managed_host(
             if isinstance(exc, HTTPException):
                 raise
             if isinstance(exc, OwnerCredentialMissingError):
-                raise HTTPException(status_code=409, detail=exc.message) from exc
+                raise _existing_host_credential_refusal(exc) from exc
             message = exc.message if isinstance(exc, click.ClickException) else str(exc)
             raise HTTPException(
                 status_code=502, detail=f"managed host wake failed: {message}"
