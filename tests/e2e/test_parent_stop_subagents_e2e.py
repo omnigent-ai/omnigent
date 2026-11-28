@@ -202,6 +202,20 @@ def test_native_parent_teardown_preserves_child_outcome(
         "OMNIGENT_NO_UPDATE_CHECK": "1",
         "OMNIGENT_SKIP_WEB_UI": "true",
     }
+    if harness == "claude":
+        # Pre-seed the isolated home before host discovery or native launch can read it.
+        claude_config = Path(env["CLAUDE_CONFIG_DIR"])
+        claude_config.mkdir(parents=True)
+        (claude_config / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "hasCompletedOnboarding": True,
+                    "theme": "dark",
+                    "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+                }
+            ),
+            encoding="utf-8",
+        )
     dispatch_prompt = "PARENT_TEARDOWN_PROBE: delegate the research to the worker."
     child_prompt = "CHILD_TEARDOWN_PROBE: research the requested topic."
     # Child turns can precede MCP discovery; built-in tools still exclude title requests.

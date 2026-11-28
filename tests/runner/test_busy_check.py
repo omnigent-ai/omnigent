@@ -4,7 +4,24 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from omnigent.runner.busy_check import RunnerBusyCheck
+
+
+@pytest.mark.parametrize(
+    "method,counts", [("GET", False), ("HEAD", False), ("POST", True), ("PUT", True)]
+)
+def test_mutation_activity_keeps_requests_busy_without_counting_views(method, counts):
+    from omnigent.runner.busy_check import MutatingRequestActivity
+
+    tracker = MutatingRequestActivity(clock=lambda: 42.0)
+    release = tracker.admit(method)
+    assert bool(tracker.active) is counts
+    release()
+    release()
+    assert tracker.active == 0
+    assert tracker.last_activity_at == (42.0 if counts else None)
 
 
 def test_active_work_is_busy() -> None:
