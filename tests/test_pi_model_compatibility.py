@@ -14,6 +14,7 @@ from omnigent.models.model_metadata import (
 from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_model_json_entry,
+    pi_model_with_level_map,
 )
 from omnigent.onboarding.providers import ModelInfo
 
@@ -365,3 +366,44 @@ def test_unknown_thinking_defaults_leave_entry_unchanged() -> None:
 
     entry = {"id": "anthropic-compatible-model"}
     assert pi_model_with_thinking_defaults(entry) is entry
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "system.ai.gpt-6-2-astra",
+        "databricks-gpt-6-astra",
+        "openai/gpt-6.2-astra",
+    ],
+)
+def test_models_without_none_effort_map_unsupported_pi_levels(model_id: str) -> None:
+    """Pi must not offer ``off`` or ``minimal`` where the endpoint rejects them."""
+    entry = pi_model_json_entry(
+        _entry(model_id, reasoning=None, wire=ModelWireAPI.OPENAI_RESPONSES)
+    )
+
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"] == {
+        "off": None,
+        "minimal": None,
+        "xhigh": "xhigh",
+        "max": "max",
+    }
+
+
+@pytest.mark.parametrize(
+    "model_id", ["system.ai.gpt-6-luna", "system.ai.gpt-6-1-sol", "system.ai.gpt-5-5"]
+)
+def test_other_gpt_models_keep_default_thinking_levels(model_id: str) -> None:
+    """Models that accept ``none`` get no level map."""
+    entry = pi_model_json_entry(
+        _entry(model_id, reasoning=True, wire=ModelWireAPI.OPENAI_RESPONSES)
+    )
+
+    assert "thinkingLevelMap" not in entry
+
+
+def test_explicit_thinking_level_map_wins_over_gpt_level_map() -> None:
+    entry = {"id": "system.ai.gpt-6-2-astra", "thinkingLevelMap": {"off": "low"}}
+
+    assert pi_model_with_level_map(entry) is entry

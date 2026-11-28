@@ -59,6 +59,7 @@ from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
     pi_model_json_entry,
+    pi_model_with_level_map,
     pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
@@ -366,7 +367,7 @@ class PiProviderConfig:
                 )
                 if self.api == "anthropic-messages":
                     base["reasoning"] = True
-                models.append(base)
+                models.append(pi_model_with_level_map(base))
             elif surface is DatabricksPiSurface.ANTHROPIC:
                 models.append({"id": self.model, "input": ["text", "image"], "reasoning": True})
             elif surface is not None:
@@ -427,6 +428,7 @@ class PiProviderConfig:
             # when the model entry declares reasoning.
             if "deepseek" in self.model.lower():
                 entry["reasoning"] = True
+            entry = pi_model_with_level_map(entry)
         existing = additional.get(provider_id)
         if existing is not None:
             # Copy rather than mutate: the payload is shared with
