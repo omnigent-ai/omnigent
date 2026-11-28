@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import datetime
 import ssl
+import stat
+import threading
+import time
 from pathlib import Path
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -150,3 +154,66 @@ def test_system_ca_bundle_skips_non_pem_in_capath(tmp_path: Path, monkeypatch) -
 
     assert real_ca in bundle
     assert b"not a certificate" not in bundle
+
+
+def test_ensure_ca_bundle_rewrite_never_exposes_partial_bundle(tmp_path: Path) -> None:
+    """Proxy starts rewrite the shared bundle while other processes load it."""
+    cert_path, _key_path = ensure_ca(cache_dir=tmp_path)
+    extra_ca = [str(cert_path)]
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path, extra_ca_certs=extra_ca)
+    with_extra = bundle_path.read_bytes()
+    ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    complete = {with_extra, bundle_path.read_bytes()}
+    assert len(complete) == 2
+    stop = threading.Event()
+    rewrites = 0
+    writer_errors: list[BaseException] = []
+
+    def rewrite_until_stopped() -> None:
+        nonlocal rewrites
+        try:
+            while not stop.is_set():
+                ensure_ca_bundle(
+                    cert_path,
+                    cache_dir=tmp_path,
+                    extra_ca_certs=extra_ca if rewrites % 2 else None,
+                )
+                rewrites += 1
+        except BaseException as error:
+            writer_errors.append(error)
+
+    writer = threading.Thread(target=rewrite_until_stopped)
+    writer.start()
+    reads = partial_reads = 0
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            reads += 1
+            partial_reads += bundle_path.read_bytes() not in complete
+    finally:
+        stop.set()
+        writer.join()
+
+    assert writer_errors == []
+    assert rewrites > 0
+    assert partial_reads == 0, f"{partial_reads} of {reads} reads saw a partial bundle"
+
+
+@pytest.mark.parametrize("failing_step", ["chmod", "replace"])
+def test_ensure_ca_bundle_keeps_published_bundle_when_publication_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_step: str
+) -> None:
+    cert_path, _key_path = ensure_ca(cache_dir=tmp_path)
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    published = bundle_path.read_bytes()
+    assert stat.S_IMODE(bundle_path.stat().st_mode) == 0o644
+
+    def fail_step(*args: object) -> None:
+        raise OSError(f"{failing_step} failed")
+
+    monkeypatch.setattr(ca_module.os, failing_step, fail_step)
+    with pytest.raises(OSError, match=f"{failing_step} failed"):
+        ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+
+    assert bundle_path.read_bytes() == published
+    assert list(tmp_path.glob(f".{bundle_path.name}.*")) == []

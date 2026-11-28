@@ -12,6 +12,7 @@ import datetime
 import logging
 import os
 import ssl
+import tempfile
 from pathlib import Path
 
 from cryptography import x509
@@ -85,7 +86,16 @@ def ensure_ca_bundle(
 
     parts.append(ca_cert_path.read_bytes())
 
-    bundle_path.write_bytes(b"\n".join(parts))
+    # Other proxy starts read this shared bundle, so replace it in one step.
+    fd, temp_name = tempfile.mkstemp(prefix=f".{bundle_path.name}.", dir=cache)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(b"\n".join(parts))
+        os.chmod(temp_name, 0o644)
+        os.replace(temp_name, bundle_path)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
     logger.debug("Wrote combined CA bundle to %s", bundle_path)
     return bundle_path
 

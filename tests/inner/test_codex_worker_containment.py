@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from omnigent.inner.codex_executor import _CodexAppServerSession
+from omnigent.inner.codex_executor import _CodexAppServerSession, _populate_codex_home_config
 from omnigent.inner.codex_worker import (
     _BROKERED_AUTH_SECRET_ENV,
     BROKERED_CODEX_ENV,
@@ -33,8 +39,10 @@ from omnigent.inner.model_signer import SignerReadiness
 from omnigent.inner.sandbox import (
     HarnessSandboxPreparationError,
     SandboxPolicy,
+    with_additional_write_files,
     with_additional_write_roots,
 )
+from tests.e2e._harness_probes import bwrap_namespace_unavailable_reason, cli_unavailable_reason
 
 
 class _Pipe:
@@ -228,6 +236,77 @@ def test_worker_grants_only_selected_skills_directory_read_only(
                 for root in [*policy.read_roots, *policy.write_roots]
             )
             assert policy.write_roots == [codex_home.resolve()]
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "layout", ["plain", "linked_codex_home", "linked_login", "replaced_after_check"]
+)
+def test_worker_grants_plain_host_login_and_detaches_host_memories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, layout: str
+) -> None:
+    """Only a plain host login file is granted; the shared memories DB stays on the host."""
+    host_codex = tmp_path / "host-codex"
+    host_codex.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"auth_mode": "chatgpt"}')
+    if layout == "linked_login":
+        (host_codex / "auth.json").symlink_to(outside)
+    else:
+        (host_codex / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (host_codex / "memories_1.sqlite").write_bytes(b"host memories")
+    source = host_codex
+    if layout == "linked_codex_home":
+        source = tmp_path / "dotfiles-codex"
+        source.symlink_to(host_codex)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    _populate_codex_home_config(codex_home, source)
+    assert (codex_home / "memories_1.sqlite").is_symlink()
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.touch()
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
+    create_launcher = Mock(return_value=str(tmp_path / "launcher"))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox",
+        Mock(return_value=_active_policy(tmp_path)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+    if layout == "replaced_after_check":
+
+        def replace_login_then_grant(policy: SandboxPolicy, files: list[Path]) -> SandboxPolicy:
+            (host_codex / "auth.json").unlink()
+            (host_codex / "auth.json").symlink_to(outside)
+            return with_additional_write_files(policy, files)
+
+        monkeypatch.setattr(
+            "omnigent.inner.codex_worker.with_additional_write_files", replace_login_then_grant
+        )
+
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        spawn_env_names=["PATH", "CODEX_HOME"],
+    )
+    try:
+        login = host_codex.resolve() / "auth.json"
+        granted = [login] if layout in ("plain", "linked_codex_home") else []
+        for policy in (
+            backend.wrap_launcher_argv.call_args.args[1],
+            create_launcher.call_args.args[1],
+        ):
+            assert policy.write_files == granted
+            assert policy.write_roots == [codex_home.resolve()]
+        if granted:
+            assert os.readlink(codex_home / "auth.json") == str(login)
+        assert not os.path.lexists(codex_home / "memories_1.sqlite")
+        assert (host_codex / "memories_1.sqlite").read_bytes() == b"host memories"
     finally:
         worker.close()
 
@@ -1224,3 +1303,157 @@ def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
         signer_private.rmdir()
 
     assert completed.returncode == 0, completed.stderr
+
+
+def _fake_jwt(claims: dict[str, object]) -> str:
+    def encode(part: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(part).encode()).rstrip(b"=").decode()
+
+    return f"{encode({'alg': 'none'})}.{encode(claims)}.signature"
+
+
+def _write_chatgpt_login(codex_dir: Path) -> None:
+    account = {"chatgpt_account_id": "account-example", "chatgpt_plan_type": "plus"}
+    claims = {
+        "email": "user@example.com",
+        "exp": 4102444800,
+        "https://api.openai.com/auth": account,
+    }
+    tokens = {
+        "id_token": _fake_jwt(claims),
+        "access_token": _fake_jwt(claims),
+        "refresh_token": "refresh-example",
+        "account_id": "account-example",
+    }
+    (codex_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": tokens,
+                "last_refresh": "2026-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.timeout(150)
+@pytest.mark.parametrize("host_codex_state", ["login_only", "after_codex_use"])
+async def test_real_bwrap_network_denied_worker_starts_with_host_chatgpt_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    host_codex_state: str,
+) -> None:
+    if (reason := cli_unavailable_reason("codex")) is not None:
+        pytest.skip(f"requires a runnable 'codex' CLI; {reason}")
+    if (reason := bwrap_namespace_unavailable_reason()) is not None:
+        pytest.skip(f"cannot execute bwrap namespaces here: {reason}")
+    home = tmp_path / "home"
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True)
+    _write_chatgpt_login(codex_dir)
+    if host_codex_state == "after_codex_use":
+        sqlite3.connect(codex_dir / "memories_1.sqlite").close()
+    workspace = home / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    session = _CodexAppServerSession(
+        codex_path=shutil.which("codex") or "codex",
+        cwd=str(workspace),
+        env={"PATH": os.environ["PATH"], "HOME": str(home)},
+        tool_executor=None,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=False),
+        ),
+    )
+
+    try:
+        await asyncio.wait_for(session.start(), 120)
+        auth_status = await asyncio.wait_for(
+            session._request("getAuthStatus", {"includeToken": False, "refreshToken": False}),
+            20,
+        )
+    finally:
+        await session.close()
+
+    assert auth_status["result"]["authMethod"] == "chatgpt", auth_status
+
+
+@pytest.mark.timeout(150)
+async def test_real_bwrap_worker_refreshes_host_login_in_place(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real Codex token refresh inside the contained worker rotates the host login in place."""
+    if (reason := cli_unavailable_reason("codex")) is not None:
+        pytest.skip(f"requires a runnable 'codex' CLI; {reason}")
+    if (reason := bwrap_namespace_unavailable_reason()) is not None:
+        pytest.skip(f"cannot execute bwrap namespaces here: {reason}")
+    refresh_requests: list[dict[str, object]] = []
+
+    class TokenEndpoint(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            refresh_requests.append(json.loads(body))
+            token = _fake_jwt({"email": "user@example.com", "exp": 4102444800})
+            reply = {"id_token": token, "access_token": token, "refresh_token": "refresh-rotated"}
+            payload = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    home = tmp_path / "home"
+    host_codex = home / ".codex"
+    host_codex.mkdir(parents=True)
+    _write_chatgpt_login(host_codex)
+    host_inode = (host_codex / "auth.json").stat().st_ino
+    workspace = home / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    token_server = ThreadingHTTPServer(("127.0.0.1", 0), TokenEndpoint)
+    threading.Thread(target=token_server.serve_forever, daemon=True).start()
+    try:
+        token_url = f"http://127.0.0.1:{token_server.server_port}/oauth/token"
+        session = _CodexAppServerSession(
+            codex_path=shutil.which("codex") or "codex",
+            cwd=str(workspace),
+            env={
+                "PATH": os.environ["PATH"],
+                "HOME": str(home),
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE": token_url,
+            },
+            tool_executor=None,
+            # The worker shares the test's loopback only with network allowed; grants are the same.
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(workspace),
+                sandbox=OSEnvSandboxSpec(
+                    type="linux_bwrap", write_paths=["."], allow_network=True
+                ),
+            ),
+        )
+        try:
+            await asyncio.wait_for(session.start(), 120)
+            assert session._worker_launch is not None
+            assert session._worker_launch.sandboxed
+            auth_status = await asyncio.wait_for(
+                session._request("getAuthStatus", {"includeToken": False, "refreshToken": True}),
+                30,
+            )
+        finally:
+            await session.close()
+    finally:
+        token_server.shutdown()
+        token_server.server_close()
+
+    assert auth_status["result"]["authMethod"] == "chatgpt", auth_status
+    assert [request["refresh_token"] for request in refresh_requests] == ["refresh-example"]
+    host_login = json.loads((host_codex / "auth.json").read_text())
+    assert host_login["tokens"]["refresh_token"] == "refresh-rotated"
+    assert (host_codex / "auth.json").stat().st_ino == host_inode
