@@ -1289,6 +1289,171 @@ def test_anthropic_api_listing_uses_api_key_headers(
     assert opus.metadata.reasoning.modes == frozenset({ModelReasoningMode.ADAPTIVE})
 
 
+def test_gemini_key_listing_paginates_filters_and_populates_metadata_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``gemini`` key provider calls native ``/v1beta/models`` with ``x-goog-api-key``."""
+    from omnigent.llms.gemini_model_metadata import (
+        _clear_model_metadata_cache,
+        lookup_cached_gemini_context_window,
+    )
+    from omnigent.models.model_metadata import ModelWireAPI
+
+    _clear_model_metadata_cache()
+    try:
+        monkeypatch.setenv("GEMINI_API_KEY", "gm-test-key")
+        _isolate_config(
+            monkeypatch,
+            tmp_path,
+            "providers:\n"
+            "  gemini:\n"
+            "    kind: key\n"
+            "    default: true\n"
+            "    gemini:\n"
+            "      base_url: https://generativelanguage.googleapis.com/v1beta/openai\n"
+            "      api_key: $GEMINI_API_KEY\n",
+        )
+        requests_seen: list[httpx.Request] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            requests_seen.append(request)
+            if request.url.params.get("pageToken") is None:
+                return httpx.Response(
+                    200,
+                    json={
+                        "models": [
+                            {
+                                "name": "models/gemini-3.8-flash",
+                                "inputTokenLimit": 1_048_576,
+                                "outputTokenLimit": 65_536,
+                                "thinking": True,
+                                "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            },
+                            {
+                                "name": "models/text-embedding-004",
+                                "inputTokenLimit": 2048,
+                                "supportedGenerationMethods": ["embedContent"],
+                            },
+                        ],
+                        "nextPageToken": "page-2",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "models/gemini-2.0-flash",
+                            "inputTokenLimit": 1_048_576,
+                            "outputTokenLimit": 8192,
+                            "thinking": False,
+                            "supportedGenerationMethods": ["generateContent"],
+                        }
+                    ]
+                },
+            )
+
+        listing = list_models_for_worker(
+            _worker_spec("antigravity-native"),
+            "antigravity-native",
+            transport=httpx.MockTransport(_handler),
+        )
+
+        assert len(requests_seen) == 2
+        assert (
+            requests_seen[0].url.path == "/v1beta/models"
+            and requests_seen[0].url.host == "generativelanguage.googleapis.com"
+        )
+        assert requests_seen[0].headers["x-goog-api-key"] == "gm-test-key"
+        assert requests_seen[1].url.params.get("pageToken") == "page-2"
+
+        assert listing.source == "gemini-api"
+        assert listing.verified is True
+        # Embedding-only model is filtered out; both generateContent models survive.
+        assert [m.id for m in listing.models] == ["gemini-3.8-flash", "gemini-2.0-flash"]
+
+        flash = listing.models[0]
+        assert flash.context_window == 1_048_576
+        assert flash.metadata.max_output_tokens == 65_536
+        assert flash.metadata.supports(ModelCapability.REASONING) is True
+        assert flash.metadata.wire_apis == frozenset({ModelWireAPI.GEMINI_GENERATE_CONTENT})
+        assert listing.models[1].metadata.supports(ModelCapability.REASONING) is False
+        assert lookup_cached_gemini_context_window("gemini/gemini-3.8-flash") == 1_048_576
+    finally:
+        _clear_model_metadata_cache()
+
+
+def test_gemini_key_listing_stops_on_repeated_page_token_and_deduplicates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A looping ``nextPageToken`` terminates without hanging and deduplicates repeated ids."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gm-loop-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-unrelated")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  openai:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://api.openai.com/v1\n"
+        "      api_key: $OPENAI_API_KEY\n"
+        "  gemini:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    gemini:\n"
+        "      base_url: https://generativelanguage.googleapis.com/v1beta\n"
+        "      api_key: $GEMINI_API_KEY\n",
+    )
+    calls = 0
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {
+                        "name": "models/gemini-shared",
+                        "inputTokenLimit": 1_048_576,
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                    {
+                        "name": f"models/gemini-loop-{calls}",
+                        "inputTokenLimit": 1_048_576,
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                ],
+                "nextPageToken": "stuck-token",
+            },
+        )
+
+    listing = list_models_for_worker(
+        _worker_spec("antigravity-native"),
+        "antigravity-native",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert calls == 2
+    assert [m.id for m in listing.models] == ["gemini-shared", "gemini-loop-1", "gemini-loop-2"]
+
+
+def test_antigravity_does_not_leak_global_auth_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Global ``auth:`` keys (OpenAI/gateway) are never forwarded to Gemini by antigravity."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "auth:\n  type: api_key\n  api_key: sk-global-openai-secret\n",
+    )
+    provider = resolve_model_provider(_worker_spec("antigravity-native"), "antigravity-native")
+    assert provider.kind == "none"
+    assert provider.api_key is None
+
+
 def test_subscription_listing_is_static_and_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

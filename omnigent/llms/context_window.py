@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from omnigent.llms.gemini_model_metadata import lookup_cached_gemini_context_window
 from omnigent.onboarding.providers import (
     ModelInfo,
     find_catalog_models,
@@ -74,9 +75,9 @@ def find_model_context_window(model: str) -> int | None:
     Look up the model's context window in tokens, or ``None`` when unknown.
 
     Same resolution as :func:`get_model_context_window` (env override,
-    model-id markers, catalog, litellm) but with no default fallback, for
-    callers that must omit the window rather than report a guessed one
-    (e.g. the kimi-native forwarder's context ring).
+    model-id markers, live Gemini metadata cache, catalog, litellm) but with
+    no default fallback, for callers that must omit the window rather than
+    report a guessed one (e.g. the kimi-native forwarder's context ring).
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"``.
     :returns: Context window size in tokens, or ``None`` when no
@@ -88,6 +89,9 @@ def find_model_context_window(model: str) -> int | None:
     encoded = _encoded_context_window(model)
     if encoded is not None:
         return encoded
+    gemini_window = lookup_cached_gemini_context_window(model)
+    if gemini_window is not None:
+        return gemini_window
     catalog_window = _catalog_context_window(model)
     if catalog_window is not None:
         return catalog_window
@@ -125,11 +129,13 @@ def get_model_context_window(model: str) -> int:
        Supports custom/self-hosted models and e2e compaction tests.
     2. :func:`_encoded_context_window` — explicit provider metadata carried
        in the model id, currently Anthropic's ``[1m]`` beta marker.
-    3. Shared MLflow catalog metadata. This is the authoritative dynamic
+    3. Live Gemini Models API metadata cache (in-memory only, populated from
+       canonical Google Gemini ``/v1beta/models`` lookups).
+    4. Shared MLflow catalog metadata. This is the authoritative dynamic
        source and reuses the onboarding/model-resolver cache.
-    4. ``litellm.get_model_info()`` — optional local metadata. Also
+    5. ``litellm.get_model_info()`` — optional local metadata. Also
        tried with the ``databricks/`` prefix for Databricks models.
-    5. ``DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
+    6. ``DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"`` or
         ``"databricks-gpt-5-5"``.
