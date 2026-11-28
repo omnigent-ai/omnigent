@@ -4968,6 +4968,13 @@ async def _auto_create_kimi_terminal(
     then advertises the pane's tmux socket+target so the kimi-native harness
     executor can inject web-UI turns into the same pane (tmux paste).
 
+    The agent's startup instructions reach Kimi through a private ``SYSTEM.md``
+    in the session home (:mod:`omnigent.harnesses.kimi_native.system_prompt`).
+    ``model_override`` is passed as ``-m`` (a Kimi config alias). When the prior
+    launch's Kimi session is still valid, the TUI resumes it with ``-S <id>`` and
+    the forwarder keeps its delivered cursor; pass-through session or agent
+    selectors disable that auto-resume.
+
     The pane runs with a session-scoped ``KIMI_CODE_HOME`` (built by
     :func:`omnigent.harnesses.kimi_native.credentials.build_kimi_session_home`) that
     mirrors the user's global ``kimi login`` (symlinked ``oauth`` / providers)
@@ -4992,8 +4999,8 @@ async def _auto_create_kimi_terminal(
     :param ensure_comment_relay: Unused; kept for call-site parity with the
         other native auto-create helpers.
     :param agent_spec: The session's resolved agent spec. Its ``os_env`` is
-        inherited by the terminal so a declared sandbox is honoured (model
-        pinning via the kimi TUI is a follow-up).
+        inherited by the terminal so a declared sandbox is honoured, and its
+        instructions are composed into the private ``SYSTEM.md``.
     :returns: Created terminal resource view.
     """
     del ensure_comment_relay
@@ -5005,19 +5012,20 @@ async def _auto_create_kimi_terminal(
     from omnigent.harnesses.kimi_native.credentials import build_kimi_session_home
     from omnigent.harnesses.kimi_native.forwarder import (
         clear_kimi_bridge_state,
+        prepare_kimi_bridge_state,
         supervise_kimi_forwarder,
     )
     from omnigent.harnesses.kimi_native.main import resolve_kimi_executable
+    from omnigent.harnesses.kimi_native.system_prompt import write_kimi_system_prompt
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     # Stamp launch time before the TUI starts so the forwarder only adopts a kimi
-    # session created for THIS launch. Tear down any prior forwarder + its line
-    # offset so a re-created terminal tails the fresh wire log (mirrors cursor).
+    # session created for THIS launch. Tear down any prior forwarder; its cursor
+    # is kept only for a resumed session (below).
     launch_epoch_ms = int(time.time() * 1000)
     await _cancel_auto_forwarder_task(session_id)
-    clear_kimi_bridge_state(bridge_dir)
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -5031,6 +5039,44 @@ async def _auto_create_kimi_terminal(
     # launch args (``omnigent kimi -- <args>``) are persisted on the session
     # snapshot and threaded here.
     kimi_args = list(launch_config.terminal_launch_args or [])
+    kimi_home = bridge_dir / "kimi-code-home"
+    # A pass-through session or agent selector is the user's choice; Kimi also
+    # refuses ``--agent``/``--agent-file`` together with ``-S``.
+    user_selects_session = any(
+        arg in ("-S", "--session", "-r", "--resume", "-c", "--continue", "--agent", "--agent-file")
+        or arg.startswith(("--session=", "--resume=", "--agent=", "--agent-file="))
+        for arg in kimi_args
+    )
+    if user_selects_session:
+        clear_kimi_bridge_state(bridge_dir)
+        resume_session_id = None
+    else:
+        resume_session_id = prepare_kimi_bridge_state(
+            bridge_dir, kimi_home=kimi_home, workspace=workspace
+        )
+    launch_flags = ["-S", resume_session_id] if resume_session_id is not None else []
+    if launch_config.model_override is not None and not any(
+        arg in ("-m", "--model") or arg.startswith("--model=") for arg in kimi_args
+    ):
+        launch_flags += ["-m", launch_config.model_override]
+    kimi_args = [*launch_flags, *kimi_args]
+    # Written before the session home is built, which skips existing entries,
+    # so a global ``SYSTEM.md`` is never symlinked in its place.
+    write_kimi_system_prompt(
+        kimi_home,
+        await _native_startup_instructions(
+            agent_spec, server_client, session_id, workspace=workspace
+        ),
+    )
+    if any(
+        arg in ("--agent", "--agent-file") or arg.startswith(("--agent=", "--agent-file="))
+        for arg in kimi_args
+    ):
+        _logger.warning(
+            "kimi-native session %s selects a custom Kimi agent; Omnigent startup "
+            "instructions are not delivered to it",
+            session_id,
+        )
 
     # Wire the Omnigent tool-policy hooks: kimi reads a single
     # ``$KIMI_CODE_HOME/config.toml``, so point it at a session-scoped home that

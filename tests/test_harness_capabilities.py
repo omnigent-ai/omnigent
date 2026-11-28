@@ -381,7 +381,13 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
 
 
 def test_native_startup_additive_instruction_delivery() -> None:
-    for harness in ("claude-native", "codex-native", "pi-native", "antigravity-native"):
+    for harness in (
+        "claude-native",
+        "codex-native",
+        "pi-native",
+        "antigravity-native",
+        "kimi-native",
+    ):
         assert (
             harness_capabilities()[harness].instruction_delivery
             is InstructionDelivery.AGENT_STARTUP_ADDITIVE

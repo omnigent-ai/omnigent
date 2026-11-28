@@ -38,6 +38,7 @@ from omnigent.harnesses.kimi_native.forwarder import (
     _write_usage_state,
     clear_kimi_bridge_state,
     forward_kimi_wire_to_session,
+    prepare_kimi_bridge_state,
     read_kimi_wire_items,
     read_new_kimi_wire_items,
 )
@@ -443,6 +444,97 @@ class TestState:
         loaded = _read_state(tmp_path)
         assert loaded is not None
         assert loaded.last_assistant_text == "partial result"
+
+
+_RESUME_SESSION = "session_3f2b8c1e-4d5a-4b6c-8d7e-9f0a1b2c3d4e"
+
+
+def _resumable_session(
+    tmp_path: Path, *, session_name: str = _RESUME_SESSION, work_dir: str = "/ws"
+) -> tuple[Path, Path, Path]:
+    """A bridge dir whose state names a delivered wire in the private Kimi store."""
+    bridge = tmp_path / "bridge"
+    home = bridge / "kimi-code-home"
+    wire = home / "sessions" / "wd_ws_0123456789ab" / session_name / "agents" / "main"
+    wire = wire / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text(
+        "".join(json.dumps(row) + "\n" for row in (_prompt_row(), _assistant_row("u1", "hi"))),
+        encoding="utf-8",
+    )
+    (home / "session_index.jsonl").write_text(
+        json.dumps({"sessionDir": str(wire.parent.parent.parent), "workDir": work_dir}) + "\n",
+        encoding="utf-8",
+    )
+    wire_stat = wire.stat()
+    _write_state(
+        bridge,
+        _ForwardState(
+            wire_path=str(wire),
+            last_line=2,
+            offset=wire_stat.st_size,
+            turn_open=True,
+            tools_in_flight=1,
+            last_edge_id="kimi:turn_end:9",
+            dropped_edge_status="failed",
+            dropped_edge_output="boom",
+            last_assistant_text="hi",
+            turn_seq=4,
+            last_activity_ts=1_700_000_000.0,
+            wire_dev=wire_stat.st_dev,
+            wire_ino=wire_stat.st_ino,
+            last_prompt_id="kimi:turn:0",
+        ),
+    )
+    return bridge, home, wire
+
+
+class TestPrepareBridgeState:
+    def test_resumable_session_keeps_cursor_and_resets_lifecycle(self, tmp_path: Path) -> None:
+        bridge, home, wire = _resumable_session(tmp_path)
+
+        assert prepare_kimi_bridge_state(bridge, kimi_home=home, workspace="/ws") == (
+            _RESUME_SESSION
+        )
+
+        state = _read_state(bridge)
+        assert state is not None
+        assert (state.wire_path, state.last_line, state.offset) == (
+            str(wire),
+            2,
+            wire.stat().st_size,
+        )
+        assert (state.last_edge_id, state.last_prompt_id, state.turn_seq) == (
+            "kimi:turn_end:9",
+            "kimi:turn:0",
+            4,
+        )
+        assert (state.wire_dev, state.wire_ino) == (wire.stat().st_dev, wire.stat().st_ino)
+        assert state.turn_open is False
+        assert state.tools_in_flight == 0
+        assert state.last_assistant_text == ""
+        assert (state.dropped_edge_status, state.dropped_edge_output) == (None, "")
+        assert state.last_activity_ts is None
+        assert state.replay_floor_line == 2
+
+    @pytest.mark.parametrize(
+        "case", ["other-workspace", "malformed-session-dir", "missing-wire", "symlinked-wire"]
+    )
+    def test_unresumable_state_is_cleared(self, tmp_path: Path, case: str) -> None:
+        bridge, home, wire = _resumable_session(
+            tmp_path,
+            session_name="session_a" if case == "malformed-session-dir" else _RESUME_SESSION,
+            work_dir="/elsewhere" if case == "other-workspace" else "/ws",
+        )
+        if case == "missing-wire":
+            wire.unlink()
+        if case == "symlinked-wire":
+            outside = tmp_path / "outside.jsonl"
+            wire.replace(outside)
+            wire.symlink_to(outside)
+
+        assert prepare_kimi_bridge_state(bridge, kimi_home=home, workspace="/ws") is None
+        assert _read_state(bridge) is None
 
 
 class TestReadNewIncremental:
@@ -2105,6 +2197,34 @@ class TestForwardLoopEdges:
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), prepare=_seed)
 
         assert self.statuses == [("idle", "")]
+
+    async def test_cold_resume_rewrite_on_new_inode_posts_no_history(self, tmp_path: Path) -> None:
+        delivered = [_prompt_row("old prompt"), _assistant_row("old", "OLD ANSWER")]
+        rows = [*delivered, _prompt_row("new prompt"), _assistant_row("new", "NEW ANSWER")]
+        rows.append(_turn_ended_row("completed"))
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            old_text = "".join(json.dumps(row) + "\n" for row in delivered)
+            old_wire = wire.with_suffix(".old")
+            old_wire.write_text(old_text, encoding="utf-8")
+            old_stat = old_wire.stat()
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=2,
+                    offset=len(old_text.encode()),
+                    last_seen_offset=len(old_text.encode()),
+                    wire_dev=old_stat.st_dev,
+                    wire_ino=old_stat.st_ino,
+                    replay_floor_line=2,
+                ),
+            )
+
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), prepare=_seed)
+
+        assert self.items == ["kimi:turn:2", "kimi:new"]
+        assert self.statuses == [("idle", "NEW ANSWER")]
 
     async def test_turn_ended_completed_posts_idle_edge_with_output(self, tmp_path: Path) -> None:
         rows = [_prompt_row(), _assistant_row("u1", "done!"), _turn_ended_row("completed")]
