@@ -105,11 +105,17 @@ export async function fetchWorkspaceVideoBlob(
   return readVideoResponse(res, path, { signal });
 }
 
+/**
+ * A confined read the server must acknowledge: `workspace` reads only the session's own
+ * workspace; `family` reads a host-absolute path from a same-family session's workspace.
+ */
+export type FileReadScope = "workspace" | "family";
+
 export async function fetchFileContent(
   conversationId: string,
   path: string,
   signal?: AbortSignal,
-  options: { scope?: "workspace"; sshTarget?: string | null } = {},
+  options: { scope?: FileReadScope; sshTarget?: string | null } = {},
 ): Promise<FileContentResponse> {
   const { sshTarget, ...query } = options;
   // The workspace API reads only inside the workspace, so it serves either scope.
@@ -125,7 +131,7 @@ export async function fetchFileContentViaRest(
   conversationId: string,
   path: string,
   signal?: AbortSignal,
-  query: { scope?: "workspace" } = {},
+  query: { scope?: FileReadScope } = {},
 ): Promise<FileContentResponse> {
   const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, query), { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);

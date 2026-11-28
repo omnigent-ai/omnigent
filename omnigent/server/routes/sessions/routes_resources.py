@@ -9,6 +9,7 @@ import functools
 import json
 import mimetypes
 import ntpath
+import posixpath
 import re
 import time
 import urllib.parse
@@ -36,7 +37,10 @@ from omnigent.entities import (
     Conversation,
     StoredFile,
 )
-from omnigent.entities.session_resources import session_resource_view_to_dict
+from omnigent.entities.session_resources import (
+    DEFAULT_ENVIRONMENT_ID,
+    session_resource_view_to_dict,
+)
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.host.frames import PullRequestVouch
 from omnigent.host.workspace_tokens import mint_token
@@ -229,6 +233,10 @@ _UPLOAD_FIELDS_MARGIN_BYTES = 64 * 1024
 # Automatic previews can require this acknowledgement when talking to older servers.
 _WORKSPACE_FILE_SCOPE_HEADERS = {
     "X-Omnigent-File-Scope": "workspace",
+    "Access-Control-Expose-Headers": "X-Omnigent-File-Scope",
+}
+_FAMILY_FILE_SCOPE_HEADERS = {
+    "X-Omnigent-File-Scope": "family",
     "Access-Control-Expose-Headers": "X-Omnigent-File-Scope",
 }
 
@@ -1088,6 +1096,88 @@ def register_resources_routes(
         if absolute:
             return True, "/" + client_path.lstrip("/")
         return False, client_path
+
+    def _family_workspace_match(
+        source: Conversation, absolute_path: str
+    ) -> tuple[str, str] | None:
+        """Pick the same-host family member whose workspace holds *absolute_path*.
+
+        :param source: The displayed session.
+        :param absolute_path: Canonical host-absolute path.
+        :returns: ``(member_session_id, path_relative_to_its_workspace)``, or
+            ``None`` when no other member qualifies.
+        """
+        try:
+            family = conversation_store.get_session_family(source.id)
+        except NotImplementedError:
+            return None
+        host_owner = routing_host_session(source, conversation_store)
+        # Without a known host nothing shows that a member's files share this
+        # session's filesystem, and without a known workspace the own-workspace
+        # exclusion below cannot be applied.
+        source_workspace = source.workspace or (host_owner.workspace if host_owner else None)
+        if host_owner is None or host_owner.host_id is None or not source_workspace:
+            return None
+        source_host_id = host_owner.host_id
+        # The displayed session reads its own workspace with ``scope=workspace``,
+        # so a member rooted at the same or an enclosing directory never serves it.
+        # A "/" workspace holds every path.
+        source_root = source_workspace.rstrip("/")
+        if not source_root.startswith("/") or absolute_path.startswith(f"{source_root}/"):
+            return None
+        match: tuple[str, str] | None = None
+        matched_root_length = -1
+        for member in family:
+            # A "/" workspace would hold every host path, so it never matches.
+            root = (member.workspace or "").rstrip("/")
+            if member.id == source.id or not root.startswith("/"):
+                continue
+            if not absolute_path.startswith(f"{root}/") or len(root) <= matched_root_length:
+                continue
+            # The reply cites a path on the displayed session's host; a member on
+            # another host may record the same path for different files, and its
+            # reads route through another host's tunnel.
+            if routing_host_id(member, conversation_store) != source_host_id:
+                continue
+            match = (member.id, absolute_path[len(root) + 1 :])
+            matched_root_length = len(root)
+        return match
+
+    async def _family_workspace_target(
+        source: Conversation, absolute_path: str
+    ) -> tuple[str, str]:
+        """Find the family session whose recorded workspace holds an absolute path.
+
+        Lets a reply show a file a nested worker saved in its own workspace
+        (e.g. a sibling git worktree) without reading anywhere that is not some
+        session's workspace. Only members on the displayed session's host count,
+        and the deepest matching workspace wins, so a worktree nested inside
+        another member's workspace resolves to its own session.
+
+        :param source: The displayed session, already authorized for browsing.
+        :param absolute_path: Canonical host-absolute path, e.g.
+            ``"/home/u/repo-worktrees/fix/shot.png"``.
+        :returns: ``(member_session_id, path_relative_to_its_workspace)``.
+        :raises HTTPException: 400 for a non-canonical path, 404 when no other
+            same-host family member's workspace contains it.
+        """
+        if posixpath.normpath(absolute_path) != absolute_path or absolute_path.startswith("//"):
+            raise HTTPException(status_code=400, detail="Family scope requires a canonical path")
+        match = await asyncio.to_thread(_family_workspace_match, source, absolute_path)
+        if match is None:
+            raise _family_path_not_found()
+        return match
+
+    def _family_path_not_found() -> HTTPException:
+        """The one answer for a family path with no readable member workspace.
+
+        A matching member the caller cannot browse gets this same answer, so it
+        does not reveal where an unshared sibling's workspace is.
+        """
+        return HTTPException(
+            status_code=404,
+            detail="No session in this family has a readable workspace holding that path",
+        )
 
     async def _authorize_absolute_browse(
         conversation: Conversation,
@@ -3516,7 +3606,7 @@ def register_resources_routes(
         # A plain default, not ``Query(...)``: the root listing calls this
         # function directly, and a ``Query`` object is truthy.
         download: bool = False,
-        scope: Literal["workspace"] | None = None,
+        scope: Literal["workspace", "family"] | None = None,
     ) -> Any:
         """
         Read a file or list a directory in an environment.
@@ -3535,6 +3625,8 @@ def register_resources_routes(
             attachment with no size cap instead of the capped JSON
             envelope. A directory rejects it with 400.
         :param scope: ``workspace`` also confines owner reads, including symlinks.
+            ``family`` takes a host-absolute path and reads it from the family
+            session whose workspace holds it, confined like ``workspace``.
         :returns: File content or directory listing, or the raw file.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
@@ -3548,8 +3640,38 @@ def register_resources_routes(
         # shared context, everything past it is the owner's own machine. See
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
+        requested_path = relative_path
         absolute, relative_path = _resolve_browse_path(request, relative_path)
-        conv, owner = await _authorize_browse_read_with_owner(session_id, request, relative_path)
+        family_scope = scope == "family"
+        if family_scope:
+            # ``base=host`` with the path's leading slash dropped, as the client sends
+            # it; checked before browse normalization collapses extra leading slashes.
+            # Matching uses recorded workspaces, which root the primary environment;
+            # a terminal environment may be rooted elsewhere.
+            if (
+                not absolute
+                or download
+                or requested_path.startswith("/")
+                or environment_id != DEFAULT_ENVIRONMENT_ID
+            ):
+                raise HTTPException(
+                    status_code=400, detail="Family scope reads an absolute file path"
+                )
+            source = await _authorize_browse_read(session_id, request)
+            # From here on this is an ordinary workspace-scoped read of the member
+            # session, under that session's own browse authorization.
+            session_id, relative_path = await _family_workspace_target(source, relative_path)
+            absolute, scope = False, "workspace"
+            try:
+                conv, owner = await _authorize_browse_read_with_owner(
+                    session_id, request, relative_path
+                )
+            except OmnigentError as exc:
+                raise _family_path_not_found() from exc
+        else:
+            conv, owner = await _authorize_browse_read_with_owner(
+                session_id, request, relative_path
+            )
         if scope == "workspace" and (absolute or ntpath.isabs(relative_path)):
             raise HTTPException(status_code=400, detail="Workspace scope requires a relative path")
 
@@ -3587,7 +3709,9 @@ def register_resources_routes(
             else None
         )
         if scope == "workspace":
-            response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
+            response.headers.update(
+                _FAMILY_FILE_SCOPE_HEADERS if family_scope else _WORKSPACE_FILE_SCOPE_HEADERS
+            )
         # The session is already validated above at the browse level, which is
         # stricter than main's plain LEVEL_READ for an absolute path.
         return _skip_gzip_for_binary(
