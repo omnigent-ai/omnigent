@@ -35,10 +35,14 @@ anyone needs to read through.
    args={purpose: "review", input: "Read the diff at <absolute shared diff path>
    (base <base-sha>, head <head-sha>). <The acceptance contract>.
    Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code. If the snapshot is inaccessible, report that
-   failure rather than reviewing from a summary."})`. Pass the snapshot path,
-   not its contents; do NOT point the reviewer at the implementer's worktree.
-   Prepare the snapshot and emit the
+   suggestions. Do not edit code. You are a leaf reviewer. You have no
+   sub-agents and no ability to delegate — do not attempt to dispatch, and do
+   not describe a delegation plan. Review the supplied snapshot yourself and
+   return the structured report. Check that changed docstrings/comments
+   describe the shipped diff, not an approach that was tried and rejected. If
+   the snapshot is inaccessible, report that failure rather than reviewing
+   from a summary."})`. Pass the snapshot path, not its contents; do NOT point
+   the reviewer at the implementer's worktree. Prepare the snapshot and emit the
    `sys_session_send` call in the SAME turn you decide to review — never end a
    turn having only announced "I'll load cross-review and fetch the diff" with
    no tool call (that dropped turn stalls the run; nothing dispatches and no
