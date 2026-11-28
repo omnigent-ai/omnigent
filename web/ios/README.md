@@ -22,6 +22,39 @@ tap routing back into the SPA. OIDC sign-in happens outside the web view (see
 user agents work. It does not implement APNs, background polling, or localhost
 proxy/CORS behavior.
 
+## Apple Watch
+
+`OmnigentWatch` lists the 25 most recently updated sessions, shows recent conversation messages,
+and resolves yes/no approvals. Older sessions and full history remain available on the phone.
+The transcript shows up to 12 committed messages, scanning at most 300 recent items past tool
+activity, plus queued inputs.
+For bound runners, each refresh first checks a one-item terminal inventory to verify routing
+before trusting live approvals. This read does not launch or attach to a terminal. Successful
+keyless retries are reused; later refreshes can recover if the host reconnects with a key.
+Inherited-host lookup checks at most 16 sessions, including the selected session; deeper
+ancestry requires the phone for live approvals, while stored messages remain readable.
+Receipt-based native approvals stay visible but require the phone for confirmation/retry;
+the watch does not expose approval buttons for that delivery protocol.
+Only form-mode yes/no prompts have watch buttons. URL-mode prompts, including internal
+server policy ASK approval URLs, and terminal-only prompts require the phone.
+After each page load or sign-in renewal the phone sends the server's API root and the cookies
+scoped to it (`WatchBridge`); the watch keeps them in its Keychain and calls the API directly.
+Signing out queues a credential-clearing context and preserves sign-out intent across phone
+restarts, retrying when the watch reconnects. Accepting a context is not delivery confirmation;
+sign-out intent remains until a new sign-in replaces it. Delivery is best-effort: an offline
+watch may retain a usable cookie until delivery, expiry, or server-side revocation.
+Run the `OmnigentWatch` scheme on a paired simulator.
+
+The watch has the same server permissions as the phone's bearer session, not a watch-scoped
+token. Native workspace and OIDC sign-in hand off only their named session cookie; the workspace
+cookie is workspace-wide. Browser-only authentication keeps URL-scoped cookies because its
+cookie contract is unknown.
+[WatchConnectivity retains the latest application context](https://developer.apple.com/documentation/watchconnectivity/wcsession/applicationcontext)
+on the phone and watch until it is replaced. The watch's Keychain accessibility policy protects
+its own saved copy, not that system-managed context. Defaults contain only sign-out intent and
+ordering metadata. This design trusts both paired devices with the bearer credential and does
+not add app-layer encryption to the handoff; watch-scoped tokens would require server support.
+
 ## Databricks OAuth
 
 Workspace connections use native OAuth, isolated persistent WebKit stores, bounded

@@ -735,9 +735,26 @@ final class DatabricksLifecycleTests: XCTestCase {
     let h = try await coordinatorFixture(
       recover: { _ in recovered.fulfill() }, failure: { _ in XCTFail("Unexpected failure") })
     let cookieStore = h.coordinator.websiteDataStore.httpCookieStore
-    for cookie in await cookieStore.allCookies() { await cookieStore.deleteCookie(cookie) }
+    let cookies = await cookieStore.allCookies()
+    let signedIn = try XCTUnwrap(
+      h.coordinator.syncWatchCredentials(afterLoading: h.context.pageURL, cookieStore: cookieStore))
+    await signedIn.value
+    let publishedCount = h.watchTransport.contexts.count
+    XCTAssertFalse(
+      try XCTUnwrap(h.watchTransport.contexts.last?[WatchCredentials.contextKey] as? Data).isEmpty)
+    let pendingCookies = PendingWatchCookies()
+    let lateSync = try XCTUnwrap(
+      h.coordinator.syncWatchCredentials(
+        afterLoading: h.context.pageURL, cookieStore: pendingCookies))
+    for cookie in cookies { await cookieStore.deleteCookie(cookie) }
     NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
     await fulfillment(of: [recovered], timeout: 2)
+    XCTAssertEqual(h.watchTransport.contexts.count, publishedCount + 1)
+    XCTAssertEqual(h.watchTransport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
+    pendingCookies.cookies.continuation.yield(cookies)
+    await lateSync.value
+    XCTAssertEqual(h.watchTransport.contexts.count, publishedCount + 1)
+    XCTAssertEqual(h.watchTransport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
     NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
     h.coordinator.detach()
     h.view.removeFromSuperview()
@@ -754,7 +771,10 @@ final class DatabricksLifecycleTests: XCTestCase {
         signedOut.fulfill()
       })
     XCTAssertNotNil(h.model.signOut)
+    let publishedCount = h.watchTransport.contexts.count
     h.model.signOut?()
+    XCTAssertEqual(h.watchTransport.contexts.count, publishedCount + 1)
+    XCTAssertEqual(h.watchTransport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
     await fulfillment(of: [signedOut], timeout: 2)
     try await XCTUnwrap(cleanup).value
     XCTAssertNil(h.credentials.snapshot(for: h.context.scope))
@@ -795,6 +815,7 @@ final class DatabricksLifecycleTests: XCTestCase {
     let credentials: MemoryDatabricksCredentialStore
     let model: WebViewModel
     let coordinator: OmnigentWebView.Coordinator
+    let watchTransport: PendingWatchTransport
     let view: RecordingWorkspaceWebView
     let window: UIWindow
   }
@@ -812,6 +833,10 @@ final class DatabricksLifecycleTests: XCTestCase {
     let suite = "omnigent-coordinator-tests-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
     addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+    let watchTransport = PendingWatchTransport()
+    watchTransport.activationState = .activated
+    let watchBridge = WatchBridge(defaults: defaults, transport: watchTransport)
+    watchBridge.start()
     let installer = DatabricksCookieInstaller()
     let bootstrap = DatabricksWorkspaceBootstrap(
       tokens: tokens, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions(),
@@ -824,7 +849,8 @@ final class DatabricksLifecycleTests: XCTestCase {
       loadFailed: { _, message in failure(message) }, loadSucceeded: {}, pushServerPicker: {},
       requestSwitchServer: { _ in }, openServerSetup: {},
       recoverWorkspace: recover, signedOut: signedOut)
-    let coordinator = OmnigentWebView.Coordinator(parent, context: context, bootstrap: bootstrap)
+    let coordinator = OmnigentWebView.Coordinator(
+      parent, context: context, bootstrap: bootstrap, watchBridge: watchBridge)
     let configuration = WKWebViewConfiguration()
     configuration.websiteDataStore = coordinator.websiteDataStore
     let view = RecordingWorkspaceWebView(frame: .zero, configuration: configuration)
@@ -838,7 +864,7 @@ final class DatabricksLifecycleTests: XCTestCase {
     await fulfillment(of: [loaded], timeout: 10)
     return CoordinatorFixture(
       context: context, credentials: credentials, model: model, coordinator: coordinator,
-      view: view, window: window)
+      watchTransport: watchTransport, view: view, window: window)
   }
 
   private struct Fixture {

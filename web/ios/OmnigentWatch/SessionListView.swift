@@ -1,0 +1,131 @@
+import SwiftUI
+
+struct SessionListView: View {
+  let client: WatchClient
+  @State private var model: WatchSessionList
+
+  init(client: WatchClient) {
+    self.client = client
+    _model = State(initialValue: WatchSessionList(client: client))
+  }
+
+  var body: some View {
+    NavigationStack {
+      List {
+        if let error = model.error { ErrorLabel(error) }
+        ForEach(model.groups) { group in
+          Section {
+            ForEach(group.sessions) { session in
+              NavigationLink(value: session) { SessionRow(session: session) }
+                .glassRow()
+            }
+          } header: {
+            Group {
+              if group.symbol.isEmpty {
+                Text(group.title)
+              } else {
+                Label(group.title, systemImage: group.symbol)
+              }
+            }
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+          }
+        }
+      }
+      .overlay {
+        if model.sessions?.isEmpty == true {
+          ContentUnavailableView("No sessions", systemImage: "bubble.left.and.bubble.right")
+        }
+      }
+      .toolbar { LoadingIndicator(isLoading: model.sessions == nil && model.error == nil) }
+      .navigationTitle("Omnigent")
+      .navigationDestination(for: WatchSession.self) { SessionView(session: $0, client: client) }
+      .containerBackground(for: .navigation) { BrandBackground() }
+      .refreshable { await model.load() }
+      .task {
+        while !Task.isCancelled {
+          await model.load()
+          try? await Task.sleep(for: .seconds(30))
+        }
+      }
+    }
+  }
+
+}
+
+/// A small spinner in the top-left corner while the list loads.
+struct LoadingIndicator: ToolbarContent {
+  let isLoading: Bool
+
+  var body: some ToolbarContent {
+    ToolbarItem(placement: .topBarLeading) {
+      if isLoading { ProgressView().controlSize(.small) }
+    }
+  }
+}
+
+/// A sidebar row: the title, with the web's trailing state marker and nothing when idle.
+private struct SessionRow: View {
+  let session: WatchSession
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      HStack {
+        Text(session.name).lineLimit(1)
+        Spacer(minLength: 4)
+        if !session.needsResponse { SessionMarker(session: session) }
+      }
+      if session.needsResponse {
+        Text("Needs response")
+          .font(.caption2.weight(.medium))
+          .foregroundStyle(Color.brand)
+          .padding(.horizontal, 6)
+          .padding(.vertical, 2)
+          .background(Color.brand.opacity(0.15), in: .capsule)
+      }
+    }
+  }
+}
+
+/// `SessionStateBadge`'s markers: a spinner while running, an alert on failure, a dot when unread.
+struct SessionMarker: View {
+  let session: WatchSession
+
+  var body: some View {
+    if session.isActive {
+      Image(systemName: "progress.indicator")
+        .foregroundStyle(.secondary)
+        .symbolEffect(.variableColor.iterative)
+        .accessibilityLabel("Session running")
+    } else if session.status == "failed" {
+      Image(systemName: "exclamationmark.circle").foregroundStyle(.red)
+        .accessibilityLabel("Latest message is an error")
+    } else if session.viewerUnread == true {
+      Circle().fill(Color.brand).frame(width: 6, height: 6).accessibilityLabel("New messages")
+    }
+  }
+}
+
+extension View {
+  /// A list row on an interactive Liquid Glass platter, like the iOS app's floating controls.
+  func glassRow(tint: Color? = nil) -> some View {
+    padding(.horizontal, 14)
+      .padding(.vertical, 12)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .glassEffect(.regular.tint(tint).interactive(), in: .rect(cornerRadius: 22))
+      .listRowBackground(Color.clear)
+      .listRowInsets(EdgeInsets(top: 3, leading: 0, bottom: 3, trailing: 0))
+  }
+}
+
+struct ErrorLabel: View {
+  let message: String
+  init(_ message: String) { self.message = message }
+
+  var body: some View {
+    Label(message, systemImage: "exclamationmark.triangle.fill")
+      .font(.footnote)
+      .foregroundStyle(.red)
+  }
+}

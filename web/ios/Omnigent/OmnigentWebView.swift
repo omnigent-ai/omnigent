@@ -443,6 +443,7 @@ struct OmnigentWebView: UIViewRepresentable {
     /// Deprecated: removal targeted for iOS 0.5.0.
     private var oidcLoginManager = OidcLoginManager()
     private let oidcCredentials = OidcCredentials.shared
+    private let watchBridge: WatchBridge
     /// Set once a native-OIDC connect succeeds; the shell then owns the session's lifecycle.
     private var oidcConnection: OidcConnection?
     /// The last app page under the mount, reloaded after a renewal the page asked for.
@@ -471,9 +472,10 @@ struct OmnigentWebView: UIViewRepresentable {
 
     init(
       _ parent: OmnigentWebView, context: DatabricksWebContext? = nil,
-      bootstrap: DatabricksWorkspaceBootstrap? = nil
+      bootstrap: DatabricksWorkspaceBootstrap? = nil, watchBridge: WatchBridge = .shared
     ) {
       self.parent = parent
+      self.watchBridge = watchBridge
       let result = Result { try context ?? DatabricksWebContext.resolve(parent.initialURL) }
       contextResult = result
       workspaceBootstrap = bootstrap ?? DatabricksWorkspaceBootstrap()
@@ -739,9 +741,9 @@ struct OmnigentWebView: UIViewRepresentable {
           webView.load(URLRequest(url: session.pageURL))
         } catch {
           guard navigationID == id, self.webView === webView else { return }
-          if error as? DatabricksSessionError == .reauthenticationRequired,
-            let reauthenticate = parent.reauthenticateWorkspace
-          {
+          let needsReauthentication = error as? DatabricksSessionError == .reauthenticationRequired
+          if needsReauthentication { watchBridge.signOut() }
+          if needsReauthentication, let reauthenticate = parent.reauthenticateWorkspace {
             parent.model.isAuthenticating = false
             parent.model.isLoading = false
             parent.model.cancelAuthentication = nil
@@ -756,6 +758,7 @@ struct OmnigentWebView: UIViewRepresentable {
 
     private func requestWorkspaceRecovery() {
       guard let session = workspaceSession else { return }
+      watchBridge.signOut()
       let pageURL = lastWorkspacePageURL ?? session.pageURL
       guard let recover = parent.recoverWorkspace else {
         showWorkspaceFailure(DatabricksSessionError.recoveryExhausted)
@@ -808,6 +811,7 @@ struct OmnigentWebView: UIViewRepresentable {
       do {
         let cleanup = try workspaceBootstrap.beginSignOut(context: context, store: webStore)
         let callback = parent.signedOut
+        watchBridge.signOut()
         effectiveOrigin = nil
         workspaceSession = nil
         detach()
@@ -820,6 +824,47 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     // MARK: Native OIDC sign-in
+
+    func authNavigationRoute(for url: URL, isMainFrame: Bool) -> OidcAuthRoute? {
+      guard isMainFrame,
+        let serverURL = oidcConnection?.serverURL ?? parent.serverURL ?? pinnedURL
+      else { return nil }
+      // Auth transitions can redirect externally without another app page completing.
+      if isWatchAuthenticationPage(url, of: serverURL) { watchBridge.signOut() }
+      return OidcAuthRoute(url: url, serverURL: serverURL)
+    }
+
+    private func isWatchAuthenticationPage(_ url: URL, of serverURL: URL) -> Bool {
+      guard let origin = url.omnigentOrigin, origin == serverURL.omnigentOrigin else {
+        return false
+      }
+      let mount = OidcWebSession.mountPath(of: serverURL)
+      let path = OidcWebSession.mountPath(of: url)
+      return path == mount + "/login" || path == mount + "/auth"
+        || path.hasPrefix(mount + "/auth/")
+    }
+
+    @discardableResult
+    func syncWatchCredentials(
+      afterLoading pageURL: URL?, cookieStore: some WatchCookieStore
+    ) -> Task<Void, Never>? {
+      guard let pageURL, let pinnedOrigin, pageURL.omnigentOrigin == pinnedOrigin,
+        let serverURL = oidcConnection?.serverURL ?? parent.serverURL ?? pinnedURL
+      else { return nil }
+      if workspaceSession == nil {
+        guard OidcWebSession.isPage(pageURL, of: serverURL),
+          !isWatchAuthenticationPage(pageURL, of: serverURL)
+        else {
+          watchBridge.signOut()
+          return nil
+        }
+      }
+      return watchBridge.sync(
+        serverURL: serverURL, workspacePageURL: workspaceSession?.pageURL,
+        workspaceID: workspaceSession?.workspaceID,
+        cookieName: workspaceSession == nil ? oidcConnection?.cookieName : "DBAUTH",
+        cookieStore: cookieStore)
+    }
 
     /// Reads the manifest, then either signs in natively before loading or loads as before.
     private func connectOidcServer(_ pageURL: URL, in webView: WKWebView) {
@@ -1121,6 +1166,9 @@ struct OmnigentWebView: UIViewRepresentable {
           return
         }
         oidcRenewalCause = nil
+        // A background renewal rotates the cookie without a page load, so hand it on here.
+        watchBridge.sync(
+          serverURL: connection.serverURL, cookieName: connection.cookieName, cookieStore: store)
         scheduleOidcRenewal()
         if reload, let webView {
           webView.load(URLRequest(url: oidcPageURL ?? connection.serverURL))
@@ -1178,6 +1226,7 @@ struct OmnigentWebView: UIViewRepresentable {
       }
       let message = OidcWebSession.signedOutMessage(host: connection.host, complete: complete)
       let signedOut = parent.serverSignedOut
+      watchBridge.signOut()
       let loadFailed = parent.loadFailed
       let initialURL = parent.initialURL
       effectiveOrigin = nil
@@ -1457,6 +1506,9 @@ struct OmnigentWebView: UIViewRepresentable {
       if pinnedOrigin != nil, webView.url?.omnigentOrigin == pinnedOrigin {
         (webView as? AccessoryFreeWebView)?.emitKeyboardViewport(force: true)
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
+        syncWatchCredentials(
+          afterLoading: webView.url,
+          cookieStore: webView.configuration.websiteDataStore.httpCookieStore)
         parent.loadSucceeded()
       }
     }
@@ -1543,10 +1595,9 @@ struct OmnigentWebView: UIViewRepresentable {
       }
 
       // The IdP must never load in the web view: the shell renews or signs out instead.
-      if let connection = oidcConnection, navigationAction.targetFrame?.isMainFrame == true,
-        ["http", "https"].contains(scheme),
-        let route = OidcAuthRoute(url: url, serverURL: connection.serverURL)
-      {
+      let authRoute = authNavigationRoute(
+        for: url, isMainFrame: navigationAction.targetFrame?.isMainFrame == true)
+      if oidcConnection != nil, ["http", "https"].contains(scheme), let route = authRoute {
         decisionHandler(.cancel)
         switch route {
         case .login: recoverOidcSession()
