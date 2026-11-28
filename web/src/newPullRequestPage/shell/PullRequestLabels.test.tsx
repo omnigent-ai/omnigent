@@ -255,6 +255,44 @@ it("sends chip removals one at a time in click order", async () => {
   expect(shownLabels()).toEqual([]);
 });
 
+it("keeps a refused edit's failure past the cache's cleanup, and forgets it once a retry lands", async () => {
+  // Real time still runs; the cleanup timers can be skipped ahead.
+  vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const { posts } = stubFetch(() => json({ object: "list", data: [], has_more: false }));
+    const client = renderLabels([bug]);
+    fireEvent.click(screen.getByRole("button", { name: "Remove label bug" }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    await act(async () => posts[0].respond(json({ detail: "Refused by GitHub." }, 400)));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Refused by GitHub.");
+
+    // Nothing shows it for an hour, well past an unwatched mutation's five minutes.
+    cleanup();
+    act(() => vi.advanceTimersByTime(60 * 60_000));
+    render(
+      <QueryClientProvider client={client}>
+        <CachedLabels />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Refused by GitHub.");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    await act(async () =>
+      posts[1].respond(json({ object: "session.github.pr_labels", labels: [] })),
+    );
+    await waitFor(() => expect(shownLabels()).toEqual([]));
+    // Only the change that landed stays, so kept changes don't pile up.
+    const settled = client
+      .getMutationCache()
+      .getAll()
+      .map((mutation) => mutation.state.status);
+    expect(settled).toEqual(["success"]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("keeps a refused edit's failure after its section remounts, until Retry goes through", async () => {
   const { posts } = stubFetch(() => json({ object: "list", data: [], has_more: false }));
   const client = renderLabels([bug]);

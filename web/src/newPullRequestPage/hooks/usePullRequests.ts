@@ -2039,6 +2039,7 @@ export function useUpdatePullRequestLabels(conversationId: string) {
   const routed = useHostMutation<PullRequestLabelChange, { labels: PullRequestLabel[] | null }>({
     mutationKey: pullRequestLabelsMutationKey(conversationId),
     operation: "pull_request_labels_update",
+    keepFailures: true,
     // One edit at a time, in click order, so GitHub and the cache end in the last state shown.
     hostScope: `github-labels-${conversationId}`,
     host: (change) => {
@@ -2774,6 +2775,7 @@ export function useUpdatePullRequestReviewers(conversationId: string) {
   >({
     mutationKey: pullRequestReviewersMutationKey(conversationId),
     operation: "pull_request_reviewers_update",
+    keepFailures: true,
     hostScope: `github-reviewers-${conversationId}`,
     host: (change) => {
       const add = change.add.map(({ login, kind }) => ({ login, kind }));
@@ -3128,8 +3130,24 @@ function useHostMutation<Change extends { prUrl: string }, Result>(options: {
   hostRefusal?: (change: Change) => PullRequestWriteError | null;
   onSuccess: (result: Result, change: Change) => Promise<void> | void;
   onError: (error: Error, change: Change) => void;
+  /**
+   * Keep a failure in the mutation cache until it's dismissed or a later change to the PR
+   * lands, for views that read it there after they remount.
+   */
+  keepFailures?: boolean;
 }) {
-  const { operation, onSuccess, onError } = options;
+  const { operation, onSuccess, onError, keepFailures = false } = options;
+  const queryClient = useQueryClient();
+  // Kept changes never expire, so a success forgets the PR's earlier settled ones.
+  const kept = keepFailures ? { gcTime: Number.POSITIVE_INFINITY } : {};
+  const forgetEarlierChanges = (prUrl: string) => {
+    if (!keepFailures) return;
+    const cache = queryClient.getMutationCache();
+    for (const mutation of cache.findAll({ mutationKey: options.mutationKey, exact: true })) {
+      const earlier = mutation.state.variables as Change | undefined;
+      if (mutation.state.status !== "pending" && earlier?.prUrl === prUrl) cache.remove(mutation);
+    }
+  };
   // A change of workspace user hides the last change's state from the next user.
   useWorkspaceDraftOwner();
   const [lastPath, setLastPath] = useState<"host" | "refused">("host");
@@ -3137,6 +3155,7 @@ function useHostMutation<Change extends { prUrl: string }, Result>(options: {
   // unmounted before the answer: drafts outlive the editor that saved them.
   const hostMutation = useMutation({
     mutationKey: options.mutationKey,
+    ...kept,
     ...(options.hostScope ? { scope: { id: options.hostScope } } : {}),
     mutationFn: ({
       callbacks: _callbacks,
@@ -3146,6 +3165,7 @@ function useHostMutation<Change extends { prUrl: string }, Result>(options: {
       options.host(change as unknown as Change),
     onSuccess: async (result, { callbacks, release, ...change }) => {
       release?.();
+      forgetEarlierChanges(change.prUrl);
       await onSuccess(result, change as unknown as Change);
       callbacks?.onSuccess?.(change);
     },
@@ -3158,6 +3178,7 @@ function useHostMutation<Change extends { prUrl: string }, Result>(options: {
   // A change that the host refuses before sending: nothing goes, and the refusal is its error.
   const refusedMutation = useMutation({
     mutationKey: options.mutationKey,
+    ...kept,
     networkMode: "always",
     retry: false,
     mutationFn: async ({

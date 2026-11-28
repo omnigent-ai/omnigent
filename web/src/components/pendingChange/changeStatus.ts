@@ -1,7 +1,8 @@
 // The state of one change the user made, read from TanStack Query's mutation cache: in
 // flight, refused, or settled. Reading the cache rather than a hook's own state keeps a
 // failure visible after the control that made it unmounts, and the latest change decides,
-// so a fresh change that succeeds clears an earlier failure.
+// so a fresh change that succeeds clears an earlier failure. The mutation must outlive
+// its five-minute default cache time for that, as `keepFailures` does.
 
 import { useMutationState, useQueryClient, type Mutation } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
