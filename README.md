@@ -299,6 +299,10 @@ session in the browser, or on a phone on your network (step 4). The
 in a native window and adds OS notifications (with a configurable sound) and a dock badge —
 [download it for macOS](https://omnigent.ai/quickstart/install#install-the-desktop-app).
 
+Running without the UI, from a script, a bot or CI? The
+[headless/API-first guide](docs/headless_api_run_guide.md) starts the server
+with `--no-open` and drives it from the Python client over HTTP.
+
 > [!NOTE]
 > The install puts two names for the same CLI on your PATH: `omnigent` and
 > the shorter `omni`. They're interchangeable.
