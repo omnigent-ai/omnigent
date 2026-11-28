@@ -214,3 +214,57 @@ def test_a_malformed_collection_is_invalid_input(
                 "operation_id": "o",
             },
         )
+
+
+def _previous_release_service():
+    """``GadgetService`` from the release before per-viewer collections (``main``'s), run
+    against the same store, as an older replica would."""
+    import importlib.util
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    shown = subprocess.run(
+        ["git", "show", "origin/main:omnigent/gadgets/service.py"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[2],
+    )
+    if shown.returncode != 0:
+        pytest.skip("no main checkout to compare with")
+    source = shown.stdout
+    if "viewer_collections" in source or "collection_scopes" in source:
+        pytest.skip("main already has per-viewer collections")
+    path = Path(tempfile.mkdtemp()) / "previous_gadget_service.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("previous_gadget_service", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_an_older_release_never_treats_a_viewer_collection_as_shared(gadgets: Fixture) -> None:
+    previous = _previous_release_service()
+    owner = gadgets.service(1)
+    app = publish(owner)
+    older = previous.GadgetService(
+        gadgets.store, gadgets.access, previous.GadgetViewer(person(1)), None
+    )
+
+    # It can't write or read the viewer collection as a shared one...
+    for method, extra in (("create", {"value": {}}), ("list", {})):
+        with pytest.raises((InvalidInput, previous.CorruptData)):
+            older.rpc(
+                app["id"],
+                app["published_revision"],
+                "data.v1." + method,
+                {"collection": "progress", "operation_id": "o1", **extra},
+            )
+    # ...and refuses the published revision outright, as it can't check what it was given.
+    with pytest.raises(previous.CorruptData):
+        older.content(app["id"])
+    assert not list((gadgets.root / "gadgets" / app["id"]).rglob("data/progress/**/*.json"))
