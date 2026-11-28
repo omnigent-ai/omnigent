@@ -5802,12 +5802,14 @@ async function bindStream(
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
   if (isHostRoutingEnabled() && getSessionHost(id) === null) {
     try {
-      // Prefer the registered resolver: it walks a hostless sub-agent child up
-      // to its host-bound ancestor. Without one, the bare snapshot still seeds
-      // a top-level session's own host.
-      await (resolveSessionHost(id) ?? getSessionSlim(id));
+      // Prefer the registered resolver: it walks a hostless sub-agent child up to
+      // its host-bound ancestor; without one, the bare snapshot seeds the host.
+      // Bounded: this entry already counts as live, so `switchTo` won't rebind it.
+      await withReadTimeout<void | Session>(
+        (signal) => resolveSessionHost(id) ?? getSessionSlim(id, { signal }),
+      );
     } catch {
-      // Best-effort: a failed resolve (bad id, transient) falls through to the
+      // Best-effort: a failed or unanswered resolve falls through to the
       // client-keyed open; the snapshot fetch surfaces the real error.
     }
     // Liveness, not the visible id: a background bind must survive a switch away
