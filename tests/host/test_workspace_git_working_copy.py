@@ -839,7 +839,7 @@ async def test_a_remote_with_an_unusual_but_valid_name_is_still_where_a_branch_s
     _add_remote(root, remote)
     _git(root, "update-ref", f"refs/remotes/{remote}/next", fork_next)
     _git(root, "checkout", "-q", "-b", "feature", f"{remote}/next")
-    _push_upstream(root, "fork", "feature")
+    _push_upstream(root, remote, "feature")
 
     response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
     assert _unavailable_problem(response) is None
@@ -954,6 +954,10 @@ async def test_a_branch_on_origin_without_a_default_compares_with_the_branch_it_
         "another remote's name, which means its HEAD",
         "deleted remote branch",
         "own copy",
+        "own name on the remote it no longer tracks",
+        "qualified name",
+        "deleted qualified name a longer ref now matches",
+        "a remote the branch neither tracks nor pushes to",
         "no reflog",
     ],
 )
@@ -979,8 +983,15 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
         "another remote's name, which means its HEAD": ["source"],
         "deleted remote branch": ["fork/next"],
         "own copy": ["fork/feature"],
+        "own name on the remote it no longer tracks": ["origin/feature"],
+        "qualified name": ["refs/remotes/fork/next"],
+        "deleted qualified name a longer ref now matches": ["refs/remotes/fork/next"],
+        "a remote the branch neither tracks nor pushes to": ["source/next"],
         "no reflog": ["fork/next"],
     }
+    if start == "own name on the remote it no longer tracks":
+        # Started from its own name on origin, then pushed to and tracking the fork instead.
+        _git(root, "update-ref", "refs/remotes/origin/feature", fork_next)
     options = ["-c", "core.logAllRefUpdates=false"] if start == "no reflog" else []
     _git(root, *options, "checkout", "-q", "-b", "feature", *starts[start])
     if start == "upstream expression retargeted since":
@@ -992,6 +1003,10 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
         _git(root, "branch", "fork/next", main)
     if start == "deleted remote branch":
         _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+    if start == "deleted qualified name a longer ref now matches":
+        # Git would now read the recorded name as this ref, which isn't where the branch started.
+        _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+        _git(root, "update-ref", "refs/remotes/refs/remotes/fork/next", fork_next)
     _push_upstream(root, "fork", "feature")
 
     response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)

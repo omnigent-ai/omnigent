@@ -275,6 +275,7 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
     remote: str | None = None
     upstream_candidate: str | None = None
     own_copies: set[str] = set()
+    tracked_remotes: set[str] = set()
     if branch_ref:
         tracking = await repository.run(
             [
@@ -289,6 +290,9 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
         fields = tracking.decode("utf-8", "replace").rstrip("\n").split("\0")
         if len(fields) == 5:
             _ref, upstream, upstream_remote, push, push_remote = fields
+            tracked_remotes = {
+                name for name in (upstream_remote, push_remote) if name not in ("", ".")
+            }
             remote = next(
                 (name for name in (upstream_remote, push_remote) if name not in ("", ".")), None
             )
@@ -317,7 +321,9 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
     ):
         return upstream_candidate, upstream_candidate.removeprefix("refs/remotes/")
     if branch_ref:
-        start = await _remote_start_point(repository, branch_ref, own_copies, deadline)
+        start = await _remote_start_point(
+            repository, branch_ref, tracked_remotes | {remote_name}, own_copies, deadline
+        )
         if start is not None:
             return start, start.removeprefix("refs/remotes/")
     if remote_name == "origin":
@@ -328,8 +334,6 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
 _CREATED_FROM = "branch: Created from "
 # Characters Git refuses in a ref name, which revision expressions such as ``next~1`` use.
 _NOT_IN_A_REF_NAME = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
-# The prefixes Git tries, in order, when it looks up a short ref name.
-_REF_LOOKUP_PREFIXES = ("", "refs/", "refs/tags/", "refs/heads/", "refs/remotes/")
 
 
 def _is_plain_ref_name(name: str) -> bool:
@@ -352,13 +356,19 @@ def _is_plain_ref_name(name: str) -> bool:
 
 
 async def _remote_start_point(
-    repository: GitRepository, branch_ref: str, own_copies: set[str], deadline: Deadline
+    repository: GitRepository,
+    branch_ref: str,
+    remotes: set[str],
+    own_copies: set[str],
+    deadline: Deadline,
 ) -> str | None:
     """The remote branch ``branch_ref`` was created from, by its oldest reflog entry, or None.
 
-    None when the reflog is off or expired, or the start was ``HEAD``, a commit, a tag, a local
-    branch, a deleted branch or the branch's own copy on a remote, an expression rather than a
-    plain name, or a name that's now ambiguous.
+    The recorded start counts only as exactly ``<remote>/<name>``: ``<remote>`` one of
+    ``remotes``, ``<name>`` neither ``HEAD`` nor the branch's own name, and that exact
+    remote-tracking ref still there with no ref, tag or local branch of the same name. Anything
+    else, such as a commit, a tag, a local branch, a qualified, deleted or shadowed name or an
+    expression, or a reflog that's off or expired, is None.
     """
     # Only the oldest entry is read, so a long-lived branch's reflog stays within the output cap.
     counted = await repository.run_unchecked(
@@ -385,23 +395,33 @@ async def _remote_start_point(
     if not oldest.startswith(_CREATED_FROM):
         return None
     start = oldest.removeprefix(_CREATED_FROM)
-    if not _is_plain_ref_name(start):
+    if not _is_plain_ref_name(start) or start.startswith("refs/"):
         return None
-    # Git's own lookup, where an ambiguous name resolves to none; any failure means no start.
-    resolved = await repository.run_unchecked(
-        ["rev-parse", "--verify", "-q", "--symbolic-full-name", "--end-of-options", start],
-        deadline=deadline,
-    )
-    candidate = first_line(resolved.stdout) if resolved.success else ""
-    # A symbolic ref, such as a remote's HEAD or the remote's bare name, resolves to its target's
-    # name, which is no longer the recorded name under any of Git's prefixes.
+    # Exactly one of the branch's remotes names it, so ``a/b/c`` can't be read two ways.
+    names = [start[len(remote) + 1 :] for remote in remotes if start.startswith(f"{remote}/")]
+    if len(names) != 1:
+        return None
+    name = names[0]
+    candidate = f"refs/remotes/{start}"
     if (
-        not candidate.startswith("refs/remotes/")
-        or candidate not in {prefix + start for prefix in _REF_LOOKUP_PREFIXES}
-        or candidate.endswith("/HEAD")
+        name in ("", "HEAD")
+        or name == branch_ref.removeprefix("refs/heads/")
         or candidate in own_copies
-        or await verify_commit(repository, candidate, deadline) is None
     ):
+        return None
+    # That exact ref, with none of Git's lookup prefixes, still there and a commit.
+    exact = await repository.run_unchecked(
+        ["show-ref", "--verify", "--quiet", candidate], deadline=deadline
+    )
+    if not exact.success or await verify_commit(repository, candidate, deadline) is None:
+        return None
+    # Nothing else Git could have read the name as when the branch was created: a ref, tag or
+    # local branch of that name makes the recorded start ambiguous.
+    shadows = {f"refs/{start}", f"refs/tags/{start}", f"refs/heads/{start}"}
+    listed = await repository.run_unchecked(
+        ["for-each-ref", "--format=%(refname)", "--", *sorted(shadows)], deadline=deadline
+    )
+    if not listed.success or shadows & set(listed.stdout.decode("utf-8", "replace").split("\n")):
         return None
     return candidate
 
