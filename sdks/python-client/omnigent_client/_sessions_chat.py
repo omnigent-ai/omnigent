@@ -244,6 +244,10 @@ def _is_delivery_ack(event: ServerStreamEvent, session_status: str | None) -> bo
     )
 
 
+# Bounds how long ``send()`` waits for a native harness to settle after a delivery ack.
+_DELIVERY_SETTLE_TIMEOUT_S = 1200.0
+
+
 # Newer servers emit an immediate ``session.heartbeat`` after the
 # live-tail subscriber is registered. Older servers do not, so keep a
 # short fallback instead of hanging forever before posting the user's
@@ -537,7 +541,8 @@ class SessionsChat:
         event has been yielded. An output-less completion that only
         acknowledges delivery to a still-running native harness does
         not end the turn; the iterator then continues until the
-        session status leaves ``running``.
+        session status leaves ``running``. That acknowledgement is
+        still yielded and still fires ``on_response_end``.
 
         Always returns an async iterator: the caller does
         ``async for event in chat.send("hi"): ...`` regardless of
@@ -558,7 +563,9 @@ class SessionsChat:
             :meth:`SessionsNamespace.stream`.
         :raises OmnigentError: If the underlying ``post_event`` or
             ``stream`` call fails (e.g. 404 if the session was
-            deleted out from under us).
+            deleted out from under us), or with code ``turn_timeout``
+            if the session is still running 20 minutes after such a
+            delivery acknowledgement.
         :raises RuntimeError: If ``files`` is non-empty but no
             ``files_uploader`` was wired at construction.
         :raises ValueError: If the agent's spec declares a
@@ -591,7 +598,7 @@ class SessionsChat:
         stream_aiter = self._namespace.stream(self._session.id)
         hook_state = _StreamHookState()
         session_status: str | None = None
-        awaiting_settled_status = False
+        settle_deadline: float | None = None
         first_event_task = asyncio.ensure_future(stream_aiter.__anext__())
         try:
             first_event: ServerStreamEvent | None
@@ -634,7 +641,9 @@ class SessionsChat:
                 if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
                     if not _is_delivery_ack(event, session_status):
                         return
-                    awaiting_settled_status = True
+                    settle_deadline = (
+                        asyncio.get_running_loop().time() + _DELIVERY_SETTLE_TIMEOUT_S
+                    )
                 # A SETUP-phase failure (spec resolution, spawn-env
                 # build) ends the turn before the LLM stream starts, so
                 # no response.failed / FailedEvent is ever emitted — the
@@ -654,12 +663,25 @@ class SessionsChat:
                     raise OmnigentError(message, code=code)
                 if isinstance(event, SessionStatusEvent):
                     session_status = event.status
-                    if awaiting_settled_status and session_status != "running":
+                    if settle_deadline is not None and session_status != "running":
                         return
+                settle_timeout = asyncio.timeout_at(settle_deadline)
                 try:
-                    event = await stream_aiter.__anext__()
+                    async with settle_timeout:
+                        event = await stream_aiter.__anext__()
                 except StopAsyncIteration:
                     return
+                except TimeoutError:
+                    if not settle_timeout.expired():
+                        raise
+                    # The settling status event may have been missed; trust a fresh snapshot.
+                    if (await self.refresh()).status != "running":
+                        return
+                    raise OmnigentError(
+                        f"session still running {_DELIVERY_SETTLE_TIMEOUT_S:.0f}s after "
+                        "the harness accepted the message",
+                        code="turn_timeout",
+                    ) from None
         finally:
             if not first_event_task.done():
                 first_event_task.cancel()

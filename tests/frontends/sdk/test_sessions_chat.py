@@ -541,6 +541,57 @@ async def test_send_continues_past_delivery_ack_until_session_settles(
     assert yielded == events[:4]
 
 
+class _StalledNativeNamespace(_FakeNamespace):
+    """Stream a native delivery ack, then only heartbeats."""
+
+    def stream(  # type: ignore[override]
+        self,
+        session_id: str,
+    ) -> AsyncIterator[ServerStreamEvent]:
+        async def _stream() -> AsyncIterator[ServerStreamEvent]:
+            yield _status_event("running")
+            yield _completed_event()
+            while True:
+                await asyncio.sleep(0.01)
+                yield SessionHeartbeatEvent(type="session.heartbeat")
+
+        return _stream()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_status", "times_out"), [("running", True), ("idle", False), ("waiting", False)]
+)
+async def test_send_bounds_the_wait_after_delivery_ack(
+    monkeypatch: pytest.MonkeyPatch, snapshot_status: str, times_out: bool
+) -> None:
+    """A harness still running at the settle deadline fails the turn; a settled one ends it."""
+    from omnigent_client._errors import OmnigentError
+
+    monkeypatch.setattr("omnigent_client._sessions_chat._DELIVERY_SETTLE_TIMEOUT_S", 0.1)
+    ns = _StalledNativeNamespace(
+        stream_scripts=[], session_obj=_make_session(status=snapshot_status)
+    )
+    chat = SessionsChat(
+        namespace=ns, files_uploader=None, files_getter=None, session=_make_session()
+    )
+    yielded: list[ServerStreamEvent] = []
+
+    async def drain() -> None:
+        async for event in chat.send("hi"):
+            yielded.append(event)
+
+    if times_out:
+        with pytest.raises(OmnigentError) as raised:
+            await asyncio.wait_for(drain(), timeout=5)
+        assert raised.value.code == "turn_timeout"
+    else:
+        await asyncio.wait_for(drain(), timeout=5)
+    assert [event.type for event in yielded[:2]] == ["session.status", "response.completed"]
+    assert any(isinstance(event, SessionHeartbeatEvent) for event in yielded)
+    assert ns.get_calls == ["conv_abc"]
+
+
 @pytest.mark.asyncio
 async def test_send_returns_on_completion_with_output_while_running() -> None:
     session = _make_session()

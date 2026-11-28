@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import subprocess
 import threading
@@ -907,7 +908,7 @@ async def test_interrupt_turn_never_raises() -> None:
 def _completed(stdout: str) -> subprocess.CompletedProcess[str]:
     """A ``CompletedProcess`` stand-in for a stubbed ``pgrep`` run."""
     return subprocess.CompletedProcess(
-        args=["pgrep", "-f", "bin/agy"], returncode=0, stdout=stdout
+        args=["pgrep", "-f", rpc._AGY_PGREP_PATTERN], returncode=0, stdout=stdout
     )
 
 
@@ -932,14 +933,33 @@ def test_list_agy_pids_skips_supervisors_and_finds_child(
         200: ["/usr/local/bin/agy"],
         300: ["/usr/local/bin/agy-helper"],
         400: ["/opt/tools/vendor-bin/agy"],
+        500: ["/opt/agy/agy"],
     }
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _completed("100\n200\n300\n400\n"))
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: _completed("100\n200\n300\n400\n500\n")
+    )
     monkeypatch.setattr(
         rpc.psutil, "Process", lambda pid: SimpleNamespace(cmdline=lambda: commands[pid])
     )
     monkeypatch.setattr(rpc, "_child_pids", lambda pid: [200] if pid == 100 else [])
-    assert rpc._list_agy_pids() == [200, 400]
+    assert rpc._list_agy_pids() == [200, 400, 500]
     assert rpc._agy_pid_in_pane_subtree(100) == 200
+
+
+@pytest.mark.parametrize(
+    ("cmdline", "selected"),
+    [
+        ("/usr/local/bin/agy --dangerously-skip-permissions", True),
+        ("/opt/agy/agy", True),
+        ("agy", True),
+        ("python -m gateway -- /opt/agy/agy", True),
+        ("/usr/local/bin/agy-helper", False),
+        ("node /opt/agy/server.js", False),
+    ],
+)
+def test_pgrep_pattern_selects_agy_executables_anywhere(cmdline: str, selected: bool) -> None:
+    """``pgrep`` pre-selects every ``agy`` executable, not only ``*bin/agy`` paths."""
+    assert bool(re.search(rpc._AGY_PGREP_PATTERN, cmdline)) is selected
 
 
 def test_list_agy_pids_falls_back_to_proc_when_pgrep_missing(

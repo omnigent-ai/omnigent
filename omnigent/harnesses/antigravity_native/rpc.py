@@ -1179,6 +1179,10 @@ async def stream_agent_state_updates(
                     yield inner if isinstance(inner, dict) else parsed
 
 
+# Any cmdline mentioning an ``agy`` executable; argv[0] is checked afterwards.
+_AGY_PGREP_PATTERN = r"(^|/)agy( |$)"
+
+
 def _list_agy_pids() -> list[int]:
     """
     Return pids of running ``agy`` processes (best-effort).
@@ -1195,7 +1199,7 @@ def _list_agy_pids() -> list[int]:
     """
     try:
         completed = subprocess.run(
-            ["pgrep", "-f", r"bin/agy"],
+            ["pgrep", "-f", _AGY_PGREP_PATTERN],
             capture_output=True,
             text=True,
             timeout=_LSOF_TIMEOUT_S,
