@@ -176,6 +176,7 @@ import {
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
   isCodexHarness,
+  isNativeClaudeHarness,
   isNativeCursorHarness,
   isNativeOpenCodeHarness,
   MIN_TMUX_VERSION,
@@ -909,9 +910,10 @@ export async function describeCreateError(res: Response): Promise<string> {
  * composer when the UI-driven setup feature is OFF.
  *
  * The ``needs-auth`` / ``binary-missing`` copy is Codex-specific ("run codex
- * login" / "set OMNIGENT_CODEX_PATH"), so it's gated on {@link isCodexHarness}.
- * Other harnesses that report those structured reasons (claude-native /
- * opencode-native now do) fall through to the generic "run omni setup"
+ * login" / "set OMNIGENT_CODEX_PATH"), so it's gated on {@link isCodexHarness};
+ * native Claude and Cursor have their own ``needs-auth`` copy.
+ * Other harnesses that report those structured reasons (e.g. opencode-native)
+ * fall through to the generic "run omni setup"
  * message — matching the pre-feature behavior, where only Codex ever produced
  * these reasons and everything else showed the generic text.
  */
@@ -927,6 +929,18 @@ function harnessWarningMessage(
       <>
         {agentName} needs Codex authentication on {hostName} — run <code>codex login</code> on that
         machine.
+      </>
+    );
+  }
+  // Claude may get its credentials from a launcher (OMNIGENT_CLAUDE_PATH) rather
+  // than a stored login, so name both instead of the generic "run omni setup".
+  if (reason === "needs-auth" && !!harness && isNativeClaudeHarness(harness)) {
+    return (
+      <>
+        {agentName}: Claude Code isn&apos;t signed in on {hostName} — run{" "}
+        <code>claude auth login</code> on that machine, or if Claude starts through a launcher (
+        <code>OMNIGENT_CLAUDE_PATH</code>), run <code>&lt;launcher&gt; auth status</code> there to
+        see why it fails.
       </>
     );
   }

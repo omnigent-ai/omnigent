@@ -9,6 +9,7 @@ import {
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
+  isNativeClaudeHarness,
   isNativeOpenCodeHarness,
   missingHarnessCredentialCopy,
   resolveSetupSteps,
@@ -570,5 +571,14 @@ describe("skillInvocationPrefix", () => {
   it("returns / for null and undefined", () => {
     expect(skillInvocationPrefix(null)).toBe("/");
     expect(skillInvocationPrefix(undefined)).toBe("/");
+  });
+});
+
+describe("isNativeClaudeHarness", () => {
+  it("accepts both native Claude spellings and rejects others", () => {
+    expect(isNativeClaudeHarness("claude-native")).toBe(true);
+    expect(isNativeClaudeHarness("native-claude")).toBe(true);
+    expect(isNativeClaudeHarness("claude")).toBe(false);
+    expect(isNativeClaudeHarness("codex-native")).toBe(false);
   });
 });
