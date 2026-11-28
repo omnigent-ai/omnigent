@@ -47,6 +47,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "webfonts": False,
         "import_review": False,
         "sidebar_grouping_ui": True,
         "workspace_content_search": True,
@@ -215,6 +216,15 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "user_inbox",
         "workspace_content_search",
     )
+
+
+def test_webfonts_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "webfonts"})
+
+    assert flags.enabled(Feature.WEBFONTS)
+    assert flags.frontend_dict()["webfonts"] is True
+    defaults = resolve_feature_flags({}).enabled_features
+    assert flags.enabled_features == defaults | {Feature.WEBFONTS}
 
 
 def test_floating_composer_is_a_frontend_visible_feature() -> None:
