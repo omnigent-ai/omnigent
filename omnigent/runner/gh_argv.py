@@ -48,6 +48,7 @@ class _Command:
     :ivar repository_flags: Value flags whose value is ``[HOST/]OWNER/REPO``.
     :ivar positional: What its one optional positional argument is, if it takes one.
     :ivar checkout: Whether, naming no repository, ``gh`` reads the checkout's remotes.
+    :ivar needs_host: Whether it must name its host; with none, ``gh`` checks every host.
     """
 
     values: frozenset[str] = field(default_factory=frozenset)
@@ -56,6 +57,7 @@ class _Command:
     repository_flags: frozenset[str] = field(default_factory=frozenset)
     positional: str | None = None
     checkout: bool = False
+    needs_host: bool = False
 
 
 _REPOSITORY = frozenset({"-R", "--repo"})
@@ -94,7 +96,10 @@ _COMMANDS: dict[tuple[str, ...], _Command] = {
         host_flags=frozenset({"--hostname"}),
         positional="endpoint",
     ),
-    ("auth", "status"): _Command(values=_HOSTNAME | {"--json"}, host_flags=_HOSTNAME),
+    # With no host, auth status checks every host gh knows with the environment's tokens.
+    ("auth", "status"): _Command(
+        values=_HOSTNAME | {"--json"}, host_flags=_HOSTNAME, needs_host=True
+    ),
     ("auth", "token"): _Command(values=_HOSTNAME | {"-u", "--user"}, host_flags=_HOSTNAME),
     ("repo", "view"): _Command(
         values=frozenset({"--json"}), positional="repository", checkout=True
@@ -183,9 +188,9 @@ def classify(argv: list[str]) -> GhTarget:
     """Read which host ``argv`` (the arguments after ``gh``) sends to.
 
     :raises GhArgvRefused: For a command or flag the panel doesn't run, a missing flag
-        value, a repeated host or repository flag, more than one positional argument, an
-        argument that looks like a host or a URL but can't be read as one, or two arguments
-        that name different hosts.
+        value, a repeated host or repository flag, a missing host where gh would check every
+        host, more than one positional argument, an argument that looks like a host or a URL
+        but can't be read as one, or two arguments that name different hosts.
     """
     command = next(
         (words for words in _COMMANDS if tuple(argv[: len(words)]) == words),
@@ -254,6 +259,8 @@ def classify(argv: list[str]) -> GhTarget:
     if len(hosts) > 1:
         raise GhArgvRefused("A gh command line names two different hosts")
     host = next(iter(hosts), None)
+    if host is None and spec.needs_host:
+        raise GhArgvRefused(f"gh {' '.join(command)} must name its host")
     if host is None and spec.checkout and not named_repository:
         from_checkout = True
     if host is None and command == ("repo", "set-default"):

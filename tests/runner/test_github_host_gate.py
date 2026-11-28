@@ -68,7 +68,9 @@ def started(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         ),
         # A scope on a host the user never set up runs nothing, even a call naming no host.
         (UNKNOWN, ["api", "--hostname", UNKNOWN, "x"]),
-        (UNKNOWN, ["auth", "status", "--json", "hosts"]),
+        (UNKNOWN, ["auth", "status", "--json", "hosts", "-h", UNKNOWN]),
+        # With no host, the sign-in listing would check every host with every token.
+        (KNOWN, ["auth", "status", "--json", "hosts"]),
         (UNKNOWN, ["auth", "token", "-h", UNKNOWN]),
         # Commands and flags the panel doesn't run.
         (KNOWN, ["pr", "create", "-R", f"{KNOWN}/o/r"]),
@@ -94,7 +96,7 @@ def test_a_refused_call_starts_no_process(
         ["api", "--hostname", KNOWN, "x"],
         ["pr", "view", "1", "-R", f"{KNOWN}/o/r"],
         ["api", "-X", "POST", f"https://{KNOWN}/api/uploads/user-attachments/assets"],
-        ["auth", "status", "--json", "hosts"],
+        ["auth", "status", "--json", "hosts", "-h", KNOWN],
     ],
 )
 def test_a_call_naming_its_scopes_known_host_or_none_runs(
@@ -270,7 +272,7 @@ def _checkout(path: Path, remotes: dict[str, str], *, config: dict[str, str] | N
     [
         ["api", "--hostname", KNOWN, "x"],
         ["api", "x"],
-        ["auth", "status", "--json", "hosts"],
+        ["auth", "status", "--json", "hosts", "-h", KNOWN],
         ["auth", "token"],
         ["pr", "view", "--json", "number"],
     ],
@@ -362,16 +364,16 @@ def test_a_call_gh_aims_at_the_checkout_runs_only_where_the_checkouts_host_is_th
     assert started == [["gh", *argv]] * 2
 
 
-def test_a_checkout_with_no_single_github_host_runs_nothing_but_the_sign_in_listing(
+def test_a_checkout_with_no_single_github_host_runs_nothing(
     started: list[list[str]], tmp_path: Path
 ) -> None:
     root = _checkout(tmp_path, {"origin": f"https://{UNKNOWN}/o/r.git"})
 
     with github_resource.gh_target_host_scope(github_resource.CHECKOUT_SCOPE):
         github_resource._gh(["pr", "view", "--json", "number"], cwd=root)
-        github_resource._gh(["auth", "status", "--json", "hosts"], cwd=root)
+        github_resource._gh(["auth", "status", "--json", "hosts", "-h", KNOWN], cwd=root)
 
-    assert started == [["gh", "auth", "status", "--json", "hosts"]]
+    assert started == []
 
 
 TOKENS = {
@@ -445,14 +447,66 @@ def test_a_call_naming_no_host_gets_the_tokens_of_where_it_goes(
     environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert _passed_tokens("github.com", ["api", "user"]) == {"GH_TOKEN", "GITHUB_TOKEN"}
-    assert _passed_tokens(STORED, ["auth", "status", "--json", "hosts"]) == {
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-    }
     monkeypatch.setenv("GH_HOST", KNOWN)
     enterprise = {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
     assert _passed_tokens(KNOWN, ["api", "user"]) == enterprise
-    assert _passed_tokens(KNOWN, ["auth", "status"]) == enterprise
+
+
+def test_the_sign_in_listing_checks_each_host_alone_with_only_its_own_tokens(
+    environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no host, gh would check every host with GH_HOST's enterprise token and GH_TOKEN."""
+    monkeypatch.setenv("GH_HOST", OTHER_KNOWN)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", KNOWN)
+    calls: list[tuple[list[str], set[str]]] = []
+
+    def run(argv: list[str], *, env: dict[str, str] | None = None, **_kwargs: object):
+        passed = {name for name in TOKENS if name in (env if env is not None else os.environ)}
+        calls.append((argv[1:], passed))
+        host = argv[-1]
+        # gh answers for more than the host asked about; only that host's entry counts.
+        hosts = {
+            name: [{"login": f"octo-{name}", "state": "success", "active": True}]
+            for name in {host, "github.com"}
+        }
+        return 0, json.dumps({"hosts": hosts}), ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+
+    authenticated, accounts = github_resource._list_accounts("/workspace")
+
+    listing = ["auth", "status", "--json", "hosts", "-h"]
+    enterprise = {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+    assert calls == [
+        ([*listing, "github.com"], {"GH_TOKEN", "GITHUB_TOKEN"}),
+        ([*listing, OTHER_KNOWN], enterprise),
+        ([*listing, KNOWN], enterprise),
+        ([*listing, STORED], set()),
+    ]
+    assert authenticated
+    assert [(account["host"], account["login"]) for account in accounts] == [
+        (host, f"octo-{host}") for host in ("github.com", OTHER_KNOWN, KNOWN, STORED)
+    ]
+
+
+def test_an_older_gh_answers_the_sign_in_listing_from_each_hosts_status(
+    environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **_kwargs: object):
+        calls.append(argv[1:])
+        if "--json" in argv:
+            return 1, "", "unknown flag: --json"
+        return (0 if argv[-1] == STORED else 1), "", ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+
+    assert github_resource._list_accounts("/workspace") == (True, [])
+    assert calls[1::2] == [
+        ["auth", "status", "-h", "github.com"],
+        ["auth", "status", "-h", STORED],
+    ]
 
 
 def test_a_sandbox_passes_no_environment_token_and_a_chosen_one_replaces_them(

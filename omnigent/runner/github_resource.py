@@ -73,7 +73,7 @@ from urllib.parse import quote
 
 from omnigent import config as _config
 from omnigent.git_providers import EnvInstances, host_of
-from omnigent.git_providers.github import GitHubProvider
+from omnigent.git_providers.github import GitHubProvider, _gh_signed_in_hosts
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import gh_argv, pr_resource
 from omnigent.runner import github_review_fields as review_fields
@@ -274,23 +274,20 @@ def _gate(argv: list[str], scope: str | None, cwd: str | None) -> str:
     Every call runs in a host scope, on a host the user set up for GitHub: a pull request
     URL can name any host, and ``gh`` would send it a token. The host the call goes to must
     be the scope's, whether the argv names it, ``gh`` reads it from the checkout's remotes,
-    or it's ``GH_HOST`` or github.com. A sign-in listing checks each host as itself.
+    or it's ``GH_HOST`` or github.com.
 
-    :returns: The host the call goes to; for the listing, ``GH_HOST`` or github.com.
+    :returns: The host the call goes to.
     :raises gh_argv.GhArgvRefused: For a call that mustn't run.
     """
     target = gh_argv.classify(argv)
     if scope is None:
         raise gh_argv.GhArgvRefused("A gh call runs outside a host scope")
-    listing = target.host is None and target.command == ("auth", "status")
-    if scope == CHECKOUT_SCOPE and not listing:
+    if scope == CHECKOUT_SCOPE:
         scope = checkout_github_host(cwd) if cwd else None
         if scope is None:
             raise gh_argv.GhArgvRefused("The checkout has no single GitHub host to read")
-    if scope != CHECKOUT_SCOPE and not _known_github_host(scope):
+    if not _known_github_host(scope):
         raise gh_argv.GhArgvRefused(f"{scope} isn't a host set up for GitHub")
-    if listing:
-        return _default_github_host()
     if target.host is not None:
         goes_to = target.host
     elif target.from_checkout:
@@ -488,15 +485,30 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     """Return ``(authenticated, accounts)`` from ``gh auth status --json hosts``.
 
     ``accounts`` is ``[{login, active, state, host}]``; ``authenticated`` is true
-    when at least one account validates (``state == "success"``). Falls back to a
-    plain ``gh auth status`` for the boolean on an older ``gh`` without ``--json``.
+    when at least one account validates (``state == "success"``). Each host is checked
+    in its own scope, so it sees only its own tokens; with no host, ``gh`` would check
+    every host with the environment's. An older ``gh`` without ``--json`` answers only
+    the boolean, from each host's plain status.
     """
-    with _own_scope(_default_github_host()):
-        return _listed_accounts(root)
+    authenticated = False
+    accounts: list[dict[str, Any]] = []
+    for host in _sign_in_hosts():
+        with gh_target_host_scope(host):
+            host_authenticated, host_accounts = _listed_accounts(root, host)
+        authenticated = authenticated or host_authenticated
+        accounts.extend(host_accounts)
+    return authenticated, accounts
 
 
-def _listed_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
-    _, out, _ = _gh(["auth", "status", "--json", "hosts"], cwd=root)
+def _sign_in_hosts() -> list[str]:
+    """github.com, ``GH_HOST``, then every other host set up for GitHub, each once."""
+    configured = EnvInstances().hosts_for("github") | _gh_signed_in_hosts()
+    hosts = ["github.com", _default_github_host(), *sorted(configured)]
+    return [host for host in dict.fromkeys(hosts) if _known_github_host(host)]
+
+
+def _listed_accounts(root: str, host: str) -> tuple[bool, list[dict[str, Any]]]:
+    _, out, _ = _gh(["auth", "status", "--json", "hosts", "-h", host], cwd=root)
     try:
         data = json.loads(out)
     except ValueError:
@@ -504,23 +516,21 @@ def _listed_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     hosts = data.get("hosts") if isinstance(data, dict) else None
     if isinstance(hosts, dict):
         accounts: list[dict[str, Any]] = []
-        for host, entries in hosts.items():
-            if not isinstance(entries, list):
+        entries = hosts.get(host)
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict) or not entry.get("login"):
                 continue
-            for entry in entries:
-                if not isinstance(entry, dict) or not entry.get("login"):
-                    continue
-                accounts.append(
-                    {
-                        "login": entry.get("login"),
-                        "active": bool(entry.get("active")),
-                        "state": entry.get("state"),
-                        "host": entry.get("host") or host,
-                    }
-                )
+            accounts.append(
+                {
+                    "login": entry.get("login"),
+                    "active": bool(entry.get("active")),
+                    "state": entry.get("state"),
+                    "host": entry.get("host") or host,
+                }
+            )
         return any(a.get("state") == "success" for a in accounts), accounts
     # Older gh (no --json hosts): fall back to the plain status exit code.
-    rc, _, _ = _gh(["auth", "status"], cwd=root)
+    rc, _, _ = _gh(["auth", "status", "-h", host], cwd=root)
     return rc == 0, []
 
 
