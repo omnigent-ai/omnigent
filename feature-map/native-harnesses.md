@@ -458,6 +458,15 @@ without tmux continues to the same tmux step.
 that agent, then Settings → Harnesses → the **CLI did not respond** card or its
 gear, then send a message in an existing session for that harness.
 
+**Launcher sign-in prompt:** use a host whose native harness launcher stops at
+a device-style sign-in prompt in the agent's terminal. A new chat shows **Sign
+in to Databricks to start the agent** with **Open sign-in link** before the
+first message; the card clears when the prompt goes away. Restart the host
+after turns in several sessions were refused for that sign-in: sessions without
+a pending approval do not relaunch, so no sign-in pages open on reconnect. Their
+Terminal view offers **Resume session**; Resume or the next message relaunches
+only that session.
+
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
 harness and choose **Switch account**. For Codex, open or copy the HTTPS device

@@ -10,6 +10,7 @@ import {
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
+import { PendingSignInNotice } from "@/components/chat/PendingSignInNotice";
 import { TaskMarkersProvider } from "@/components/blocks/TaskActivityMessage";
 import { readTaskActivity, taskMarkerId } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
@@ -187,6 +188,7 @@ function TranscriptImpl({
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const conversationId = useChatStore((s) => s.conversationId);
+  const isNativeTerminalSession = useChatStore((s) => s.isNativeTerminalSession);
   const tasks = useSessionTasks(conversationId ?? undefined, true);
   const hasTasks = hasTaskPreview(tasks);
   // Task markers link to the tasks in the Tasks tab now; keyed by their IDs so
@@ -473,6 +475,9 @@ function TranscriptImpl({
                         : "Send a message to get started."}
                     </p>
                   </div>
+                  {conversationId && isNativeTerminalSession && (
+                    <PendingSignInNotice sessionId={conversationId} />
+                  )}
                 </ConversationEmptyState>
               )
             ) : (
