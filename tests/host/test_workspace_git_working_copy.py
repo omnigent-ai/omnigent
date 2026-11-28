@@ -1005,6 +1005,15 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
         _git(root, "branch", "fork/next", main)
     if start == "deleted remote branch":
         _git(root, "update-ref", "-d", "refs/remotes/fork/next")
+        # Enough branches below the deleted name that listing it runs past the output cap.
+        subprocess.run(
+            ["git", "-C", str(root), "update-ref", "--stdin"],
+            input="".join(
+                f"create refs/remotes/fork/next/{index:04} {fork_next}\n" for index in range(2_500)
+            ),
+            text=True,
+            check=True,
+        )
     if start == "deleted qualified name a longer ref now matches":
         # Git would now read the recorded name as this ref, which isn't where the branch started.
         _git(root, "update-ref", "-d", "refs/remotes/fork/next")

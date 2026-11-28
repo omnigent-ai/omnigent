@@ -412,11 +412,16 @@ async def _remote_start_point(
     # The refs of exactly these names, as Git lists them. A lookup by path would also find
     # ``fork/Next`` for ``fork/next`` on a case-insensitive filesystem; a listing doesn't.
     shadows = {f"refs/{start}", f"refs/tags/{start}", f"refs/heads/{start}"}
+    # The patterns match refs below these names too. A listing past the cap could leave out a
+    # shadowing ref, so it's no start at all, like a failed one.
     listed = await repository.run_unchecked(
         ["for-each-ref", "--format=%(refname)", "--", candidate, *sorted(shadows)],
         deadline=deadline,
+        allow_partial=True,
     )
-    names = set(listed.stdout.decode("utf-8", "replace").split("\n")) if listed.success else set()
+    if not listed.success or listed.overflowed:
+        return None
+    names = set(listed.stdout.decode("utf-8", "replace").split("\n"))
     # That exact remote-tracking ref still there, and nothing else Git could have read the name
     # as when the branch was created: a ref, tag or local branch of that name.
     if (
