@@ -1743,16 +1743,33 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
 async def test_runner_post_refuses_message_when_history_load_lacks_credentials(
     pinned_runner_log: Path,
 ) -> None:
-    """A credential failure while loading history names it and caches no history."""
+    """Credentials failing between history pages refuse the message and cache no history."""
     from unittest.mock import AsyncMock
 
     from omnigent.inner.databricks_executor import DatabricksAuthError
+    from omnigent.runner import app as runner_app
     from omnigent.runner._entry import _RunnerDatabricksAuth
 
     remedy = "Host credential service could not supply workspace credentials"
     session_id = "conv_history_without_credentials"
-    credentials_available = False
-    history_requests: list[str] = []
+    credentials_available = True
+    history_cursors: list[str | None] = []
+    first_item = {
+        "id": "item_1",
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "first"}],
+    }
+    second_item = {
+        "id": "item_2",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "second"}],
+    }
+    history_pages = {
+        None: {"data": [first_item], "has_more": True},
+        "item_1": {"data": [second_item], "has_more": False},
+    }
 
     def _host_credential_service() -> str:
         if not credentials_available:
@@ -1760,33 +1777,44 @@ async def test_runner_post_refuses_message_when_history_load_lacks_credentials(
         return "workspace-token"
 
     def _server_handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == f"/v1/sessions/{session_id}/items":
-            history_requests.append(request.url.path)
-        return httpx.Response(200, json={"data": [], "has_more": False})
+        nonlocal credentials_available
+        if request.url.path != f"/v1/sessions/{session_id}/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        cursor = request.url.params.get("after")
+        history_cursors.append(cursor)
+        if len(history_cursors) == 1:
+            credentials_available = False
+        return httpx.Response(200, json=history_pages[cursor])
 
     spec_resolver = AsyncMock(side_effect=RuntimeError("spec resolver unavailable"))
     message = {"type": "message", "role": "user", "agent_id": "ag_x", "model": "x", "content": []}
-    async with httpx.AsyncClient(
-        base_url="http://server",
-        auth=_RunnerDatabricksAuth(_host_credential_service),
-        transport=httpx.MockTransport(_server_handler),
-    ) as server_client:
-        app = create_runner_app(
-            process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
-            spec_resolver=spec_resolver,
-            server_client=server_client,
-        )
-        async with _runner_test_client(app) as http:
-            refused = await http.post(
-                f"/v1/sessions/{session_id}/events?stream=true", json=message
+    runner_app._session_histories_ref.pop(session_id, None)
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://server",
+            auth=_RunnerDatabricksAuth(_host_credential_service),
+            transport=httpx.MockTransport(_server_handler),
+        ) as server_client:
+            app = create_runner_app(
+                process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
+                spec_resolver=spec_resolver,
+                server_client=server_client,
             )
-            assert session_id not in app.state.active_turns
-            spec_resolver.assert_not_called()
+            async with _runner_test_client(app) as http:
+                refused = await http.post(
+                    f"/v1/sessions/{session_id}/events?stream=true", json=message
+                )
+                assert session_id not in app.state.active_turns
+                assert session_id not in runner_app._session_histories_ref
+                spec_resolver.assert_not_called()
 
-            credentials_available = True
-            retried = await http.post(
-                f"/v1/sessions/{session_id}/events?stream=true", json=message
-            )
+                credentials_available = True
+                retried = await http.post(
+                    f"/v1/sessions/{session_id}/events?stream=true", json=message
+                )
+                cached = runner_app._session_histories_ref.get(session_id, [])
+    finally:
+        runner_app._session_histories_ref.pop(session_id, None)
 
     assert refused.status_code == 503
     assert refused.json() == {
@@ -1796,8 +1824,9 @@ async def test_runner_post_refuses_message_when_history_load_lacks_credentials(
             f"{pinned_runner_log}"
         ),
     }
-    assert history_requests == [f"/v1/sessions/{session_id}/items"]
+    assert history_cursors == [None, None, "item_1"]
     assert retried.json()["error"] == "spec_resolver_failed"
+    assert [item["id"] for item in cached] == ["item_1", "item_2", None]
 
 
 @pytest.mark.asyncio

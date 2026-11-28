@@ -21,6 +21,7 @@ import pytest
 from playwright.sync_api import Browser, Page, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from tests._helpers.browser import user_page
 from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
@@ -30,6 +31,8 @@ CREDENTIAL_FAILURE_MESSAGE = "Host credential service could not supply workspace
 _MARKER_ENV = "OMNIGENT_TEST_CREDENTIAL_FAULT_MARKER"
 _MESSAGE_ENV = "OMNIGENT_TEST_CREDENTIAL_FAULT_MESSAGE"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
+_USER = '[data-testid="message-bubble"][data-role="user"]'
+_ERROR_PILL = '[data-testid="error-pill"][data-level="error"]'
 _TURN_TIMEOUT_MS = 90_000
 
 _AGENT_YAML = """\
@@ -98,17 +101,30 @@ def create_bound_session(stack: ServerRunner) -> str:
 
 
 def open_session(page: Page, stack: ServerRunner, session_id: str) -> None:
+    items = httpx.get(
+        f"{stack.base_url}/v1/sessions/{session_id}/items", params={"limit": 100}, timeout=10.0
+    )
+    items.raise_for_status()
+    stored_user_messages = sum(1 for item in items.json()["data"] if item.get("role") == "user")
     page.goto(f"{stack.base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=30_000)
+    # Error pills are counted before each send, so stored history must render first.
+    expect(page.locator(_USER)).to_have_count(stored_user_messages, timeout=30_000)
+
+
+def hold_for_recording(page: Page, milliseconds: int) -> None:
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(milliseconds)
 
 
 def run_scripted_turn(page: Page, mock_url: str) -> dict[str, str]:
-    """Send a prompt with a scripted reply; return the reply or the new error pill's text."""
+    """Send a prompt with a scripted reply; return the reply or this turn's error pill text."""
     nonce = uuid.uuid4().hex[:8]
     marker, token = f"usr-{nonce}", f"ast-{nonce}"
     reset_mock_llm(mock_url)
-    configure_mock_llm(mock_url, [{"text": token}], key=marker, match=marker)
-    pills = page.get_by_test_id("error-pill")
+    # Spare copies stop background requests such as title generation from taking the reply.
+    configure_mock_llm(mock_url, [{"text": token}] * 4, key=marker, match=marker)
+    pills = page.locator(_ERROR_PILL)
     new_pill = pills.nth(pills.count())
     page.get_by_role("textbox", name="Message the agent").fill(
         f"Context marker {marker}. Reply with exactly this token and nothing else: {token}"
@@ -117,7 +133,7 @@ def run_scripted_turn(page: Page, mock_url: str) -> dict[str, str]:
     reply = page.locator(_ASSISTANT, has_text=token).first
     expect(reply.or_(new_pill)).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     if reply.is_visible():
-        page.wait_for_timeout(1_500)
+        hold_for_recording(page, 1_500)
         return {"reply": token}
     headline = new_pill.get_by_test_id("error-headline").inner_text()
     expander = new_pill.locator('button[aria-expanded="false"]')
@@ -130,7 +146,7 @@ def run_scripted_turn(page: Page, mock_url: str) -> dict[str, str]:
         content.scroll_into_view_if_needed()
     except (AssertionError, PlaywrightTimeoutError):
         message = ""
-    page.wait_for_timeout(5_000)
+    hold_for_recording(page, 5_000)
     return {"headline": headline, "message": message}
 
 
@@ -155,9 +171,7 @@ def test_credential_outage_names_cause_and_recovers(
 ) -> None:
     stack, mock_url = credential_stack.stack, credential_stack.mock_url
     warm_session = create_bound_session(stack)
-    context = browser.new_context()
-    try:
-        page = context.new_page()
+    with user_page(browser, headers={}) as page:
         open_session(page, stack, warm_session)
         control = run_scripted_turn(page, mock_url)
         save_observation("01-control", page, control, stack, warm_session)
@@ -177,8 +191,6 @@ def test_credential_outage_names_cause_and_recovers(
         open_session(page, stack, fresh_session)
         recovered = run_scripted_turn(page, mock_url)
         save_observation("04-recovered", page, recovered, stack, fresh_session)
-    finally:
-        context.close()
 
     assert "reply" not in outage, f"the new session replied despite the outage: {outage}"
     shown = f"{outage['headline']} {outage['message']}"
