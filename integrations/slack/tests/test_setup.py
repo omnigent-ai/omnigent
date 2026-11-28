@@ -15,6 +15,8 @@ from omnigent_slack.setup import (
     HOST_ACTION,
     HOST_BLOCK,
     MANAGED_HOST_VALUE,
+    MCP_ACTION,
+    MCP_BLOCK,
     WORKSPACE_ACTION,
     WORKSPACE_BLOCK,
     SetupFlow,
@@ -95,12 +97,20 @@ class SlackResponseSetupClient(FakeSetupClient):
         return SlackResponseLike({"channel": SlackResponseLike({"id": "D123"})})
 
 
-def _mock_info(*, managed: bool = False, provider: str | None = None) -> None:
+def _mock_info(
+    *,
+    managed: bool = False,
+    provider: str | None = None,
+    mcp_services: list[dict[str, Any]] | None = None,
+) -> None:
     """Mock ``GET /v1/info``, the managed-sandbox capability probe ``validate`` reads.
 
     Every setup path that validates the server hits this, so each respx test that
     drives ``_begin_setup`` past ``/health`` declares it. Defaults to a server
     with no managed sandboxes — the pre-existing behavior.
+
+    Also mocks the MCP registry catalog ``validate`` reads, defaulting to no
+    services — the pre-existing behavior (no MCP choice in setup).
     """
     respx.get(_SERVER + "/v1/info").mock(
         return_value=httpx.Response(
@@ -110,6 +120,9 @@ def _mock_info(*, managed: bool = False, provider: str | None = None) -> None:
                 "sandbox_provider": provider,
             },
         )
+    )
+    respx.get(_SERVER + "/v1/mcp-registry/services").mock(
+        return_value=httpx.Response(200, json={"data": mcp_services or []})
     )
 
 
@@ -209,6 +222,70 @@ def test_select_modal_leaves_workspace_blank_with_no_host_to_seed_it_from() -> N
     )
     blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
     assert "initial_value" not in blocks[WORKSPACE_BLOCK]["element"]
+
+
+_MCP_SERVICES = [
+    {"id": "tracker", "title": "Work tracker", "connected": True},
+    {"id": "crm", "title": "CRM", "connected": False},
+    {"id": "notes", "title": "Notes", "connected": True},
+]
+
+
+def test_select_modal_offers_connected_mcp_services_only() -> None:
+    from omnigent_slack.omnigent import ValidatedServer
+
+    view = select_modal(
+        _SERVER,
+        ValidatedServer(
+            agents=[{"id": "ag_1", "name": "Helper"}],
+            online_hosts=[{"host_id": "h1", "name": "Host One"}],
+            mcp_services=_MCP_SERVICES,
+        ),
+    )
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    mcp_element = blocks[MCP_BLOCK]["element"]
+    assert mcp_element["type"] == "multi_static_select"
+    assert blocks[MCP_BLOCK].get("optional") is True
+    # Only the connected services are offered — the server would reject the
+    # disconnected one at session creation.
+    assert [o["value"] for o in mcp_element["options"]] == ["tracker", "notes"]
+    assert "initial_options" not in mcp_element
+
+
+def test_select_modal_omits_mcp_block_when_nothing_connected() -> None:
+    from omnigent_slack.omnigent import ValidatedServer
+
+    view = select_modal(
+        _SERVER,
+        ValidatedServer(
+            agents=[{"id": "ag_1", "name": "Helper"}],
+            online_hosts=[{"host_id": "h1", "name": "Host One"}],
+            mcp_services=[{"id": "crm", "title": "CRM", "connected": False}],
+        ),
+    )
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    assert MCP_BLOCK not in blocks
+    # …but the modal says where to connect one, instead of staying silent.
+    assert any("MCP Services" in note for note in _notes(view))
+
+
+def test_select_modal_preselects_pinned_mcp_services() -> None:
+    from omnigent_slack.omnigent import ValidatedServer
+
+    view = select_modal(
+        _SERVER,
+        ValidatedServer(
+            agents=[{"id": "ag_1", "name": "Helper"}],
+            online_hosts=[{"host_id": "h1", "name": "Host One"}],
+            mcp_services=_MCP_SERVICES,
+        ),
+        default_mcp_service_ids=("notes", "gone"),
+    )
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    initial = blocks[MCP_BLOCK]["element"]["initial_options"]
+    # The still-offered pin is pre-selected; the one no longer offered is
+    # dropped rather than smuggled into the menu.
+    assert [o["value"] for o in initial] == ["notes"]
 
 
 def _last_update(client: FakeSetupClient) -> dict[str, Any]:
@@ -816,6 +893,164 @@ async def test_select_submit_persists_config(tmp_path: Path) -> None:
     assert config.host_name == "Host One"
     # Confirmation DM was posted.
     assert client.posts and "set up" in client.posts[0]["text"].lower()
+
+
+async def test_select_submit_persists_pinned_mcp_services(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    view = {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    "agent_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Helper"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    "host_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Host One"},
+                            "value": "h1",
+                        }
+                    }
+                },
+                MCP_BLOCK: {
+                    MCP_ACTION: {
+                        "selected_options": [
+                            {
+                                "text": {"type": "plain_text", "text": "Work tracker"},
+                                "value": "tracker",
+                            },
+                            {"text": {"type": "plain_text", "text": "Notes"}, "value": "notes"},
+                        ]
+                    }
+                },
+                WORKSPACE_BLOCK: {"workspace_input": {"value": "/home/me/project"}},
+            }
+        },
+    }
+    body = {"team": {"id": "T1"}, "user": {"id": "U1"}}
+
+    try:
+        await flow._handle_select_submit(ack, body, view, client)
+    finally:
+        await pool.aclose_all()
+
+    config = await store.get_user_config("T1", "U1")
+    assert config is not None
+    assert config.mcp_registry_services == ("tracker", "notes")
+    assert client.posts and "tracker" in client.posts[0]["text"]
+
+
+async def test_select_submit_without_mcp_block_clears_a_previous_pin(tmp_path: Path) -> None:
+    # Submitting with no MCP block (nothing connected any more) reads as
+    # "pin nothing" — the previous pin must not survive the re-save.
+    store = await _store(tmp_path)
+    await store.upsert_user_config(
+        "T1",
+        "U1",
+        UserConfig(
+            agent_id="ag_1",
+            agent_name="Helper",
+            workspace="/home/me/project",
+            host_id="h1",
+            mcp_registry_services=("tracker",),
+        ),
+    )
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    view = {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    "agent_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Helper"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    "host_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Host One"},
+                            "value": "h1",
+                        }
+                    }
+                },
+                WORKSPACE_BLOCK: {"workspace_input": {"value": "/home/me/project"}},
+            }
+        },
+    }
+    body = {"team": {"id": "T1"}, "user": {"id": "U1"}}
+
+    try:
+        await flow._handle_select_submit(ack, body, view, client)
+    finally:
+        await pool.aclose_all()
+
+    config = await store.get_user_config("T1", "U1")
+    assert config is not None
+    assert config.mcp_registry_services == ()
+
+
+@respx.mock
+async def test_setup_advance_preselects_previously_pinned_mcp_services(
+    tmp_path: Path,
+) -> None:
+    # Re-running setup with a pin already stored pre-selects it in the MCP
+    # menu, so the user edits the pin instead of losing it.
+    store = await _store(tmp_path)
+    await store.upsert_user_config(
+        "T1",
+        "U1",
+        UserConfig(
+            agent_id="ag_1",
+            agent_name="Helper",
+            workspace="/home/me/project",
+            host_id="h1",
+            mcp_registry_services=("notes",),
+        ),
+    )
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"name": ".bashrc", "path": "/home/bob/.bashrc", "type": "file"}]},
+        )
+    )
+    _mock_info(mcp_services=_MCP_SERVICES)
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
+    flow = _flow(store, pool)
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == "omnigent_setup_select"
+    initial = _element(view, MCP_BLOCK)["initial_options"]
+    assert [o["value"] for o in initial] == ["notes"]
 
 
 async def test_select_submit_persists_managed_choice_without_a_workspace(tmp_path: Path) -> None:
@@ -1801,6 +2036,9 @@ async def test_an_unreachable_capability_probe_does_not_claim_non_support(
         )
     )
     respx.get(_SERVER + "/v1/info").mock(return_value=httpx.Response(500))
+    respx.get(_SERVER + "/v1/mcp-registry/services").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool, default_host_type="managed")
     client = FakeSetupClient()

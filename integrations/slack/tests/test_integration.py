@@ -53,7 +53,12 @@ async def _token_store(tmp_path: Path) -> EncryptedTokenStore:
 
 
 async def _configure_user(
-    store: SQLiteStore, team_id: str, user_id: str, *, agent_id: str = "ag_1"
+    store: SQLiteStore,
+    team_id: str,
+    user_id: str,
+    *,
+    agent_id: str = "ag_1",
+    mcp_registry_services: tuple[str, ...] = (),
 ) -> None:
     await store.upsert_user_config(
         team_id,
@@ -63,6 +68,7 @@ async def _configure_user(
             agent_name="debby",
             workspace="/home/bot/work",
             host_id="h1",
+            mcp_registry_services=mcp_registry_services,
         ),
     )
 
@@ -236,6 +242,42 @@ async def test_app_mention_runs_full_turn_and_streams_answer(tmp_path: Path) -> 
     assert f"/v1/sessions/{server.session_id}/stream" in server.paths("GET")
 
     # Slack side: the SSE answer streamed into the reply.
+    assert "Here is the answer." in client.streamed_text
+
+
+@respx.mock
+async def test_app_mention_with_pinned_mcps_sends_them_on_session_create(
+    tmp_path: Path,
+) -> None:
+    """A user whose setup pinned MCP services starts a session carrying them:
+    the create request includes ``mcp_registry_services`` from the stored
+    config, and nothing else about the turn changes."""
+    server = FakeOmnigentServer(_SERVER)
+    server.install(respx.mock)
+
+    store = await _store(tmp_path)
+    await _configure_user(store, "T1", "U1", mcp_registry_services=("tracker", "notes"))
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
+    service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
+    client = RecordingSlackClient()
+
+    try:
+        await service.handle_app_mention(
+            body={"team_id": "T1", "event_id": "Ev1"},
+            event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> review this"},
+            client=client,
+            context={"bot_user_id": "B1"},
+        )
+        await _wait_for_stream_stop(client, service)
+    finally:
+        await service.shutdown()
+        await pool.aclose_all()
+
+    server.assert_request(
+        "POST",
+        "/v1/sessions",
+        json_contains={"agent_id": "ag_1", "mcp_registry_services": ["tracker", "notes"]},
+    )
     assert "Here is the answer." in client.streamed_text
 
 

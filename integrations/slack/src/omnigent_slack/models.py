@@ -73,6 +73,10 @@ class UserConfig:
     host_id: str | None = None
     host_name: str | None = None
     host_type: HostType = "external"
+    # MCP registry services pinned at setup, applied to every new Slack-started
+    # session for this user. Empty means "send nothing", so the session request
+    # is unchanged from before this field existed.
+    mcp_registry_services: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,3 +112,7 @@ class SlackTurn:
     workspace: str | None = None
     host_id: str | None = None
     host_type: HostType = "external"
+    # MCP registry services pinned in the user's setup, for the session this
+    # turn creates. Empty for turns on an existing thread — that session was
+    # created with its own selection and keeps it.
+    mcp_registry_services: tuple[str, ...] = ()
