@@ -72,7 +72,10 @@ export function SideChatSettings({
     if (runnerOnline !== undefined) {
       void queryClient.invalidateQueries({ queryKey: ["session", session.id] });
     }
-  }, [queryClient, session.id, runnerOnline]);
+    if (runnerOnline === true && settingsParentId) {
+      void queryClient.invalidateQueries({ queryKey: ["session", settingsParentId] });
+    }
+  }, [queryClient, session.id, settingsParentId, runnerOnline]);
   const { session: parent } = useSession(sourceId);
   const parentState = useConversationEntryState(nativeSide ? sourceId : null);
   const families = useHarnessEffortFamilies();

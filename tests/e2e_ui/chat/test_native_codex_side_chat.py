@@ -20,6 +20,7 @@ from tests.e2e_ui.conftest import (
 )
 from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view
 from tests.e2e_ui.messages.test_native_codex_render_parity import (
+    _CODEX_MOCK_MODEL,
     _open_terminal_view,
     _wait_terminal_connected,
 )
@@ -72,7 +73,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
             required_tools=[],
         )
         set_fallback_mock_llm(mock_llm_server_url, prompt.split(":")[0], reply)
-    set_fallback_mock_llm(mock_llm_server_url, "gpt-4o", "")
+    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "")
 
     _send_parent(page, parent_question, parent_reply)
     parent_items = _items(base_url, session_id)
@@ -118,7 +119,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
         )
     ]
     assert first_requests
-    assert {request["model"] for request in first_requests} == {"gpt-4o"}
+    assert {request["model"] for request in first_requests} == {_CODEX_MOCK_MODEL}
     child_thread_id = child["labels"]["omnigent.codex_native.subagent_thread_id"]
     assert child_thread_id
     assert child_thread_id != parent["external_session_id"]
@@ -151,23 +152,40 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     assert _items(base_url, session_id) == parent_items
 
     expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+    selected_model_option = next(
+        model
+        for model in parent["model_options"]
+        if model["id"] != first_requests[0]["model"]
+        and any(
+            effort["reasoningEffort"] != model["defaultReasoningEffort"]
+            for effort in model["supportedReasoningEfforts"]
+        )
+    )
+    selected_model = selected_model_option["id"]
+    selected_effort = next(
+        effort["reasoningEffort"]
+        for effort in reversed(selected_model_option["supportedReasoningEfforts"])
+        if effort["reasoningEffort"] != selected_model_option["defaultReasoningEffort"]
+    )
     settings = pane.get_by_role("button", name="Side chat model and effort")
     expect(settings).to_be_visible(timeout=30_000)
     settings.click()
     page.get_by_test_id("side-chat-model-edit").click()
-    page.get_by_placeholder("Search models…").fill("gpt-6-sol")
-    option = page.locator('[data-model-id$="gpt-6-sol"]')
-    selected_model = option.get_attribute("data-model-id")
-    assert selected_model and selected_model != first_requests[0]["model"]
+    search = page.get_by_placeholder("Search models…")
+    if search.count():
+        search.fill(selected_model)
+    option = page.locator(f'[data-model-id="{selected_model}"]')
     with page.expect_response(f"**/v1/sessions/{child_id}") as picked_model:
         option.click()
     assert picked_model.value.ok
     with page.expect_response(f"**/v1/sessions/{child_id}") as picked_effort:
-        page.locator('[data-effort-level="max"]').click()
+        page.locator(f'[data-effort-level="{selected_effort}"]').click()
     assert picked_effort.value.ok
     page.keyboard.press("Escape")
-    expect(settings).to_contain_text("Max")
-    expected_followup_effort = "max"
+    expect(settings).to_contain_text(
+        "xHigh" if selected_effort == "xhigh" else selected_effort.title()
+    )
+    expected_followup_effort = selected_effort
     if mobile:
         # A cleared pick must reset the thread's effort rather than inherit the previous turn.
         reset = httpx.patch(
@@ -177,11 +195,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
         )
         reset.raise_for_status()
         assert reset.json()["reasoning_effort"] is None
-        expected_followup_effort = next(
-            model["defaultReasoningEffort"]
-            for model in parent["model_options"]
-            if model["id"] == selected_model
-        )
+        expected_followup_effort = selected_model_option["defaultReasoningEffort"]
     page.get_by_test_id("side-chat-input").fill(followup)
     expect(page.get_by_test_id("side-chat-send")).to_be_enabled(timeout=30_000)
     page.get_by_test_id("side-chat-send").click()
@@ -239,4 +253,4 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
         )
     ]
     assert parent_requests
-    assert {request["model"] for request in parent_requests} == {"gpt-4o"}
+    assert {request["model"] for request in parent_requests} == {_CODEX_MOCK_MODEL}

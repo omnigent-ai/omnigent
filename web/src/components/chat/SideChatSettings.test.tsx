@@ -71,9 +71,9 @@ function Pane() {
   return session ? <SideChatSettings session={session} /> : null;
 }
 
-function mount(session = child) {
+function mount(session = child, parentSession = parent) {
   cache.setQueryData(["session", "side"], session);
-  cache.setQueryData(["session", "parent"], parent);
+  cache.setQueryData(["session", "parent"], parentSession);
   return render(
     <QueryClientProvider client={cache}>
       <Pane />
@@ -690,7 +690,7 @@ it("uses the parent catalog while targeting a native Codex side thread", async (
   expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
 });
 
-it("refreshes native settings support when the parent runner reconnects", async () => {
+it("refreshes native settings support and the parent catalog on reconnect", async () => {
   const session = {
     ...child,
     harness: "codex-native",
@@ -704,12 +704,17 @@ it("refreshes native settings support when the parent runner reconnects", async 
   const health = vi
     .spyOn(runnerHealth, "useRunnerHealthRegistration")
     .mockReturnValue(new Map([["parent", false]]));
-  const snapshot = vi.spyOn(sessionsApi, "getSessionSlim").mockResolvedValue(session);
-  const view = mount(session);
+  let childSnapshot: Session = session;
+  let parentSnapshot: Session = { ...parent, codexModelOptions: [] };
+  const snapshot = vi
+    .spyOn(sessionsApi, "getSessionSlim")
+    .mockImplementation(async (id) => (id === "parent" ? parentSnapshot : childSnapshot));
+  const view = mount(session, parentSnapshot);
   await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(1));
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 
-  snapshot.mockResolvedValue({ ...session, sideChatSettingsSupported: true });
+  childSnapshot = { ...session, sideChatSettingsSupported: true };
+  parentSnapshot = parent;
   health.mockReturnValue(new Map([["parent", true]]));
   view.rerender(
     <QueryClientProvider client={cache}>
@@ -717,6 +722,6 @@ it("refreshes native settings support when the parent runner reconnects", async 
     </QueryClientProvider>,
   );
   expect(await screen.findByRole("button", { name: "Side chat model and effort" })).toBeVisible();
-  expect(snapshot).toHaveBeenCalledTimes(2);
+  expect(snapshot).toHaveBeenCalledTimes(3);
   expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
 });
