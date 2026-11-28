@@ -1034,6 +1034,18 @@ def create_projects_router(
             project_store.get_identity, project.id, _identity_id(identity_id), user_id=user_id
         )
         base_before = current.agent_id if current is not None else None
+        # Renaming would slip the Reviewer or Merger past the owner-only retire guard.
+        if (
+            is_agent_call(request)
+            and current is not None
+            and current.name.casefold() in _OWNER_RETIRED_ROLE_NAMES
+            and body.name is not None
+            and body.name.strip().casefold() != current.name.casefold()
+        ):
+            raise OmnigentError(
+                f"Only the project owner can rename the {current.name}",
+                code=ErrorCode.FORBIDDEN,
+            )
         if "agent_id" in body.model_fields_set and project.user_id != user_id:
             _refuse_member_agent_choice(
                 project,
@@ -1128,7 +1140,7 @@ def create_projects_router(
             raise OmnigentError(
                 "Only the project's Lead can retire a role", code=ErrorCode.FORBIDDEN
             )
-        if source is None and project.user_id != user_id:
+        if source is None and (is_agent_call(request) or project.user_id != user_id):
             raise OmnigentError(
                 "Only the project owner or its Lead can retire a role", code=ErrorCode.FORBIDDEN
             )
@@ -1201,7 +1213,7 @@ def create_projects_router(
     ) -> dict[str, Any]:
         """Bring a retired role back with its persona, defaults and agent. Owner only."""
         user_id = require_user(request, auth_provider)
-        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+        if is_agent_call(request):
             raise OmnigentError(
                 "Only the project owner can restore a role", code=ErrorCode.FORBIDDEN
             )

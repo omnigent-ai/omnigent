@@ -64,6 +64,14 @@ async def test_the_lead_retires_a_role_and_the_owner_restores_it(
     assert (await retire(designer, as_designer))[0] == 403
     assert (await retire(reviewer, as_lead))[0] == 403
     assert (await retire(merger, as_lead))[0] == 403
+    # A runner call without a source header doesn't get the owner's powers.
+    runner_only = {**owner, **runner}
+    assert (await retire(reviewer, runner_only))[0] == 403
+    # Renaming the Reviewer can't slip it past that guard.
+    renamed = await client.patch(
+        f"{base}/{reviewer['id']}", json={"name": "zz Helper"}, headers=as_lead
+    )
+    assert renamed.status_code == 403
     lead_self = await client.post(f"{base}/lead/retire", json=reason, headers=as_lead)
     assert lead_self.status_code in (400, 404)
 
@@ -89,6 +97,8 @@ async def test_the_lead_retires_a_role_and_the_owner_restores_it(
     # Agents can't restore, and a config write can't drop the retired list.
     refused = await client.post(f"{base}/{designer['id']}/restore", headers=as_lead)
     assert refused.status_code == 403
+    runner_restore = await client.post(f"{base}/{designer['id']}/restore", headers=runner_only)
+    assert runner_restore.status_code == 403
     patched = await client.patch(f"/v1/projects/{project_id}", json={"config": {}}, headers=owner)
     assert patched.status_code == 200, patched.text
     assert (await client.get(base, headers=owner)).json()["retired"]
