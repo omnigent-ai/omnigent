@@ -68,8 +68,16 @@ export function ResponsiveViewerSlot({
       else offsets.set(element, { top: element.scrollTop, left: element.scrollLeft });
     };
     host.addEventListener("scroll", rememberScroll, true);
+    // Forget removed elements at once, so a closed tab's subtree isn't kept alive.
+    const forgetRemoved = new MutationObserver(() => {
+      for (const element of offsets.keys()) {
+        if (!host.contains(element)) offsets.delete(element);
+      }
+    });
+    forgetRemoved.observe(host, { childList: true, subtree: true });
     return () => {
       host.removeEventListener("scroll", rememberScroll, true);
+      forgetRemoved.disconnect();
       offsets.clear();
     };
   }, [host, keepsScroll]);

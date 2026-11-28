@@ -188,3 +188,41 @@ it.each([true, false])(
     }
   },
 );
+
+it("releases a scrolled element removed without a layout change", async () => {
+  const mobileTarget = document.createElement("div");
+  document.body.appendChild(mobileTarget);
+  const slot = (mobile: boolean) => (
+    <ResponsiveViewerSlot mobile={mobile} mobileTarget={mobileTarget} keepsScroll>
+      <div data-testid="tabs" />
+    </ResponsiveViewerSlot>
+  );
+  const { rerender, unmount } = render(slot(false));
+  const tabs = screen.getByTestId("tabs");
+  const closedTab = document.createElement("div");
+  let top = 0;
+  Object.defineProperty(closedTab, "scrollTop", {
+    get: () => top,
+    set: (value: number) => (top = value),
+  });
+  tabs.appendChild(closedTab);
+  try {
+    top = 2400;
+    fireEvent.scroll(closedTab);
+    // The tab closes at the same width; let the removal be observed.
+    closedTab.remove();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+    // Had the slot kept it, a later move would give it the closed tab's old place.
+    top = 0;
+    tabs.appendChild(closedTab);
+    rerender(slot(true));
+    expect(mobileTarget.contains(closedTab)).toBe(true);
+    expect(top).toBe(0);
+  } finally {
+    unmount();
+    mobileTarget.remove();
+  }
+});
