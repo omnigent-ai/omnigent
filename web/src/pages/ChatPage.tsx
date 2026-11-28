@@ -127,7 +127,11 @@ import {
 } from "@/store/sessionTasksActions";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
-import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper as isNativeWrapperLabel,
+  nativeCodingAgentForHarness,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import {
   isSideChatCommand,
   newPendingSideChatId,
@@ -1755,7 +1759,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // session (embedded Omnigent REPL terminal) runs an in-process harness
   // with the full server-side slash_command path.
   const isTerminalFirst = terminalFirst?.isTerminalFirst === true;
-  const isNativeWrapper = terminalFirst?.isNativeWrapper === true;
+  // The workspace context can lag a warm switch; commands follow the displayed session.
+  const isNativeWrapper = isNativeWrapperLabel(wrapperLabel);
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
