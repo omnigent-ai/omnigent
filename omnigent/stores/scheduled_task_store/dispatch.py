@@ -74,7 +74,9 @@ class ScheduledTaskDispatchStore(Protocol):
         A ``None`` next run marks the task completed.
 
         An already-recorded occurrence advances the cursor but returns None,
-        as does a changed task. Neither case starts another run.
+        as does a changed task. Neither case starts another run. A retry of an
+        earlier run that has not started is recorded as ``skipped``
+        (``retry_superseded``).
 
         A timer runs one firing at a time: while its previous run is unfinished, this
         returns None and changes nothing. Otherwise it first deletes the timer's
@@ -111,19 +113,33 @@ class ScheduledTaskDispatchStore(Protocol):
     ) -> tuple[ScheduledTask, ScheduledTaskRun] | None:
         """Start a pending run under a lease, returning the task snapshot to fire.
 
-        Returns None if another replica already claimed it. A run whose task was
+        Returns None if another replica already claimed it, or for a retry whose
+        ``scheduled_at`` has not come yet. A retry is recorded as ``skipped``
+        instead when its task is paused (``task_paused``), now allows fewer
+        retries (``retry_cancelled``), or has its next occurrence due
+        (``retry_superseded``). A run whose task was
         deleted is recorded as ``skipped`` instead. A run whose host changed with
         the task's target gets the new host and stays pending. Both return None.
         """
         ...
 
     def renew_starting_run(
-        self, run_id: str, *, now: Callable[[], float], lease_seconds: int
+        self,
+        run_id: str,
+        *,
+        now: Callable[[], float],
+        lease_seconds: int,
+        dispatching: bool = False,
     ) -> ScheduledTaskRun | None:
         """Renew only an unexpired startup, reading now after locking.
 
         Returns the current row even if no renewal occurred. Callers must check
         status and lease expiry; a non-None result alone does not confirm renewal.
+
+        With *dispatching*, a renewed run's ``prompt_dispatch`` becomes ``"started"``:
+        its prompt is about to leave the executor. Every claim records
+        ``"not_started"``, which is the only proof recovery accepts that a run
+        without a session never sent its prompt.
         """
         ...
 
@@ -141,8 +157,15 @@ class ScheduledTaskDispatchStore(Protocol):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        retryable: bool = False,
     ) -> ScheduledTaskRun | None:
         """Finish startup conditionally on its lease still matching this snapshot.
+
+        A ``failed`` startup marked *retryable* never got its prompt to the agent. The
+        same write records the occurrence's next retry, a pending run whose
+        ``scheduled_at`` is when it may start. None is recorded if the task has no
+        retry left or already has one waiting, or if a later occurrence is due
+        first or already has a run.
 
         Executors use an unexpired lease. Reconcilers use ``expired=True`` only
         after checking whether the prompt was sent: preserve a started run,

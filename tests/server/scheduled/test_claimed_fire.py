@@ -255,6 +255,56 @@ async def test_a_claimed_run_of_a_workflow_automation_starts_as_a_run_of_the_wor
 
 
 @pytest.mark.parametrize(
+    ("failed_stage", "retried"), [("runner_start", True), ("prompt_send", False)]
+)
+async def test_a_failed_startup_is_retried_only_if_its_prompt_was_never_sent(
+    store, monkeypatch, failed_stage, retried
+) -> None:
+    from omnigent.server.routes import sessions
+
+    claimed = _claim(store, max_retries=1, retry_delay_seconds=60)
+    deps = _deps(store, conversation_store=_ConversationStore())
+    failure = RuntimeError("delivery failed")
+    monkeypatch.setattr(
+        sessions,
+        "_ensure_runner_session_initialized",
+        AsyncMock(side_effect=failure if failed_stage == "runner_start" else None),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_dispatch_session_event_to_runner",
+        AsyncMock(side_effect=failure if failed_stage == "prompt_send" else None),
+    )
+    monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+
+    async def dispatch(conv, task):
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+
+    runs = {run.trigger_key: run for run in _runs(store, claimed.task)}
+    first = runs.pop(scheduled_trigger_key(claimed.task.next_run_at))
+    assert (first.status, first.error_code) == ("failed", "launch_failed")
+    # A runner that may have taken the prompt could run it twice.
+    assert list(runs) == ([f"retry:1:schedule:{claimed.task.next_run_at}"] if retried else [])
+
+
+@pytest.mark.parametrize(
+    ("error_code", "retried"), [("host_offline", True), ("host_not_found", False)]
+)
+async def test_only_a_failure_a_later_attempt_can_get_past_is_retried(
+    store, error_code, retried
+) -> None:
+    claimed = _claim(store, max_retries=1, retry_delay_seconds=60)
+    recorder = fire_mod._ClaimedRunRecorder(_deps(store), claimed.task, claimed.lease)
+
+    await recorder.finish("failed", error="the host can't run it", error_code=error_code)
+
+    # A host that no longer exists fails the retry the same way.
+    assert len(_runs(store, claimed.task)) == (2 if retried else 1)
+
+
+@pytest.mark.parametrize(
     "session_mode,failed_stage",
     [
         ("new", stage)
@@ -439,9 +489,12 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
                 ),
             )
         )
-        assert await recovery.recover(run) == "failed"
+        # A send that had begun may have reached the runner before it was cancelled.
+        began = reported_stage == "prompt_send"
+        assert run.prompt_dispatch == ("started" if began else "not_started")
+        assert await recovery.recover(run) == ("failed" if began else "unsent")
         initialize.assert_awaited_once()
-        assert send.await_count == int(reported_stage == "prompt_send")
+        assert send.await_count == int(began)
     elif failed_stage and not native_refusal:
         assert not sent
         assert len(failed) == 1
@@ -1026,6 +1079,57 @@ async def test_lost_lease_stops_before_the_prompt_is_sent(store) -> None:
     assert _runs(store, claimed.task)[0].status == "starting"
 
 
+@pytest.mark.parametrize("target", ["connected_host", "managed_sandbox"])
+async def test_a_lease_lost_as_dispatch_begins_keeps_the_prompt_here(
+    store, monkeypatch, target
+) -> None:
+    from omnigent.server.routes import sessions
+
+    managed = target == "managed_sandbox"
+    claimed = _claim(
+        store,
+        **({"execution_target": target, "host_id": None, "workspace": None} if managed else {}),
+    )
+    send, launch = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
+    monkeypatch.setattr(sessions, "_run_managed_launch", launch)
+    monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+    renew = store.renew_starting_run
+
+    def renew_as_the_lease_expires(*args: Any, **kwargs: Any) -> ScheduledTaskRun | None:
+        if kwargs.get("dispatching"):
+            claimed.clock.advance(_LEASE_SECONDS + 1)
+        return renew(*args, **kwargs)
+
+    monkeypatch.setattr(store, "renew_starting_run", renew_as_the_lease_expires)
+    startup = FakeStartupInputs()
+    deps = _deps(
+        store,
+        conversation_store=_ConversationStore(),
+        sandbox_config=_managed_sandbox_config() if managed else None,
+        managed_launches=ManagedLaunchTracker() if managed else None,
+        startup_inputs=startup if managed else None,
+    )
+
+    async def dispatch(conv, task):
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    executor = ClaimedRunExecutor(deps, **({} if managed else {"launch_dispatch": dispatch}))
+    try:
+        with pytest.raises(StartupLeaseLost):
+            await executor.fire(claimed.task, claimed.lease)
+    finally:
+        await _drain_managed_launches()
+
+    # No runner or sandbox was given the prompt, and the run still says so.
+    send.assert_not_awaited()
+    launch.assert_not_awaited()
+    assert startup.enqueued == []
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.prompt_dispatch) == ("starting", "not_started")
+
+
 async def test_fire_runs_inside_the_owner_identity(store) -> None:
     claimed = _claim(store)
     events: list[str] = []
@@ -1141,13 +1245,32 @@ async def test_revoked_identity_of_a_deleted_owner_disables_the_task(store, monk
     assert store.get(claimed.task.id) is None
 
 
-@pytest.mark.parametrize("outcome", ["bound", "failed_after_binding", "tracker_failed", "raised"])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "bound",
+        "failed_after_binding",
+        "rolled_back_after_binding",
+        "lost_its_host_after_launching",
+        "bound_as_the_wait_ran_out",
+        "still_binding_as_the_wait_ran_out",
+        "tracker_failed",
+        "raised",
+    ],
+)
 async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
     store, monkeypatch, outcome: str
 ) -> None:
     from omnigent.server.routes import sessions
 
-    claimed = _claim(store, execution_target="managed_sandbox", host_id=None, workspace=None)
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        host_id=None,
+        workspace=None,
+        max_retries=1,
+        retry_delay_seconds=60,
+    )
     calls: list[str] = []
     startup = FakeStartupInputs(calls)
     conversations = _ConversationStore()
@@ -1162,10 +1285,26 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
             raise RuntimeError("allocation failed")
         if outcome == "tracker_failed":
             tracker.fail(session_id, "provider refused")
+            # The launch gets to record its own failure only after the executor is done.
+            await runner_started.wait()
             return
+        if outcome == "still_binding_as_the_wait_ran_out":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # A cancelled launch can still be committing its binding.
+                await runner_started.wait()
         conversations.hosts[session_id] = kwargs["host_id"]
         tracker.get(session_id).bound.set()
-        if outcome == "failed_after_binding":
+        if outcome == "rolled_back_after_binding":
+            # The failed launch drops its new host before the executor reads the session.
+            del conversations.hosts[session_id]
+        if outcome == "lost_its_host_after_launching":
+            # A launch that succeeds forgets its record; the session lost its host since.
+            tracker.finish(session_id)
+            del conversations.hosts[session_id]
+            return
+        if outcome not in ("bound", "bound_as_the_wait_ran_out"):
             # The runner launch fails before the executor records the handoff.
             tracker.fail(session_id, "harness not configured on the sandbox host")
             return
@@ -1173,7 +1312,31 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
         await runner_started.wait()
         tracker.finish(session_id)
 
+    read_held, release_read = threading.Event(), threading.Event()
+    read = conversations.get_conversation
+
+    def read_held_once_bound(conversation_id: str) -> Any:
+        if conversations.hosts and not read_held.is_set():
+            # The executor's read of the bound session outlasts its registration wait,
+            # while the bound host is free to take the saved prompt.
+            read_held.set()
+            assert release_read.wait(10)
+        return read(conversation_id)
+
+    wait_ran_out = outcome.endswith("as_the_wait_ran_out")
+    if wait_ran_out:
+        monkeypatch.setattr(conversations, "get_conversation", read_held_once_bound)
+        monkeypatch.setattr(fire_mod, "_ABANDONED_LAUNCH_SETTLE_S", 0.05)
+
+    renew = store.renew_starting_run
+
+    def renew_noting_dispatch(*args: Any, **kwargs: Any) -> ScheduledTaskRun | None:
+        if kwargs.get("dispatching"):
+            calls.append("dispatch")
+        return renew(*args, **kwargs)
+
     monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock(side_effect=launch))
+    monkeypatch.setattr(store, "renew_starting_run", renew_noting_dispatch)
     executor = ClaimedRunExecutor(
         _deps(
             store,
@@ -1181,16 +1344,22 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
             sandbox_config=_managed_sandbox_config(),
             managed_launches=ManagedLaunchTracker(),
             startup_inputs=startup,
-        )
+        ),
+        **({"registration_timeout_s": 0.2} if wait_ran_out else {}),
     )
     try:
         await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
-        [run] = _runs(store, claimed.task)
+        runs = {run.trigger_key: run for run in _runs(store, claimed.task)}
+        run = runs.pop(scheduled_trigger_key(claimed.task.next_run_at))
+        failed_by_the_executor = [session for session, _ in startup.launch_failures]
     finally:
         runner_started.set()
+        release_read.set()
         await _drain_managed_launches()
 
-    assert calls == ["enqueue", "launch"]
+    # Recorded before the prompt is saved: from then on the sandbox's host can deliver it.
+    assert calls == ["dispatch", "enqueue", "launch"]
+    assert run.prompt_dispatch == "started"
     # The sandbox registers under the run's host ID, so its connection routes back here.
     assert launched_host_ids == [run.host_id]
     assert run.host_id == occurrence_host_id(claimed.task, scheduled_trigger_key(run.scheduled_at))
@@ -1206,11 +1375,51 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
         # The failure stage: creating the sandbox, or starting its runner once bound.
         error_code, reason = {
             "failed_after_binding": ("runner_start_failed", "harness not configured"),
+            "rolled_back_after_binding": ("runner_start_failed", "harness not configured"),
+            "lost_its_host_after_launching": ("runner_start_failed", "before its host connected"),
+            "bound_as_the_wait_ran_out": ("sandbox_registration_timeout", "did not register"),
+            "still_binding_as_the_wait_ran_out": (
+                "sandbox_registration_timeout",
+                "did not register",
+            ),
             "tracker_failed": ("sandbox_create_failed", "provider refused"),
             "raised": ("sandbox_create_failed", "allocation failed"),
         }[outcome]
         assert (run.status, run.error_code) == ("failed", error_code)
         assert reason in (run.error or "")
+        # Once its host bound, the sandbox may have been given the saved prompt.
+        assert bool(runs) == (error_code == "sandbox_create_failed")
+        if runs:
+            # The executor fails the saved prompt before it records the retry, which must
+            # never find it waiting: the launch's own record can lag behind, or be lost.
+            assert conversations.ids[0] in failed_by_the_executor
+
+
+async def test_a_prompt_that_may_have_been_saved_for_a_sandbox_is_not_retried(store) -> None:
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        host_id=None,
+        workspace=None,
+        max_retries=1,
+        retry_delay_seconds=60,
+    )
+    startup = FakeStartupInputs()
+    startup.enqueue = AsyncMock(side_effect=RuntimeError("commit outcome unknown"))
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=_ConversationStore(),
+            sandbox_config=_managed_sandbox_config(),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
+        )
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    # A save that landed anyway would be delivered once a host binds to the session.
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "launch_failed")
 
 
 @pytest.mark.parametrize("hint_outcome", ["absent", "hint", "none", "empty", "raises", "blocked"])
@@ -1220,7 +1429,14 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
     from omnigent.server import managed_hosts
     from omnigent.server.routes import sessions
 
-    claimed = _claim(store, execution_target="managed_sandbox", host_id=None, workspace=None)
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        host_id=None,
+        workspace=None,
+        max_retries=1,
+        retry_delay_seconds=60,
+    )
     host_id = claimed.lease.run.host_id
     terminate = AsyncMock()
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
@@ -1269,8 +1485,11 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
         release_hint.set()
         await _drain_managed_launches()
 
-    [run] = _runs(store, claimed.task)
+    runs = {run.id: run for run in _runs(store, claimed.task)}
+    run = runs.pop(claimed.lease.run.id)
     assert (run.status, run.error_code) == ("failed", "sandbox_registration_timeout")
+    # Its launch ended with no host bound, so nothing took the saved prompt.
+    assert [retry.status for retry in runs.values()] == ["scheduled"]
     assert cancelled.is_set()
     assert terminate.await_args.args[0] is hosts.hosts[host_id]
     # The saved prompt fails with the timeout first. The cancelled launch's later
@@ -1535,7 +1754,7 @@ async def test_an_unregistered_sandbox_whose_teardown_fails_still_settles_its_la
     assert abandoned.error == "the sandbox did not register within 0.2 seconds"
     run = next(run for run in _runs(store, claimed.task) if run.id == claimed.lease.run.id)
     assert (run.status, run.conversation_id) == ("starting", unstarted)
-    assert await executor.recover(run) == "failed"
+    assert await executor.recover(run) == "unsent"
 
 
 def _bound_unstarted_session_waits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1665,8 +1884,12 @@ class _RecoveryConversationStore:
 
 
 def _expired_run(
-    task: ScheduledTask, *, conversation_id: str | None = _CONV_ID
+    task: ScheduledTask,
+    *,
+    conversation_id: str | None = _CONV_ID,
+    prompt_dispatch: str | None = "not_started",
 ) -> ScheduledTaskRun:
+    """An interrupted startup; by default one whose dispatch never began."""
     expired_at = int(time.time()) - 1
     trigger_key = scheduled_trigger_key(expired_at - 120)
     return ScheduledTaskRun(
@@ -1678,6 +1901,7 @@ def _expired_run(
         trigger_key=trigger_key,
         host_id=occurrence_host_id(task, trigger_key),
         lease_expires_at=expired_at,
+        prompt_dispatch=prompt_dispatch,
     )
 
 
@@ -1698,19 +1922,38 @@ def _saved_task(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> Scheduled
     return store.get(task.id)
 
 
-async def test_recovery_fails_a_run_that_never_created_its_session(store) -> None:
+@pytest.mark.parametrize("conversation_id", [None, _CONV_ID], ids=["no-session", "session"])
+@pytest.mark.parametrize(
+    ("prompt_dispatch", "expected"),
+    [
+        ("not_started", "unsent"),
+        # A harness that writes its own transcript shows nothing of a prompt it has.
+        ("started", "failed"),
+        # Claimed by a release that records no dispatch, so nothing is proven.
+        (None, "failed"),
+    ],
+)
+async def test_recovery_takes_a_startup_as_unsent_only_if_its_dispatch_never_began(
+    store, conversation_id, prompt_dispatch, expected
+) -> None:
     task = _saved_task(store)
-    executor = ClaimedRunExecutor(_deps(store))
+    conversations = _RecoveryConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID),
+        live_status="idle",
+        items=[_RUNNER_STARTED],
+    )
+    executor = ClaimedRunExecutor(_deps(store, conversation_store=conversations))
+    run = _expired_run(task, conversation_id=conversation_id, prompt_dispatch=prompt_dispatch)
 
-    assert await executor.recover(_expired_run(task, conversation_id=None)) == "failed"
+    assert await executor.recover(run) == expected
 
 
 @pytest.mark.parametrize(
     ("items", "live_status", "expected"),
     [
-        ([], None, "failed"),
+        ([], None, "unsent"),
         # The runner connected but never got the prompt.
-        ([_RUNNER_STARTED], "idle", "failed"),
+        ([_RUNNER_STARTED], "idle", "unsent"),
         ([_PROMPT, _RUNNER_STARTED], None, "running"),
         ([_PROMPT, _RUNNER_STARTED], "running", "running"),
         ([], "waiting", "running"),
@@ -1719,6 +1962,7 @@ async def test_recovery_fails_a_run_that_never_created_its_session(store) -> Non
         ([_REPLY, _PROMPT, _RUNNER_STARTED], "idle", "succeeded"),
         ([_RUNNER_STARTED, _REPLY, _PROMPT], "idle", "succeeded"),
         ([_TOOL_CALL, _REPLY, _PROMPT], "idle", "running"),
+        # The agent got the prompt before the session failed, so a retry would run it twice.
         ([_PROMPT], "failed", "failed"),
     ],
 )
@@ -1771,10 +2015,11 @@ def test_a_continue_tasks_runs_share_one_sandbox_identity() -> None:
 async def test_recovery_fails_a_continued_run_that_never_recorded_its_session(store) -> None:
     """A continued run attaches its session only once its prompt is delivered; never resent."""
     task = _saved_task(store, session_mode="continue", session_id=_CONV_ID)
-    run = _expired_run(task, conversation_id=None)
+    run = _expired_run(task, conversation_id=None, prompt_dispatch="started")
     assert run.host_id == _HOST_ID
     executor = ClaimedRunExecutor(_deps(store))
 
+    # So no session on the run doesn't show the prompt was never sent.
     assert await executor.recover(run) == "failed"
 
 
@@ -1797,7 +2042,7 @@ async def test_recovery_fails_a_joined_sandbox_run_whose_prompt_was_never_sent(s
         )
     )
 
-    assert await executor.recover(run) == "failed"
+    assert await executor.recover(run) == "unsent"
 
 
 def _sandbox_hosts(task: ScheduledTask, run: ScheduledTaskRun, provider: str | None) -> Any:
@@ -1857,13 +2102,24 @@ async def test_recovery_waits_while_this_server_still_provisions_the_sandbox(sto
 
 
 @pytest.mark.parametrize("provider", ["agent_sandbox", None])
-async def test_recovery_cleans_up_an_unbound_managed_run(store, monkeypatch, provider) -> None:
+@pytest.mark.parametrize(
+    ("prompt_dispatch", "expected"),
+    [
+        # The executor stopped before it saved the prompt.
+        ("not_started", "unsent"),
+        # Another server ran the launch: its host may have bound and been dropped again.
+        ("started", "failed"),
+    ],
+)
+async def test_recovery_cleans_up_an_unbound_managed_run(
+    store, monkeypatch, provider, prompt_dispatch, expected
+) -> None:
     from omnigent.server import managed_hosts
 
     terminate = AsyncMock()
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     task = _saved_task(store, execution_target="managed_sandbox")
-    run = _expired_run(task)
+    run = _expired_run(task, prompt_dispatch=prompt_dispatch)
     startup = FakeStartupInputs()
     hosts = _sandbox_hosts(task, run, provider)
     conversations = _RecoveryConversationStore(
@@ -1879,13 +2135,54 @@ async def test_recovery_cleans_up_an_unbound_managed_run(store, monkeypatch, pro
         )
     )
 
-    assert await executor.recover(run) == "failed"
+    assert await executor.recover(run) == expected
     assert [session for session, _ in startup.launch_failures] == [_CONV_ID]
     # Only a server-managed sandbox is torn down, never a user's own host.
     if provider is None:
         terminate.assert_not_awaited()
     else:
         assert terminate.await_args.args[0] is hosts.hosts[run.host_id]
+
+
+@pytest.mark.parametrize("prompt_dispatch", ["started", None])
+@pytest.mark.parametrize(
+    "seen", ["bound on this server", "prompt in the transcript", "prompt awaiting its echo"]
+)
+async def test_recovery_cannot_rule_out_a_send_once_the_launch_bound_its_host(
+    store, seen, prompt_dispatch
+) -> None:
+    """A launch that fails after binding drops its new host, so the session shows none."""
+    task = _saved_task(store, execution_target="managed_sandbox")
+    run = _expired_run(task, prompt_dispatch=prompt_dispatch)
+    tracker = ManagedLaunchTracker()
+    items, pending = [], []
+    if seen == "bound on this server":
+        tracker.begin(_CONV_ID)
+        tracker.get(_CONV_ID).bound.set()
+        tracker.fail(_CONV_ID, "harness not configured on the sandbox host")
+    elif seen == "prompt in the transcript":
+        # Another server ran the launch, so only the session can show what happened.
+        items = [_PROMPT]
+    else:
+        # A native harness took the prompt, which is not in the transcript until echoed.
+        pending = [_Item("incomplete")]
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=_RecoveryConversationStore(
+                _FakeConversation(
+                    id=_CONV_ID, agent_id=_AGENT_ID, labels={STARTUP_LABEL: "pending"}
+                ),
+                items=items,
+                pending=pending,
+            ),
+            host_store=_sandbox_hosts(task, run, None),
+            managed_launches=tracker,
+            startup_inputs=FakeStartupInputs(),
+        )
+    )
+
+    assert await executor.recover(run) == "failed"
 
 
 async def test_recovery_cleans_up_the_sandbox_of_a_deleted_session(store, monkeypatch) -> None:
@@ -1917,7 +2214,7 @@ async def test_recovery_never_tears_down_a_continue_tasks_shared_sandbox(
     terminate = AsyncMock()
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     task = _saved_task(store, execution_target="managed_sandbox", session_mode="continue")
-    run = _expired_run(task)
+    run = _expired_run(task, prompt_dispatch="started")
     assert run.host_id == continued_sandbox_host_id(task.id, task.workspace_id)
     label = {"launch failed": "failed", "launch abandoned": "pending"}.get(state)
     conversations = _RecoveryConversationStore(
@@ -1936,6 +2233,9 @@ async def test_recovery_never_tears_down_a_continue_tasks_shared_sandbox(
         )
     )
 
+    # Only a launch this server saw end unbound proves the prompt was not delivered: a
+    # deleted session shows nothing, and a launch another server ran or recorded as
+    # failed could have bound its host first.
     assert await executor.recover(run) == "failed"
     terminate.assert_not_awaited()
 
@@ -1953,8 +2253,18 @@ def _draining_sandbox_config(shutdown_drain_s: float) -> Any:
     )
 
 
+@pytest.mark.parametrize(
+    ("launch", "expected"),
+    [
+        ("never bound", "unsent"),
+        # A runner that failed to start after its host bound may have taken the prompt.
+        ("bound", "failed"),
+        # Another server recorded the failure, so nothing here shows when it failed.
+        ("unknown", "failed"),
+    ],
+)
 async def test_recovery_fails_a_failed_managed_launch_and_tears_down_its_sandbox(
-    store, monkeypatch
+    store, monkeypatch, launch, expected
 ) -> None:
     from omnigent.server import managed_hosts
 
@@ -1962,6 +2272,12 @@ async def test_recovery_fails_a_failed_managed_launch_and_tears_down_its_sandbox
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     task = _saved_task(store, execution_target="managed_sandbox")
     run = _expired_run(task)
+    tracker = ManagedLaunchTracker()
+    if launch != "unknown":
+        tracker.begin(_CONV_ID)
+        if launch == "bound":
+            tracker.get(_CONV_ID).bound.set()
+        tracker.fail(_CONV_ID, "harness not configured on the sandbox host")
     # Still inside another replica's shutdown drain: a known failure doesn't wait it out.
     clock = FakeClock(run.lease_expires_at + 1)
     # The sandbox bound after its prompt had already failed, so it can never deliver it.
@@ -1978,15 +2294,46 @@ async def test_recovery_fails_a_failed_managed_launch_and_tears_down_its_sandbox
             conversation_store=conversations,
             host_store=hosts,
             sandbox_config=_draining_sandbox_config(30),
+            managed_launches=tracker,
             startup_inputs=startup,
         ),
         now=clock.now,
     )
 
-    assert await executor.recover(run) == "failed"
+    assert await executor.recover(run) == expected
     assert startup.launch_failures == []
     assert conversations.conversation.host_id is None
     assert terminate.await_args.args[0] is hosts.hosts[run.host_id]
+
+
+@pytest.mark.parametrize(("failed_by", "expected"), [("move", "failed"), ("create", "unsent")])
+async def test_recovery_cannot_rule_out_a_send_before_a_failed_move(
+    store, failed_by, expected
+) -> None:
+    """A session a failed move left behind ran before the move, unlike a failed create."""
+    from omnigent.server.startup_inputs import STARTUP_SETTLED_BY_LABEL
+
+    task = _saved_task(store, execution_target="managed_sandbox", session_mode="continue")
+    run = _expired_run(task, prompt_dispatch="started")
+    labels = {STARTUP_LABEL: "failed"}
+    if failed_by == "move":
+        labels[STARTUP_SETTLED_BY_LABEL] = "move-claim"
+    # This server saw the launch fail with no host bound, in both cases.
+    tracker = ManagedLaunchTracker()
+    tracker.begin(_CONV_ID)
+    tracker.fail(_CONV_ID, "provider refused")
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=_RecoveryConversationStore(
+                _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, labels=labels)
+            ),
+            host_store=_sandbox_hosts(task, run, "agent_sandbox"),
+            managed_launches=tracker,
+        )
+    )
+
+    assert await executor.recover(run) == expected
 
 
 async def test_recovery_waits_out_another_replicas_shutdown_drain(store, monkeypatch) -> None:
@@ -1995,7 +2342,7 @@ async def test_recovery_waits_out_another_replicas_shutdown_drain(store, monkeyp
     terminate = AsyncMock()
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     task = _saved_task(store, execution_target="managed_sandbox")
-    run = _expired_run(task)
+    run = _expired_run(task, prompt_dispatch="started")
     config = _draining_sandbox_config(30)
     clock = FakeClock(run.lease_expires_at + 10)
     startup = FakeStartupInputs()
@@ -2019,6 +2366,7 @@ async def test_recovery_waits_out_another_replicas_shutdown_drain(store, monkeyp
     terminate.assert_not_awaited()
     assert startup.launch_failures == []
     clock.advance(30)
+    # That replica ran the launch, so nothing here shows whether its host ever bound.
     assert await executor.recover(run) == "failed"
     terminate.assert_awaited_once()
     assert [session for session, _ in startup.launch_failures] == [_CONV_ID]
@@ -2059,7 +2407,9 @@ async def test_recovery_follows_the_claimed_target_not_a_later_edit(
     terminate = AsyncMock()
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     task = _saved_task(store, execution_target=claimed_target)
-    run = _expired_run(task)
+    managed = claimed_target == "managed_sandbox"
+    # A sandbox run saves its prompt, and so records its dispatch, before it launches.
+    run = _expired_run(task, prompt_dispatch="started" if managed else "not_started")
     if claimed_target == "connected_host":
         store.update(task.id, execution_target="managed_sandbox", host_id=None, workspace=None)
     else:
@@ -2086,8 +2436,9 @@ async def test_recovery_follows_the_claimed_target_not_a_later_edit(
         )
     )
 
-    assert await executor.recover(run) == "failed"
-    if claimed_target == "managed_sandbox":
+    # With no record of the dead replica's launch, nothing shows its sandbox never bound.
+    assert await executor.recover(run) == ("failed" if managed else "unsent")
+    if managed:
         # Its sandbox is torn down and its saved prompt failed, as for any sandbox run.
         terminate.assert_awaited_once()
         assert [session for session, _ in startup.launch_failures] == [_CONV_ID]

@@ -18,6 +18,10 @@ import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentT
 
 export const RANDOM_WORKTREE_BASE_REF = "HEAD";
 
+/** The most retries an automation can have and the default wait before each, as on the server. */
+export const MAX_SCHEDULED_TASK_RETRIES = 5;
+export const DEFAULT_RETRY_DELAY_SECONDS = 5 * 60;
+
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
 
@@ -69,6 +73,10 @@ export interface ScheduledTask {
   permissionMode: string | null;
   /** Per-run cost limit in USD; null/absent adds no automation-specific cap. */
   maxCostUsd?: number | null;
+  /** Retries of a run whose startup failed before its prompt reached the agent; 0 never retries. */
+  maxRetries?: number;
+  /** Seconds the server waits before each retry. */
+  retryDelaySeconds?: number;
   /** MCP services every session the automation creates starts with. */
   mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
@@ -142,6 +150,8 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /** 0 for an occurrence's first try, then 1, 2, ... for its automatic retries. */
+  retryAttempt?: number;
   /**
    * The server's description of the failure, e.g. a sandbox provider's recovery
    * steps, capped server-side; `null` when the run recorded none.
@@ -204,6 +214,10 @@ export interface CreateScheduledTaskInput {
   permissionMode?: string | null;
   /** Optional per-run cost limit in USD; omit for no automation-specific cap. */
   maxCostUsd?: number | null;
+  /** Retries of a failed startup; omit for the server default (none). */
+  maxRetries?: number;
+  /** Seconds before each retry; omit for the server default. */
+  retryDelaySeconds?: number;
   /** MCP services every run starts with; omit for none. */
   mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
@@ -252,6 +266,8 @@ export interface UpdateScheduledTaskInput {
   permissionMode?: string | null;
   /** Omit to preserve the cost limit; null removes it for future runs. */
   maxCostUsd?: number | null;
+  maxRetries?: number;
+  retryDelaySeconds?: number;
   /** Replaces the MCP services; `[]` clears them. */
   mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
@@ -291,6 +307,9 @@ interface ScheduledTaskWire {
   reasoning_effort: string | null;
   permission_mode: string | null;
   max_cost_usd?: number | null;
+  // Absent on servers that predate retries.
+  max_retries?: number;
+  retry_delay_seconds?: number;
   mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
@@ -328,6 +347,8 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  // Absent on servers that predate retries.
+  retry_attempt?: number;
   error_detail?: string | null;
   conversation_updated_at: number | null;
   conversation_status: string | null;
@@ -390,6 +411,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
     maxCostUsd: wire.max_cost_usd ?? null,
+    maxRetries: wire.max_retries ?? 0,
+    retryDelaySeconds: wire.retry_delay_seconds ?? DEFAULT_RETRY_DELAY_SECONDS,
     mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
@@ -424,6 +447,7 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    retryAttempt: wire.retry_attempt ?? 0,
     errorDetail: wire.error_detail ?? null,
     conversationUpdatedAt: wire.conversation_updated_at ?? null,
     conversationStatus: wire.conversation_status ?? null,
@@ -616,6 +640,11 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.maxCostUsd != null) body.max_cost_usd = input.maxCostUsd;
+  // Only sent when retries are on, so a server without them still accepts the create.
+  if (input.maxRetries) {
+    body.max_retries = input.maxRetries;
+    if (input.retryDelaySeconds !== undefined) body.retry_delay_seconds = input.retryDelaySeconds;
+  }
   if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
@@ -685,6 +714,8 @@ export async function updateScheduledTask(
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.maxCostUsd !== undefined) body.max_cost_usd = input.maxCostUsd;
+  if (input.maxRetries !== undefined) body.max_retries = input.maxRetries;
+  if (input.retryDelaySeconds !== undefined) body.retry_delay_seconds = input.retryDelaySeconds;
   if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;

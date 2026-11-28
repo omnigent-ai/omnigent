@@ -22,6 +22,12 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
 
+# Bounds of a task's automatic retries of a failed startup.
+MAX_SCHEDULED_TASK_RETRIES = 5
+MIN_RETRY_DELAY_SECONDS = 60
+MAX_RETRY_DELAY_SECONDS = 60 * 60
+DEFAULT_RETRY_DELAY_SECONDS = 5 * 60
+
 
 class ScheduledRunLogContext(BaseModel):
     """Occurrence identity retained with a saved prompt across replica changes."""
@@ -73,6 +79,11 @@ class ScheduledTask:
         blocks all models once cumulative spend reaches this limit. ``None``
         means no per-firing cost cap (the session runs unconstrained unless the
         agent spec or server-wide defaults impose one).
+    :param max_retries: How many times a run whose startup failed before its
+        prompt reached the agent is started again, e.g. ``3``. ``0`` (the
+        default) never retries.
+    :param retry_delay_seconds: How long the scheduler waits after a failed
+        startup before retrying it, e.g. ``300``.
     :param session_mode: ``"new"`` (default) starts a new session per firing;
         ``"continue"`` sends each firing's prompt into ``session_id``.
     :param session_id: The session a ``"continue"`` task sends its prompt to.
@@ -123,6 +134,8 @@ class ScheduledTask:
     permission_mode: str | None = None
     mcp_services: tuple[str, ...] = ()
     max_cost_usd: float | None = None
+    max_retries: int = 0
+    retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS
     session_mode: str = "new"
     kind: str = "automation"
     session_id: str | None = None
@@ -170,6 +183,10 @@ class ScheduledTaskRun:
     :param error_code: Short failure classification (e.g. ``"timeout"``,
         ``"rate_limited"``) for future retry logic; ``None`` unless
         ``status == "failed"``.
+    :param prompt_dispatch: ``"not_started"`` from the claim until the run's
+        prompt is about to leave its executor, then ``"started"``. ``None`` on a
+        run that was never claimed, or was claimed by a release that doesn't
+        record it.
     """
 
     id: str
@@ -185,3 +202,4 @@ class ScheduledTaskRun:
     trigger_key: str | None = None
     host_id: str | None = None
     lease_expires_at: int | None = None
+    prompt_dispatch: str | None = None

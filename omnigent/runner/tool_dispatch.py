@@ -5427,6 +5427,8 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "reasoning_effort",
     "permission_mode",
     "max_cost_usd",
+    "max_retries",
+    "retry_delay_seconds",
     "mcp_services",
     "session_mode",
     "session_id",
@@ -5449,6 +5451,8 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "permission_mode",
     "mcp_services",
     "max_cost_usd",
+    "max_retries",
+    "retry_delay_seconds",
     "session_mode",
     "session_id",
     "workspace",
@@ -5482,6 +5486,12 @@ _SCHEDULED_TASK_GATED_FIELDS = (
         "does not support workflow_id; to run a saved workflow, retry with the prompt "
         "exactly '/workflow Run the saved workflow \"<name>\" (ID <id>).', optionally "
         "followed by a blank line and this run's details",
+    ),
+    (
+        ("max_retries", "retry_delay_seconds"),
+        "scheduled_task_retries",
+        "does not support max_retries or retry_delay_seconds; omit them to run "
+        "without automatic retries",
     ),
 )
 

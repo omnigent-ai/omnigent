@@ -137,6 +137,17 @@ describe("getScheduledTask", () => {
     expect((await getScheduledTask("st_1")).maxCostUsd).toBe(maxCostUsd ?? null);
   });
 
+  it("reads the retry settings, defaulting to none on older servers", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TASK_WIRE, max_retries: 2, retry_delay_seconds: 60 }),
+    );
+    const older = await getScheduledTask("st_1");
+    const current = await getScheduledTask("st_1");
+    expect([older.maxRetries, older.retryDelaySeconds]).toEqual([0, 300]);
+    expect([current.maxRetries, current.retryDelaySeconds]).toEqual([2, 60]);
+  });
+
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     const task = await getScheduledTask("st 1");
@@ -216,7 +227,8 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
-      // An older server sends no failure detail or session read state.
+      // An older server sends no failure detail, retry attempt or session read state.
+      retryAttempt: 0,
       errorDetail: null,
       conversationUpdatedAt: null,
       conversationStatus: null,
@@ -240,6 +252,7 @@ describe("listScheduledTaskRuns", () => {
             fired_at: 1_700_000_005,
             finished_at: 1_700_000_050,
             error_code: "sandbox_registration_timeout",
+            retry_attempt: 2,
             error_detail: "the sandbox did not register within 720 seconds",
             conversation_updated_at: 1_700_000_060,
             conversation_status: "idle",
@@ -253,6 +266,7 @@ describe("listScheduledTaskRuns", () => {
     );
     const [run] = await listScheduledTaskRuns("st_1");
     expect(run).toMatchObject({
+      retryAttempt: 2,
       errorDetail: "the sandbox did not register within 720 seconds",
       conversationUpdatedAt: 1_700_000_060,
       conversationStatus: "idle",
@@ -277,6 +291,18 @@ describe("createScheduledTask", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     if (maxCostUsd == null) expect(body).not.toHaveProperty("max_cost_usd");
     else expect(body.max_cost_usd).toBe(maxCostUsd);
+  });
+
+  it("sends retry settings only when retries are on", async () => {
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    await createScheduledTask({ ...base, maxRetries: 0, retryDelaySeconds: 60 });
+    await createScheduledTask({ ...base, maxRetries: 2, retryDelaySeconds: 60 });
+    const [off, on] = fetchMock.mock.calls.map((call) => JSON.parse(call[1].body));
+    // A server without retries would refuse the fields.
+    expect(off).not.toHaveProperty("max_retries");
+    expect(off).not.toHaveProperty("retry_delay_seconds");
+    expect([on.max_retries, on.retry_delay_seconds]).toEqual([2, 60]);
   });
 
   it("POSTs required fields and omits unset optionals", async () => {
@@ -459,6 +485,20 @@ describe("updateScheduledTask", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, mcp_services: mcpServices }));
     await updateScheduledTask("st_1", { mcpServices });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ mcp_services: mcpServices });
+  });
+
+  it.each([
+    ["sends an explicit 0 to turn retries off", { maxRetries: 0 }, { max_retries: 0 }],
+    ["changes the retry delay alone", { retryDelaySeconds: 120 }, { retry_delay_seconds: 120 }],
+    [
+      "sends both retry settings",
+      { maxRetries: 2, retryDelaySeconds: 60 },
+      { max_retries: 2, retry_delay_seconds: 60 },
+    ],
+  ])("%s", async (_, input, body) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await updateScheduledTask("st_1", input);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(body);
   });
 });
 

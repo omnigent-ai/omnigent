@@ -416,6 +416,8 @@ _SCHEDULED_TASK_SETTINGS = (
     "session_id",
     "permission_mode",
     "max_cost_usd",
+    "max_retries",
+    "retry_delay_seconds",
     "model_override",
     "reasoning_effort",
     "workflow_id",
