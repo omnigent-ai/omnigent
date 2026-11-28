@@ -139,7 +139,6 @@ export type ConversationIconKind =
   | "kimi"
   | "hermes"
   | "devin"
-  | "nessie"
   | null;
 
 // Display label for a session with no title and no native-wrapper name —
@@ -159,7 +158,6 @@ export function getConversationIconKind(conversation: Conversation): Conversatio
   const wrapper = wrapperLabel(conversation);
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   if (nativeAgent != null) return nativeAgent.iconKind;
-  if (conversation.agent_name === "nessie") return "nessie";
   return null;
 }
 
