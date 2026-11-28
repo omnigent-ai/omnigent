@@ -6281,6 +6281,29 @@ describe("Composer placeholder", () => {
   });
 
   it.each([
+    ["idle", "running", "Send a follow-up (queued) — Esc to stop"],
+    ["streaming", "idle", "Send a follow-up (queued) — Esc to stop"],
+    ["idle", "waiting", "Send a message…"],
+    ["idle", "idle", "Send a message…"],
+  ] as const)(
+    "a %s local send with a %s session shows %j",
+    (status, sessionStatus, placeholder) => {
+      const previousStatus = useChatStore.getState().sessionStatus;
+      onTestFinished(() => useChatStore.setState({ sessionStatus: previousStatus }));
+      useChatStore.setState({ sessionStatus });
+      render(
+        <Composer
+          {...composerProps({
+            status,
+            isWorking: status === "streaming" || computeIsWorking(sessionStatus),
+          })}
+        />,
+      );
+      expect(textarea().placeholder).toBe(placeholder);
+    },
+  );
+
+  it.each([
     {
       viewport: "desktop",
       hostId: "host-a",

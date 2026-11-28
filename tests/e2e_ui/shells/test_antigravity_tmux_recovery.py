@@ -64,7 +64,10 @@ _ROOT = Path(__file__).resolve().parents[3]
 def antigravity_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, built_spa: None
 ) -> Iterator[list[str] | None]:
-    """Build with the caller's HOME before isolating agy credentials."""
+    """Build with the caller's HOME before isolating agy credentials.
+
+    A prompt ``Reply <token> after N seconds.`` holds the mock reply N seconds.
+    """
     if os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "mock":
         assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
         yield None
@@ -87,10 +90,13 @@ def antigravity_model(
                 if content.get("role") != "user":
                     continue
                 text = "\n".join(part.get("text", "") for part in content.get("parts", []))
-                matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})\.", text)
+                matches = re.findall(
+                    r"Reply (agy-e2e-[0-9a-f]{8})(?: after (\d+) seconds)?\.", text
+                )
                 if matches:
-                    reply = matches[-1]
+                    reply, hold_seconds = matches[-1]
                     replies.append(reply)
+                    time.sleep(int(hold_seconds or 0))
                     break
             response = {
                 "candidates": [

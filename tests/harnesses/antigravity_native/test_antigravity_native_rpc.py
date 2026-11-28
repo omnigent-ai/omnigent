@@ -931,13 +931,14 @@ def test_list_agy_pids_skips_supervisors_and_finds_child(
         100: ["python", "-m", "gateway", "--", "/usr/local/bin/agy"],
         200: ["/usr/local/bin/agy"],
         300: ["/usr/local/bin/agy-helper"],
+        400: ["/opt/tools/vendor-bin/agy"],
     }
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _completed("100\n200\n300\n"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _completed("100\n200\n300\n400\n"))
     monkeypatch.setattr(
         rpc.psutil, "Process", lambda pid: SimpleNamespace(cmdline=lambda: commands[pid])
     )
     monkeypatch.setattr(rpc, "_child_pids", lambda pid: [200] if pid == 100 else [])
-    assert rpc._list_agy_pids() == [200]
+    assert rpc._list_agy_pids() == [200, 400]
     assert rpc._agy_pid_in_pane_subtree(100) == 200
 
 
@@ -979,10 +980,10 @@ def test_list_agy_pids_falls_back_to_proc_on_pgrep_timeout(
     assert rpc._list_agy_pids() == [9999]
 
 
-def test_list_agy_pids_from_proc_matches_bin_agy(
+def test_list_agy_pids_from_proc_matches_agy_executables(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The /proc scan matches ``bin/agy`` cmdlines and skips everything else."""
+    """The /proc scan matches ``agy`` executables and skips everything else."""
 
     def _write(pid: str, argv: list[str]) -> None:
         proc_dir = tmp_path / pid
@@ -992,12 +993,13 @@ def test_list_agy_pids_from_proc_matches_bin_agy(
     _write("111", ["/usr/local/bin/agy", "--dangerously-skip-permissions"])
     _write("222", ["node", "/opt/other/server.js"])  # unrelated → skipped
     _write("333", ["/data/.local/bin/agy"])  # installer-default path → matches
+    _write("444", ["/opt/tools/vendor-bin/agy"])  # vendored install → matches
     _write("555", ["python", "-m", "gateway", "--", "/usr/local/bin/agy"])
     _write("666", ["/usr/local/bin/agy-helper"])
     (tmp_path / "not-a-pid").mkdir()  # non-numeric entry → skipped
 
     monkeypatch.setattr(rpc, "_PROC_FS", str(tmp_path))
-    assert sorted(rpc._list_agy_pids_from_proc()) == [111, 333]
+    assert sorted(rpc._list_agy_pids_from_proc()) == [111, 333, 444]
 
 
 def test_list_agy_pids_from_proc_skips_empty_cmdline(

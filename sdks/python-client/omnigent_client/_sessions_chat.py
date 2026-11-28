@@ -230,6 +230,20 @@ _RESPONSE_START_EVENT_TYPES = (
     InProgressEvent,
 )
 
+
+def _is_delivery_ack(event: ServerStreamEvent, session_status: str | None) -> bool:
+    """
+    Whether *event* only acknowledges prompt delivery to a still-running harness.
+
+    Native terminal harnesses complete with no output once the prompt reaches the pane.
+    """
+    return (
+        isinstance(event, CompletedEvent)
+        and not event.response.output
+        and session_status == "running"
+    )
+
+
 # Newer servers emit an immediate ``session.heartbeat`` after the
 # live-tail subscriber is registered. Older servers do not, so keep a
 # short fallback instead of hanging forever before posting the user's
@@ -520,7 +534,10 @@ class SessionsChat:
         (:class:`CompletedEvent`, :class:`FailedEvent`,
         :class:`IncompleteEvent`, or :class:`CancelledEvent`) is
         observed. The subscription is closed once the terminal
-        event has been yielded.
+        event has been yielded. An output-less completion that only
+        acknowledges delivery to a still-running native harness does
+        not end the turn; the iterator then continues until the
+        session status leaves ``running``.
 
         Always returns an async iterator: the caller does
         ``async for event in chat.send("hi"): ...`` regardless of
@@ -573,6 +590,8 @@ class SessionsChat:
         # turns cannot publish all output before this subscriber exists.
         stream_aiter = self._namespace.stream(self._session.id)
         hook_state = _StreamHookState()
+        session_status: str | None = None
+        awaiting_settled_status = False
         first_event_task = asyncio.ensure_future(stream_aiter.__anext__())
         try:
             first_event: ServerStreamEvent | None
@@ -613,7 +632,9 @@ class SessionsChat:
                 if isinstance(event, OutputItemDoneEvent):
                     await self._maybe_dispatch_tool_call(event, hook_state)
                 if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
-                    return
+                    if not _is_delivery_ack(event, session_status):
+                        return
+                    awaiting_settled_status = True
                 # A SETUP-phase failure (spec resolution, spawn-env
                 # build) ends the turn before the LLM stream starts, so
                 # no response.failed / FailedEvent is ever emitted — the
@@ -631,6 +652,10 @@ class SessionsChat:
                     )
                     code = event.error.code if event.error is not None else None
                     raise OmnigentError(message, code=code)
+                if isinstance(event, SessionStatusEvent):
+                    session_status = event.status
+                    if awaiting_settled_status and session_status != "running":
+                        return
                 try:
                     event = await stream_aiter.__anext__()
                 except StopAsyncIteration:

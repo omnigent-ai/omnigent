@@ -27,9 +27,9 @@ Journey (all against the real SPA + live server):
 2. drive it into the reported state by publishing an ``external_session_status``
    edge with ``status: "running"`` and no ``response_id`` -- the same route the
    native-harness status forwarder posts to (see
-   ``test_send_while_background_task.py``). The composer shows the idle
-   placeholder (local status idle) while the Interrupt button appears (session
-   working, ``isWorking`` true),
+   ``test_send_while_background_task.py``). Local status stays idle while the
+   Interrupt button and the "Esc to stop" placeholder appear (session working,
+   ``isWorking`` true),
 3. focus the empty composer and press Escape,
 4. assert Escape interrupts: an ``interrupt`` event is POSTed to
    ``/v1/sessions/<id>/events`` and the Interrupt button settles -- exactly what
@@ -49,11 +49,9 @@ from __future__ import annotations
 import httpx
 from playwright.sync_api import Page, Route, expect
 
-# The composer's placeholder when the local send lifecycle is idle. When a local
-# send owns the turn (``status == "streaming"``) it instead reads "Send a
-# follow-up (queued) - Esc to stop"; the idle text here is the tell that local
-# status is idle even though the session is working.
-_COMPOSER_PLACEHOLDER_IDLE = "Send a message…"
+# The composer's placeholder while the session is working, even when no local
+# send owns the turn.
+_COMPOSER_PLACEHOLDER_WORKING = "Send a follow-up (queued) — Esc to stop"
 
 # Seconds to let a genuine interrupt POST reach the events route after the user
 # action. ``stop()`` fires it fire-and-forget, so it lands within a tick; 2s
@@ -141,10 +139,9 @@ def test_escape_interrupts_working_session(
     # the user they can cancel the working session.
     expect(interrupt_button).to_be_visible(timeout=15_000)
     expect(interrupt_button).to_be_enabled()
-    # ...yet the composer is on the IDLE placeholder, not the streaming
-    # "Esc to stop" hint: local status is idle. This is the exact mismatch --
-    # Escape gates on this local status, the Interrupt button on session activity.
-    expect(composer).to_have_attribute("placeholder", _COMPOSER_PLACEHOLDER_IDLE, timeout=15_000)
+    expect(composer).to_have_attribute(
+        "placeholder", _COMPOSER_PLACEHOLDER_WORKING, timeout=15_000
+    )
 
     # --- The bug: Escape in the composer must interrupt, exactly as the button. ---
     interrupt_posts.clear()

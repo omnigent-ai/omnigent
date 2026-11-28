@@ -512,6 +512,48 @@ async def test_send_posts_message_event_and_yields_events_until_terminal() -> No
     assert yielded == [delta1, delta2, completed]
 
 
+def _status_event(status: str) -> SessionStatusEvent:
+    return SessionStatusEvent(type="session.status", conversation_id="conv_abc", status=status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled_status", ["idle", "waiting"])
+async def test_send_continues_past_delivery_ack_until_session_settles(
+    settled_status: str,
+) -> None:
+    """A native harness's output-less completion while running does not end the turn."""
+    session = _make_session()
+    delivery_ack = _completed_event()
+    reply = OutputTextDeltaEvent(type="response.output_text.delta", delta="native reply")
+    after_turn = OutputTextDeltaEvent(type="response.output_text.delta", delta="next turn")
+    events = [
+        _status_event("running"),
+        delivery_ack,
+        reply,
+        _status_event(settled_status),
+        after_turn,
+    ]
+    ns = _FakeNamespace(stream_scripts=[_StreamScript(events=events)], session_obj=session)
+    chat = SessionsChat(namespace=ns, files_uploader=None, files_getter=None, session=session)
+
+    yielded = [event async for event in chat.send("hi")]
+
+    assert yielded == events[:4]
+
+
+@pytest.mark.asyncio
+async def test_send_returns_on_completion_with_output_while_running() -> None:
+    session = _make_session()
+    completed = _completed_event(output=[_ASSISTANT_MESSAGE_ITEM])
+    events = [_status_event("running"), completed, _status_event("idle")]
+    ns = _FakeNamespace(stream_scripts=[_StreamScript(events=events)], session_obj=session)
+    chat = SessionsChat(namespace=ns, files_uploader=None, files_getter=None, session=session)
+
+    yielded = [event async for event in chat.send("hi")]
+
+    assert yielded == events[:2]
+
+
 @pytest.mark.asyncio
 async def test_send_fires_stream_hooks_for_sessions_events() -> None:
     """
