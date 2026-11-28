@@ -1256,7 +1256,8 @@ def test_github_pr_commits_cap_at_250_keeping_the_first_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entries = [_commit_entry(f"{index:040x}", f"Commit {index}") for index in range(255)]
-    _stub_pr_commits(monkeypatch, head=_HEAD, total=255, pages=[entries[:100], entries[100:]])
+    pages = [entries[:100], entries[100:200], entries[200:]]
+    _stub_pr_commits(monkeypatch, head=_HEAD, total=255, pages=pages)
 
     result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
 
@@ -1326,6 +1327,27 @@ def test_a_paged_list_page_that_fails_or_isnt_a_list_fails_the_whole_list(
     monkeypatch: pytest.MonkeyPatch, answer: tuple[int, str, str], message: str
 ) -> None:
     monkeypatch.setattr(github_resource, "_gh", lambda *_args, **_kwargs: answer)
+    with pytest.raises(ValueError, match=message):
+        github_resource._api_pages(
+            "/root",
+            [],
+            "repos/o/r/pulls/1/files",
+            token=None,
+            max_pages=3,
+            failed="failed",
+            invalid="invalid",
+        )
+
+
+@pytest.mark.parametrize(
+    ("second", "message"), [((1, "", "boom"), "failed"), ((0, "not json", ""), "invalid")]
+)
+def test_a_paged_list_that_fails_after_a_full_page_returns_none_of_it(
+    monkeypatch: pytest.MonkeyPatch, second: tuple[int, str, str], message: str
+) -> None:
+    answers = iter([(0, json.dumps([{"filename": "a.py"}] * 100), ""), second])
+    monkeypatch.setattr(github_resource, "_gh", lambda *_args, **_kwargs: next(answers))
+
     with pytest.raises(ValueError, match=message):
         github_resource._api_pages(
             "/root",
@@ -2049,6 +2071,9 @@ def test_gh_inherits_env_outside_sandbox(monkeypatch: pytest.MonkeyPatch) -> Non
     # Local dev (not a sandbox): env is inherited untouched (env=None), so the
     # developer's own gh auth / GH_TOKEN keeps working — no regression.
     monkeypatch.delenv("IS_SANDBOX", raising=False)
+    # Variables the gate removes for github.com would make gh get a filtered copy.
+    for name in ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_REPO", "GH_DEBUG", "DEBUG"):
+        monkeypatch.delenv(name, raising=False)
     captured: dict[str, object] = {}
 
     def fake_run(argv: Sequence[str], *, cwd: str, timeout: float, env=None):
