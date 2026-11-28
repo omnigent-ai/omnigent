@@ -217,6 +217,12 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
+import {
+  beginSessionCreation,
+  noteSessionCreatedHere,
+  noteSessionCreationFailed,
+  noteFirstInputAccepted,
+} from "@/lib/sessionCreations";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
@@ -3212,7 +3218,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionId = await ensureBoundSession(
+        agentId,
+        get,
+        opts,
+        submitConversationId,
+        rekey,
+        text,
+      );
       postedSessionId = sessionId;
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
@@ -3369,6 +3382,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
       } else {
         endPlanStop();
+        noteFirstInputAccepted(sessionId, text);
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -4815,7 +4829,7 @@ function isConversationDisposed(id: string): boolean {
  * next send. `switchTo` rebinds when this is false; `ensureBoundSession` makes
  * the same check before POSTing.
  */
-function isConversationStreamCurrent(id: string): boolean {
+export function isConversationStreamCurrent(id: string): boolean {
   const entry = conversationRegistry.peek(id);
   if (entry === undefined || entry.disposed) return false;
   const state = entry.getState();
@@ -5227,6 +5241,7 @@ async function ensureBoundSession(
   opts?: SendOptions,
   pinnedConversationId?: string | null,
   onSessionResolved?: (sessionId: string) => void,
+  firstMessage?: string,
 ): Promise<string> {
   // Use the session pinned at submit time so a queued send still targets
   // where it was composed, not wherever the user switched to meanwhile.
@@ -5240,13 +5255,21 @@ async function ensureBoundSession(
     // initial_items dispatch synchronously inside create_session,
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
-    const session = await createSession(agentId, []);
+    const creationAttempt = beginSessionCreation();
+    let session: Awaited<ReturnType<typeof createSession>>;
+    try {
+      session = await createSession(agentId, []);
+    } catch (error) {
+      noteSessionCreationFailed(creationAttempt);
+      throw error;
+    }
     sessionId = session.id;
     // Register the create_session span (see interactionTelemetry). This path
     // sends no host params, so the server always makes an external ("computer")
     // session — managed sandboxes are created by the New Chat dialog, which
     // registers itself.
     markSessionCreated(sessionId, "computer");
+    noteSessionCreatedHere(sessionId, firstMessage ?? null, creationAttempt);
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send

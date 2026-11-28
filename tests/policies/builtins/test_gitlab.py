@@ -944,3 +944,355 @@ def test_mr_shell_composition_preserves_known_denials() -> None:
         )
         == "DENY"
     )
+
+
+_API_SELECTOR = f"--hostname gitlab.com --placeholder project={_PROJECT}"
+_API_MR_FIELDS = (
+    "-f source_branch=feature -f target_branch=main -f title=Fix -f description=Details "
+    "-F remove_source_branch=false -F allow_collaboration=false"
+)
+
+
+@pytest.mark.parametrize(
+    ("api_request", "write"),
+    [
+        ("projects/:project", False),
+        ("/projects/:project/issues -i --output ndjson", False),
+        ("projects/:project/issues/12", False),
+        ("projects/:project/issues/12/notes", False),
+        ("projects/:project/issues/12/notes/34", False),
+        ("projects/:project/merge_requests", False),
+        ("projects/:project/merge_requests/12", False),
+        ("projects/:project/merge_requests/12/notes", False),
+        ("projects/:project/merge_requests/12/changes", False),
+        ("projects/:project/merge_requests/12/diffs", False),
+        ("projects/:project/merge_requests/12/raw_diffs", False),
+        ("projects/:project/repository/branches", False),
+        ("projects/:project/repository/branches/feature", False),
+        ("projects/:project/repository/branches/:ref --placeholder ref=feature/topic", False),
+        ("projects/:project/issues -X GET -f page=2 -f per_page=10 -f state=opened", False),
+        ("projects/:project/issues -f title=Fix -f description=Details", True),
+        ("projects/:project/issues -iXPOST -ftitle=Fix -fdescription=Details", True),
+        (
+            "projects/:project/issues -f title=Fix -f description=@example.txt "
+            "-F confidential=true",
+            True,
+        ),
+        ('projects/:project/issues/12/notes -f "body=Mention /merge inline"', True),
+        ("projects/:project/merge_requests/12/notes -f body=Details", True),
+        (f"projects/:project/merge_requests {_API_MR_FIELDS}", True),
+        ("projects/:project/merge_requests/12 -X PUT -f target_branch=main", True),
+        (
+            "projects/:project/merge_requests/12 -X PUT -f title=/merge "
+            '-f "description=Mention /rebase inline"',
+            True,
+        ),
+        (
+            "projects/:project/merge_requests/12 -X PUT -f title=Fix "
+            "-f add_labels=bug -f remove_labels=stale -F remove_source_branch=false",
+            True,
+        ),
+    ],
+)
+def test_supported_api_routes_enforce_project_permissions(api_request: str, write: bool) -> None:
+    command = f"glab api {api_request} {_API_SELECTOR}"
+    configuration = {
+        "read_all": False,
+        "read_repos": [_PROJECT],
+        "write_repos": [_PROJECT],
+        "write_branches": ["unrelated"],
+    }
+    assert _result(command, **configuration) == "ALLOW"
+    foreign = command.replace(f"project={_PROJECT}", "project=team/other")
+    assert _result(foreign, **configuration) == "DENY"
+    assert _result(command) == ("DENY" if write else "ALLOW")
+
+
+@pytest.mark.parametrize(
+    "api_request",
+    [
+        "projects/:project/repository/commits",
+        "projects/:project/issues/12/close -X POST",
+        "projects/:project/issues -X HEAD",
+        "projects/:project/issues -X get",
+        "projects/:project/issues -X PATCH",
+        "projects/:project/issues -X POST -X GET",
+        "projects/:project/issues --paginate",
+        "projects/:project/issues --input example.json",
+        "projects/:project/issues --form title=Fix",
+        'projects/:project/issues -H "X-HTTP-Method-Override: DELETE"',
+        'projects/:project/issues -H "Sudo: 12"',
+        '"projects/:project/issues?page=2"',
+        "projects/:project/issues/../merge_requests",
+        "projects/:project//issues",
+        "https://gitlab.com/api/v4/projects/:project/issues",
+        "projects/123/issues",
+        "projects/:id/issues",
+        "projects/:project-extra/issues",
+        "projects/:project/issues --placeholder ref=feature",
+        f"projects/:project/issues --placeholder project={_PROJECT}",
+        "projects/:project/issues --placeholder branch=feature",
+        "projects/:project/repository/branches/:ref-extra --placeholder ref=feature",
+        "projects/:project/repository/branches/:ref --placeholder ref=feature/:repo",
+        "projects/:project/issues -X GET -f sudo=12",
+        "projects/:project/issues -X GET -f id=123",
+        'projects/:project/issues -f "title=Fix" -f "title=Revised" -f description=Details',
+        "projects/:project/issues -F title=Fix -f description=Details",
+        "projects/:project/issues -F title=@example.txt -f description=Details",
+        "projects/:project/issues -F title=:branch -f description=Details",
+        "projects/:project/issues -F title=123 -f description=Details",
+        "projects/:project/issues -F title=null -f description=Details",
+        'projects/:project/issues -F "title=[true]" -f description=Details',
+        'projects/:project/issues -F "title={}" -f description=Details',
+        'projects/:project/issues -f "title[]=Fix" -f description=Details',
+        'projects/:project/issues -f title=Fix -f "description="',
+        "projects/:project/issues -f title=Fix -f description=Details -f _method=DELETE",
+        f"projects/:project/merge_requests {_API_MR_FIELDS} -f source_project_id=123",
+        f"projects/:project/merge_requests {_API_MR_FIELDS} -F should_remove_source_branch=true",
+        "projects/:project/merge_requests/12 -X PUT -f title=Fix "
+        "-F should_remove_source_branch=true",
+        f"projects/:project/merge_requests {_API_MR_FIELDS} -f source_branch=other",
+        "projects/:project/merge_requests "
+        + _API_MR_FIELDS.replace("allow_collaboration=false", "allow_collaboration=true"),
+        "projects/:project/merge_requests "
+        + _API_MR_FIELDS.replace("source_branch=feature", "source_branch=-invalid"),
+        "projects/:project/merge_requests/12 -X PUT",
+        "projects/:project/merge_requests/12 -X PUT -F remove_source_branch=false",
+        'projects/:project/merge_requests/12 -X PUT -f "title="',
+        'projects/:project/merge_requests/12 -X PUT -f "description="',
+        "projects/:project/merge_requests/12 -X PUT -f target_branch=../main",
+        "projects/:project/merge_requests/12 -X PUT -F squash=true",
+        "projects/:project/merge_requests/12 -X PUT -f id=123 -f title=Fix",
+    ],
+)
+def test_unmodelled_api_inputs_require_approval(api_request: str) -> None:
+    assert _result(f"glab api {api_request} {_API_SELECTOR}", write_repos=[_PROJECT]) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "omitted",
+    [
+        "-f source_branch=feature",
+        "-f target_branch=main",
+        "-f title=Fix",
+        "-f description=Details",
+        "-F remove_source_branch=false",
+        "-F allow_collaboration=false",
+    ],
+)
+def test_api_mr_creation_requires_literal_fields_and_false_overrides(omitted: str) -> None:
+    fields = _API_MR_FIELDS.replace(omitted, "")
+    assert (
+        _result(
+            f"glab api projects/:project/merge_requests {fields} {_API_SELECTOR}",
+            write_repos=[_PROJECT],
+        )
+        == "ASK"
+    )
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "",
+        "--hostname gitlab.com",
+        f"--placeholder project={_PROJECT}",
+        "--hostname https://gitlab.com --placeholder project=team/sub/app",
+        "--hostname gitlab.example.com:8443 --placeholder project=team/sub/app",
+        "--hostname gitlab.other.example --placeholder project=team/sub/app",
+        "--hostname gitlab.com --hostname gitlab.example.com --placeholder project=team/sub/app",
+        "--hostname gitlab.com --placeholder project=team/sub/app.git",
+        "--hostname gitlab.com --placeholder project=team/../app",
+        "--hostname gitlab.com --placeholder project=https://gitlab.com/team/app",
+    ],
+)
+def test_api_authority_and_project_must_be_explicit_literal_inputs(selector: str) -> None:
+    assert _result(f"glab api projects/:project/issues {selector}") == "ASK"
+
+
+@pytest.mark.parametrize(
+    "project", [":project", "123", ":id", ":namespace/:repo", ":group/:namespace/:repo"]
+)
+@pytest.mark.parametrize("suffix", ["", "/issues/12", "/merge_requests/12"])
+def test_api_object_deletion_is_denied_before_project_resolution(
+    project: str, suffix: str
+) -> None:
+    command = f"glab api projects/{project}{suffix} -X DELETE --hostname gitlab.com"
+    assert _result(command) == "DENY"
+    assert _result(command, allow_destructive=True) == "DENY"
+
+
+@pytest.mark.parametrize(
+    ("branch_endpoint", "placeholder", "branch"),
+    [
+        ("feature", "", "feature"),
+        (":ref", "--placeholder ref=feature/topic", "feature/topic"),
+    ],
+    ids=["literal", "placeholder"],
+)
+def test_api_branch_deletion_requires_opt_in_and_exact_project_and_branch_permissions(
+    branch_endpoint: str, placeholder: str, branch: str
+) -> None:
+    command = (
+        f"glab api projects/:project/repository/branches/{branch_endpoint} "
+        f"-X DELETE {_API_SELECTOR} {placeholder}"
+    )
+    configuration = {"write_repos": [_PROJECT], "write_branches": [branch]}
+    assert _result(command, **configuration) == "DENY"
+    assert _result(command, allow_destructive=True, **configuration) == "ALLOW"
+    assert _result(command, allow_destructive=True) == "DENY"
+    assert (
+        _result(
+            command,
+            allow_destructive=True,
+            write_repos=[_PROJECT],
+            write_branches=["main"],
+        )
+        == "DENY"
+    )
+    assert (
+        _result(
+            command,
+            allow_destructive=True,
+            write_repos=[_PROJECT],
+            write_branches=[branch.upper()],
+        )
+        == "DENY"
+    )
+    for extra in (" -f branch=main", " --input example.json"):
+        assert _result(command + extra, allow_destructive=True, **configuration) == "ASK"
+    assert (
+        _result(
+            command.replace(branch, "feature.json"),
+            allow_destructive=True,
+            **configuration,
+        )
+        == "ASK"
+    )
+    assert _result(command.replace("gitlab.com", "gitlab.other.example")) == "ASK"
+
+
+def test_api_bulk_and_unresolved_branch_deletions_stay_conservative() -> None:
+    for endpoint in (
+        "projects/:project/repository/merged_branches",
+        "projects/123/repository/branches/feature",
+        "projects/:namespace/:repo/repository/branches/:branch",
+    ):
+        command = f"glab api {endpoint} -X DELETE {_API_SELECTOR}"
+        assert _result(command, write_repos=[_PROJECT]) == "DENY"
+        assert _result(command, write_repos=[_PROJECT], allow_destructive=True) == "ASK"
+
+
+@pytest.mark.parametrize(
+    ("api_request", "expected"),
+    [
+        ("merge_requests -f source_branch=feature -F remove_source_branch=true", "DENY"),
+        ("merge_requests/12 -X PUT -f title=Fix -F remove_source_branch=true", "DENY"),
+        ("merge_requests/12/merge -X PUT -F should_remove_source_branch=true", "DENY"),
+        ("merge_requests/12/merge -X PUT -f should_remove_source_branch=true", "DENY"),
+        ("merge_requests/12/merge -X PUT -F remove_source_branch=true", "ASK"),
+        ("merge_requests/12/merge -X PUT -F should_remove_source_branch=false", "ASK"),
+        ("merge_requests/12 -X PUT -f title=Fix -f remove_source_branch=false", "ASK"),
+        ("merge_requests/12/rebase -X PUT -F skip_ci=true", "ASK"),
+    ],
+)
+def test_api_removal_assignments_and_unresolved_mr_branch_effects(
+    api_request: str, expected: str
+) -> None:
+    command = f"glab api projects/:project/{api_request} {_API_SELECTOR}"
+    assert _result(command, write_repos=[_PROJECT]) == expected
+    assert _result(command, write_repos=[_PROJECT], allow_destructive=True) == "ASK"
+    if "/rebase" in api_request:
+        assert _result(command) == "ASK"
+    if api_request.startswith("merge_requests/12/merge "):
+        assert _result(command) == "DENY"
+        assert _result(command, allow_destructive=True) == "DENY"
+        assert (
+            _result(
+                command.replace(f"project={_PROJECT}", "project=team/other"),
+                write_repos=[_PROJECT],
+                allow_destructive=True,
+            )
+            == "DENY"
+        )
+
+
+def test_api_destination_override_does_not_misidentify_source_project_as_write_target() -> None:
+    command = (
+        f"glab api projects/:project/merge_requests {_API_SELECTOR} {_API_MR_FIELDS} "
+        "-f target_project_id=123"
+    )
+    assert _result(command) == "ASK"
+    assert _result(command, write_repos=[_PROJECT]) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "api_request",
+    [
+        'issues -f title=Fix -f "description=Details\n/close"',
+        'issues/12/notes -f "body=Details\n  /move team/other"',
+        "merge_requests "
+        + _API_MR_FIELDS.replace("-f description=Details", '-f "description=/merge"'),
+        'merge_requests/12 -X PUT -f "description=Details\n/rebase"',
+        'merge_requests/12/notes -f "body=/merge"',
+    ],
+)
+def test_api_text_quick_actions_require_approval_after_project_checks(api_request: str) -> None:
+    command = f"glab api projects/:project/{api_request} {_API_SELECTOR}"
+    response = _response(command, write_repos=[_PROJECT])
+    assert response is not None and response["result"] == "ASK"
+    assert "quick actions" in response["reason"]
+    assert _result(command) == "DENY"
+
+
+def test_api_option_values_and_method_selection_are_not_reinterpreted() -> None:
+    command = f"glab api projects/:project/issues {_API_SELECTOR}"
+    assert (
+        _result(command + " -f title=--method -f description=Details", write_repos=[_PROJECT])
+        == "ALLOW"
+    )
+    assert _result(command + " -f page=2") == "DENY"
+    assert _result(command + " -X GET -f page=2") == "ALLOW"
+    assert _result(command + " --input --method GET") == "ASK"
+    assert _result(command + " --help") == "ALLOW"
+    assert _result(command + " --paginate=false --silent --include --output=json") == "ALLOW"
+    assert (
+        _result(command.replace("projects/:project/issues", "projects/team%2Fsub%2Fapp/issues"))
+        == "ASK"
+    )
+    assert (
+        _result(
+            command
+            + " -f title=Fix -f description=Details -F confidential=false -f confidential=false",
+            write_repos=[_PROJECT],
+        )
+        == "ASK"
+    )
+    denied = "glab api projects/123/repository/branches/feature -X DELETE --hostname gitlab.com"
+    assert _result(command + " --input example.json && " + denied) == "DENY"
+
+
+def test_api_projects_can_be_pinned_to_a_specific_authority() -> None:
+    command = (
+        "glab api projects/:project/issues -f title=Fix -f description=Details " + _API_SELECTOR
+    )
+    configuration = {
+        "hosts": ["gitlab.com", "gitlab.example.com"],
+        "write_repos": ["https://gitlab.example.com/team/sub/app"],
+    }
+    assert _result(command, **configuration) == "DENY"
+    assert (
+        _result(
+            command.replace("--hostname gitlab.com", "--hostname gitlab.example.com"),
+            **configuration,
+        )
+        == "ALLOW"
+    )
+    assert (
+        _result(
+            "glab api projects/:project --hostname gitlab.example.com:8443 "
+            "--placeholder project=team/sub/app",
+            hosts=["gitlab.example.com:8443"],
+        )
+        == "ASK"
+    )

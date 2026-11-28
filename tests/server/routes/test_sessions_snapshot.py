@@ -3664,30 +3664,40 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(
 
 
 @pytest.mark.asyncio
-async def test_persist_error_labels_short_message_stored_verbatim() -> None:
-    """A short failure message is stored without modification."""
+async def test_persist_error_labels_timestamp_and_recovery_preserve_activity(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure occurrence and recovery leave the transcript timestamp unchanged."""
+    from omnigent.server.routes._sessions import helpers
     from omnigent.server.schemas import ErrorDetail
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
-    captured: dict[str, dict[str, str]] = {}
-
-    class _MockStore:
-        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
-            captured[session_id] = updates
-
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
     error = ErrorDetail(code="runner_error", message="Process exited with code 1")
 
-    await _persist_session_status_error_labels(
-        "d6e1678fb446a1cf5a892e0df60aaba3", error, _MockStore()
-    )  # type: ignore[arg-type]
+    for occurred_at in (conversation.updated_at + 60, conversation.updated_at + 120):
+        monkeypatch.setattr(helpers.time, "time", lambda occurred_at=occurred_at: occurred_at)
+        await _persist_session_status_error_labels(conversation.id, error, store)
 
-    assert (
-        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_message"]
-        == "Process exited with code 1"
+        stored = store.get_conversation(conversation.id)
+        assert stored is not None
+        assert stored.labels["omnigent.last_task_error_message"] == error.message
+        assert stored.labels["omnigent.last_task_error_code"] == error.code
+        assert stored.labels["omnigent.last_task_error_at"] == str(occurred_at)
+        assert stored.updated_at == conversation.updated_at
+
+    await _persist_session_status_error_labels(conversation.id, None, store)
+
+    recovered = store.get_conversation(conversation.id)
+    assert recovered is not None
+    assert recovered.labels["omnigent.last_task_error_at"] == ""
+    assert all(
+        value == ""
+        for key, value in recovered.labels.items()
+        if key.startswith("omnigent.last_task_error_")
     )
-    assert (
-        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
-        == "runner_error"
-    )
+    assert recovered.updated_at == conversation.updated_at
 
 
 # ── _runner_reject_detail ────────────────────────────────────────────────────

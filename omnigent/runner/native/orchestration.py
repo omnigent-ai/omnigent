@@ -73,7 +73,11 @@ from omnigent.errors import (
     OmnigentError,
 )
 from omnigent.harness_plugins import native_provider_for_key
-from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.host.harness_startup import (
+    env_wrapper_chdir,
+    env_wrapper_command,
+    env_wrapper_environment,
+)
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
@@ -7240,6 +7244,7 @@ async def _auto_create_antigravity_terminal(
     *,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -7294,6 +7299,8 @@ async def _auto_create_antigravity_terminal(
         relay is started against this session's bridge dir before launch so the
         wrapped agy sees the ``sys_*`` tools (#1194). ``None`` skips relay wiring
         (the ``_run_turn_bg`` first-turn fallback re-ensures it).
+    :param agent_spec: Resolved session agent whose authored instructions and
+        memory guidance should be delivered before the first agy turn.
     :returns: The created terminal resource view.
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
@@ -7307,6 +7314,7 @@ async def _auto_create_antigravity_terminal(
         ensure_agy_feedback_survey_disabled,
         prepare_bridge_dir,
         seed_isolated_agy_home,
+        write_agent_instructions,
         write_bridge_state,
         write_mcp_config,
         write_tmux_target,
@@ -7417,6 +7425,17 @@ async def _auto_create_antigravity_terminal(
             trusted_workspace=workspace,
         ),
     }
+    startup_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id, workspace=workspace
+    )
+    try:
+        await asyncio.to_thread(write_agent_instructions, bridge_dir, startup_instructions)
+    except (OSError, ValueError) as error:
+        _logger.warning(
+            "Could not write Antigravity startup instructions (%s); terminal launch will continue",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
     # active turn and lost (#1494). Disable it before launch. agy now runs under
@@ -7440,11 +7459,17 @@ async def _auto_create_antigravity_terminal(
     # _run_turn_bg first-turn fallback re-ensures this for any session whose
     # terminal was launched outside this path.
     if ensure_comment_relay is not None:
+        relay_labels = (
+            {k: v for k, v in labels.items() if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(labels, dict)
+            else None
+        )
         await ensure_comment_relay(
             session_id,
             bridge_id=bridge_id,
             explicit_bridge_dir=bridge_dir,
             await_notify=False,
+            session_labels=relay_labels,
         )
 
     _logger.info(
@@ -8113,6 +8138,25 @@ def _native_startup_instructions_from_spec(
     return build_native_startup_instructions(spec)
 
 
+async def _antigravity_startup_agent_spec(
+    session_id: str,
+    resolve: Callable[[str], Awaitable[AgentSpec | None]],
+) -> AgentSpec | None:
+    """Prepare framework guidance if optional Antigravity instruction retrieval fails."""
+    from omnigent.runner._entry import AgentSpecFetchError
+
+    try:
+        return await resolve(session_id)
+    except AgentSpecFetchError:
+        _logger.warning(
+            "Could not fetch Antigravity startup instructions; preparing framework "
+            "guidance: session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
+
+
 async def _native_startup_instructions(
     agent_spec: AgentSpec | ResolvedSpec | None,
     server_client: httpx.AsyncClient | None,
@@ -8731,7 +8775,9 @@ def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
     )
 
 
-def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
+def _claude_terminal_launch_env(
+    spec: TerminalEnvSpec, *, require_resolved: bool = False
+) -> dict[str, str]:
     """
     Return the environment the native Claude terminal process starts with.
 
@@ -8742,12 +8788,26 @@ def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
 
     :param spec: The Claude terminal launch spec, e.g. one with
         ``command="env"`` and ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
+    :param require_resolved: Refuse unmodeled wrappers for strict MCP discovery.
     :returns: The effective environment, e.g.
         ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
     """
     env = _claude_terminal_pre_wrapper_env(spec)
     wrapper = env_wrapper_environment(spec.command or "", list(spec.args), env)
     if wrapper is None and Path(spec.command or "").name == "env":
+        if require_resolved:
+            from omnigent.config import global_config_path
+            from omnigent.mcp_disabled_servers import McpStrictModeError
+
+            raise McpStrictModeError(
+                "claude-native",
+                global_config_path(),
+                "unresolved env wrapper",
+                problem=(
+                    "the configured env wrapper cannot be resolved for strict MCP discovery; "
+                    "use a supported env wrapper or launch Claude directly"
+                ),
+            )
         _logger.info(
             "Claude terminal env wrapper form is not modeled; trust seeding uses the "
             "pre-wrapper environment"
@@ -9246,6 +9306,8 @@ def _ensure_orchestrator_skills_in_bundle(
     enabled = {"build-omnigent"}
     spec = _unwrap_resolved_spec(agent_spec)
     if isinstance(spec, AgentSpec):
+        # ``gadget`` follows the spec's tool group, which the runner turns off for a
+        # server without gadgets.
         enabled.update(framework_skill_names(spec))
     if not workflows_enabled:
         enabled.difference_update(WORKFLOW_FRAMEWORK_SKILLS)
@@ -9618,6 +9680,7 @@ async def _auto_create_claude_terminal(
 
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
+        apply_claude_launch_mcp_policy,
         augment_claude_args,
         claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
@@ -10389,6 +10452,8 @@ async def _auto_create_claude_terminal(
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+        # Strict MCP discovery runs once the wrapper's cwd and environment are known.
+        defer_inherited_mcp_discovery=True,
         bridge_dir=bridge_dir,
         workspace=Path(workspace),
         ap_server_url=server_url,
@@ -10454,11 +10519,23 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
-            added_dirs=trusted_added_dirs,
+        from omnigent.mcp_inheritance import resolve_mcp_inheritance
+
+        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+        launch_env = _claude_terminal_launch_env(
+            env_spec, require_resolved=not resolve_mcp_inheritance("claude-native").inherit
         )
+        wrapped_command = env_wrapper_command(
+            env_spec.command or "", list(env_spec.args), _claude_terminal_pre_wrapper_env(env_spec)
+        )
+        apply_claude_launch_mcp_policy(
+            bridge_dir,
+            cwd=launch_cwd,
+            env=launch_env,
+            active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+            claude_args=wrapped_command[1] if wrapped_command is not None else env_spec.args,
+        )
+        ensure_claude_workspace_trusted(launch_cwd, env=launch_env, added_dirs=trusted_added_dirs)
     except BaseException as seed_error:
         release_offer()
         # No forwarder owns the routers yet, so release the ones this launch started.
@@ -11245,6 +11322,7 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 

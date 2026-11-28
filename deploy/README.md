@@ -226,6 +226,30 @@ to browsers (e.g. `docker compose up` with no proxy, reached over
 plain HTTP). That's fine for a single window; put a proxy in front once
 you or your team routinely open several.
 
+## Turning on gadget sharing
+
+Gadgets (the `gadgets` feature) can be shared when the server's permission
+store keeps gadget grants (the server reports `gadget_sharing: true`). A grant
+names a username, and a store that keeps grants removes an account's grants
+when it is deleted and refuses to register that username again until they are
+gone. So:
+
+1. Upgrade every server replica first, then turn on `gadgets`. If it is already
+   on, finish the rolling upgrade before anyone shares a gadget: an older
+   replica can delete an account and register its username again without
+   removing the grants, and the new account inherits them.
+2. Once anyone has shared a gadget, don't run a release without gadget sharing
+   against that store, even with `gadgets` turned off: turning the feature off
+   leaves the grants in place, and that release's account deletion and
+   registration would let a new account inherit them. Roll back further only
+   after removing the grants, which drops every share.
+
+Gadgets with per-viewer collections are refused by releases from before them,
+so while replicas are mixed, or after a rollback, those gadgets don't load there
+rather than keep private records as shared ones.
+
+See [`designs/GADGETS.md`](../designs/GADGETS.md) for details.
+
 ## Execution model
 
 Omnigent runs in two pieces that talk to each other over a
@@ -643,8 +667,16 @@ admins: [you@yourcompany.com]         # who can manage members
 across when you switch, so they keep their sessions and admin rights:
 
 ```bash
-omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com
+omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com \
+  --gadget-dir /data/gadgets
 ```
+
+`--gadget-dir` is the server's gadget directory (`<data dir>/gadgets` unless
+the config sets `gadget_location`), so the command can refuse users who own
+gadgets instead of cutting them off. A `--config` whose file sets
+`gadget_location` works too; pass `--no-gadgets` instead for a server that
+never kept any. Without any of these it checks only this machine's default
+gadget directory, and warns when there is none.
 
 For the provider-specific walkthroughs (GitHub OAuth, Google Workspace,
 generic OIDC), see

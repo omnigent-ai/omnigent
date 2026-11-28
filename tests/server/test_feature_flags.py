@@ -61,6 +61,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "project_repository_creation": True,
         "quick_pick_palette": False,
         "workspace_sidebar_v2": False,
+        "gadgets": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,

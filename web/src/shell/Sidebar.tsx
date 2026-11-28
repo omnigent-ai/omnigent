@@ -18,6 +18,7 @@ import { GridSidebar } from "@/grid/GridWorkspace";
 import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDropTargets";
 import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
+import { switchSessionBeforeNavigate } from "@/lib/warmSessionSwitch";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import {
   useProjectFolderCollapse,
@@ -141,20 +142,12 @@ import { useIsMutating, useQueries, useQueryClient } from "@tanstack/react-query
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import {
   canFlagUnread,
-  isConversationMuted,
   isInMutedProject,
   isSessionMuted,
   showsUnreadFor,
   useMutedProjects,
 } from "@/lib/sessionMute";
-import {
-  Link,
-  useLocation,
-  useNavigate,
-  useParams,
-  useRebasePath,
-  useSearchParams,
-} from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSearchButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -229,10 +222,48 @@ import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import {
+  type ProjectExpansionCommand,
+  type ProjectExpansionId,
+  type ProjectMoveDestination,
+  type ProjectOrderingFacts,
+  type ProjectSortChoice,
+  type ProjectSortOrder,
+  PROJECT_MOVE_DESTINATIONS,
+  PROJECT_MOVE_MENU_LABELS,
+} from "./projectCommands/ordering";
+import { usePublishProjectOrdering } from "./projectCommands/projectOrderingStore";
+import { usePinOrderPaletteCommands } from "./PinOrder";
+import { useSidebarNavCommands, useSidebarNavDestinations } from "./sidebarNavCommands";
+import {
+  projectListControls,
+  SELECT_SESSIONS,
+  type SelectionScope,
+  selectSessionsEntry,
+  sidebarEntryPaletteCommands,
+} from "./sidebarEntryCommands";
+import {
+  useQuickPickPaletteCommands,
+  useQuickPickPaletteEnabled,
+} from "./screenCommands/useQuickPickPaletteCommands";
+import {
+  GROUPING_LABELS,
+  ORDERING_LABELS,
+  SHOW_LABELS,
+  sidebarFilters,
+  sidebarViewChoices,
+  sidebarViewCommands,
+} from "./sidebarViewCommands";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { useSessionActions } from "./useSessionActions";
+import {
+  useBulkSessionPaletteCommands,
+  useSessionSelectionPaletteCommands,
+} from "./sessionCommands/useBulkSessionPaletteCommands";
+import { nestDestinations, nestLabel } from "./nestDestinations";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { consumeProjectRename, useProjectActionStore } from "./projectCommands/projectActionStore";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -247,13 +278,13 @@ import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/s
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { withUnreadState, type SessionState } from "@/hooks/useSessionState";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
+import { useSessionIndicatorState } from "@/hooks/useSessionIndicatorState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
   markConversationRead,
   markConversationUnread,
-  useConversationReadState,
   useReadStateSnapshot,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
@@ -282,6 +313,13 @@ import { OWNS_LEFT_SWIPE_ATTRIBUTE, useSidebarSwipeToClose } from "@/hooks/useSi
 import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
+import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
+import {
+  leavingSessionOfOpenView,
+  leaveSessionView,
+  navigateAfterArchiving,
+  newSessionPathFor,
+} from "./sessionCommands/archiveNavigation";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {
@@ -308,6 +346,7 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { GadgetSidebarNav, useFullScreenGadgetId } from "@/gadgets/ui/GadgetSidebarNav";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -389,8 +428,7 @@ import {
   SIDEBAR_OPEN_MENU_HIGHLIGHT,
   SIDEBAR_FAMILY_LINE,
 } from "./sidebarStyles";
-import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
-import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
+import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { projectHomePath, projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { getEmbedRoot } from "../lib/host";
 import { canCreateProject, projectsMatching } from "./projectChoices";
@@ -478,7 +516,7 @@ const IsMobileContext = createContext<boolean>(false);
 const ViewerIdContext = createContext<string | null>(null);
 const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
 const RowActivationContext = createContext<
-  (id: string, event: MouseEvent<HTMLAnchorElement>) => void
+  (id: string, event: MouseEvent<HTMLAnchorElement>, href: string) => void
 >(() => {});
 // True while a pin, unpin, or reorder is saving; pin controls are disabled then.
 const PinSavingContext = createContext(false);
@@ -534,7 +572,7 @@ function SidebarRowDataProvider({
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
-  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
+  onActivate: ContextType<typeof RowActivationContext>;
   onReorder: (fromId: string, toId: string) => void;
   nestMoves: ContextType<typeof NestMoveContext>;
   children: ReactNode;
@@ -572,13 +610,6 @@ function SidebarRowDataProvider({
  */
 type SidebarTab = SessionFilter;
 
-const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
-  { value: "all", label: "All sessions" },
-  { value: "mine", label: "My sessions" },
-  { value: "shared", label: "Shared with me" },
-  { value: "archived", label: "Archived sessions" },
-];
-
 // Shown in place of the list when a filter matches nothing.
 const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
   all: "No sessions",
@@ -590,7 +621,6 @@ const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
 // Bulk-selection targets either the flat "Sessions" list or the sessions
 // nested inside project folders; the active scope decides which rows show
 // checkboxes and where the bulk-action bar renders.
-type SelectionScope = "sessions" | "projects";
 
 interface SidebarProps {
   open: boolean;
@@ -642,6 +672,7 @@ function useActiveNavItem(): {
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isWorkflowsPage: boolean;
+  isGadgetPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -667,6 +698,8 @@ function useActiveNavItem(): {
   // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
   const isWorkflowsPage =
     !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
+  // /gadget (list), /gadget/new and /gadget/:gadgetId.
+  const isGadgetPage = !isExtensionRoute && (leaf === "gadget" || segments.at(-2) === "gadget");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -681,6 +714,7 @@ function useActiveNavItem(): {
     !isCanvasPage &&
     !isTasksPage &&
     !isWorkflowsPage &&
+    !isGadgetPage &&
     !isUsagePage &&
     !isExtensionRoute;
   const searchParams = new URLSearchParams(location.search);
@@ -698,6 +732,7 @@ function useActiveNavItem(): {
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
+    isGadgetPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -844,6 +879,17 @@ function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): s
   return incomplete ? `${label}; more automations not yet checked` : label;
 }
 
+function isPlainPrimaryClick(event: MouseEvent<HTMLAnchorElement>): boolean {
+  return (
+    !event.defaultPrevented &&
+    event.button === 0 &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey
+  );
+}
+
 function SidebarImpl({
   open,
   onClose,
@@ -855,11 +901,12 @@ function SidebarImpl({
   const sidebarData = useSidebarData();
   const branding = useBranding();
   const serverInfo = useServerInfo();
-  const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  // Canvas and Usage: the same gates and destinations for the nav links and ⌘K.
+  const navDestinations = useSidebarNavDestinations();
+  useSidebarNavCommands(navDestinations);
+  const usagePageEnabled = navDestinations.usage.enabled;
   const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows");
-  const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
-  const [searchParams] = useSearchParams();
-  const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
+  const canvasEnabled = navDestinations.canvas.enabled;
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -908,6 +955,13 @@ function SidebarImpl({
     setSelectedIds(new Set());
     lastSelectedIdRef.current = null;
   }, []);
+
+  useSessionSelectionPaletteCommands({
+    selecting: selectionMode,
+    selected: selectedIds.size,
+    selectAll: () => setSelectedIds(new Set(getVisibleIdsRef.current())),
+    deselectAll,
+  });
 
   // Enter selection mode targeting a given scope; clear any prior selection so
   // rows from the previous scope don't linger.
@@ -988,9 +1042,7 @@ function SidebarImpl({
   // clicks open tabs); we only close the drawer on a plain primary click on
   // mobile. Stable identity (useStableCallback) so it doesn't defeat the row memo.
   const onNavClick = useStableCallback((e: MouseEvent<HTMLAnchorElement>) => {
-    if (e.defaultPrevented) return;
-    if (e.button !== 0) return;
-    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (!isPlainPrimaryClick(e)) return;
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
   });
   // A search result that opens its row closes the phone's menu, as a section link does.
@@ -1000,16 +1052,20 @@ function SidebarImpl({
 
   // Which top-level nav button to highlight for the current route.
   const {
-    isNewChatPage,
+    isNewChatPage: isNewChatRoute,
     isInboxPage,
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
+    isGadgetPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
     projectHomeName,
   } = useActiveNavItem();
+  // A gadget filling the screen beside New session is what the sidebar marks, not New session.
+  const fullScreenGadgetId = useFullScreenGadgetId();
+  const isNewChatPage = isNewChatRoute && fullScreenGadgetId === null;
   const navigate = useNavigate();
   const projectKanban = useProjectKanbanEnabled();
   const openProjectHome = useStableCallback((projectName: string) => {
@@ -1626,9 +1682,10 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              <GadgetSidebarNav active={isGadgetPage} onNavigate={onNavClick} />
               {canvasEnabled && (
                 <PrimaryNavLink
-                  to={canvasDestination.pathname + canvasDestination.search}
+                  to={navDestinations.canvas.to}
                   label="Canvas"
                   icon={LayoutDashboardIcon}
                   active={isCanvasPage}
@@ -1653,7 +1710,11 @@ function SidebarImpl({
                   )}
                   data-testid="usage-nav"
                 >
-                  <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
+                  <Link
+                    to={navDestinations.usage.to}
+                    onClick={onNavClick}
+                    componentId="sidebar.usage"
+                  >
                     <WalletIcon
                       className={cn(
                         "ui-icon",
@@ -2353,6 +2414,9 @@ function useStartingConversationId(enabled: boolean): string | null {
   });
 }
 
+/** What the sidebar publishes for Next and Previous session while QuickPick is off. */
+const NO_LISTED_SESSIONS: readonly string[] = [];
+
 // Module-level so dnd-kit's useSensor/DndContext memoization holds: fresh
 // option objects rebuild the activators and re-render every draggable row.
 const KEYBOARD_SENSOR_OPTIONS: KeyboardSensorOptions = {
@@ -2450,6 +2514,20 @@ function ConversationList({
         : undefined;
     saveView(custom ? { ...patch, custom } : patch);
   });
+  // The filter menu's choices, which ⌘K offers as settings running the menu's handlers.
+  const viewChoices = useMemo(
+    () =>
+      sidebarViewChoices({
+        filter: activeTab,
+        multiUser,
+        view: groupingUi ? view : null,
+        onFilterChange: onActiveTabChange,
+        onViewChange: updateView,
+      }),
+    [activeTab, multiUser, groupingUi, view, onActiveTabChange, updateView],
+  );
+  const viewCommands = useMemo(() => sidebarViewCommands(viewChoices), [viewChoices]);
+  useQuickPickPaletteCommands("sidebar-view", "Session list", viewCommands);
   const grouped = view.grouping !== "default";
   const harnessLabels = useHarnessLabels(view.grouping === "harness");
   const harnessLabel = useCallback(
@@ -2467,6 +2545,7 @@ function ConversationList({
   const startingId = useStartingConversationId(statusView);
   const mutedProjects = useMutedProjects();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
+  const rebasePath = useRebasePath();
   // Resolve the active conversation's top-level root once here (rows get a plain
   // `isActive` prop, not their own query). Falls back to the raw id while the
   // parent walk loads — a top-level session resolves to itself.
@@ -2601,7 +2680,7 @@ function ConversationList({
   // pinned rows stop taking drops until the current write settles.
   const pinWriting = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const { mutate: reorderPins } = useReorderPinnedConversations();
-  const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
+  const moveProject = (name: string, destination: ProjectMoveDestination) => {
     if (saveOrder.isPending) return;
     const from = projects.findIndex((p) => p.name === name);
     const to =
@@ -2638,11 +2717,13 @@ function ConversationList({
 
   const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
   useEffect(() => setOptimisticActiveId(null), [activeId]);
-  const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
-    if (event.defaultPrevented || event.button !== 0) return;
-    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    setOptimisticActiveId(id);
-  }, []);
+  const activateRow = useStableCallback(
+    (id: string, event: MouseEvent<HTMLAnchorElement>, href: string) => {
+      if (!isPlainPrimaryClick(event)) return;
+      setOptimisticActiveId(id);
+      if (href === `/c/${id}`) switchSessionBeforeNavigate(id, rebasePath);
+    },
+  );
   const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
   // Freeze the open chat's sort key until you navigate away, so sending doesn't reorder it.
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
@@ -3066,6 +3147,14 @@ function ConversationList({
     if (projectHomeName !== oldName) return;
     navigate({ pathname: projectHomePath(newName), search: location.search }, { replace: true });
   });
+  // A rename from ⌘K carries the expansion over too, once.
+  const quickPickRenames = useQuickPickPaletteEnabled();
+  const hostRename = useProjectActionStore((state) => state.lastRename);
+  useEffect(() => {
+    if (!quickPickRenames || !hostRename) return;
+    renameExpandedProject(hostRename.oldName, hostRename.newName);
+    consumeProjectRename(hostRename.key);
+  }, [quickPickRenames, hostRename, renameExpandedProject]);
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
@@ -3496,7 +3585,14 @@ function ConversationList({
     () => [...new Set(orderedConversationIds)].slice(0, SESSION_HOTKEY_DIGITS.length),
     [orderedConversationIds],
   );
-  useSessionNumberHotkeys(numberedSessionIds, activeId);
+  useSessionNumberHotkeys(numberedSessionIds);
+  // With quick_pick_palette, ⌘K's Next and Previous session step through the same rows.
+  const publishesSessionOrder = useQuickPickPaletteEnabled();
+  const listedSessionIds = useMemo(
+    () => (publishesSessionOrder ? [...new Set(orderedConversationIds)] : NO_LISTED_SESSIONS),
+    [publishesSessionOrder, orderedConversationIds],
+  );
+  usePublishSidebarSessionOrder(listedSessionIds, publishesSessionOrder ? resolvedActiveId : null);
   // Holding the command modifier shows each numbered row's jump number. The slots
   // come from the hotkey's own list, so a badge exists only where the key works.
   useCommandHoldTracking();
@@ -3506,6 +3602,24 @@ function ConversationList({
         isMobile ? [] : numberedSessionIds.map((id, slot): [string, number] => [id, slot]),
       ),
     [isMobile, numberedSessionIds],
+  );
+  // ⌘K moves the open pinned session through the same writes a drop on a pin makes.
+  const pinnedOrderIds = useMemo(
+    () => sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
+    [sections.pinned],
+  );
+  const movePin = (sessionId: string, targetId: string) => {
+    const writes = pinOrderWrites(sections.pinned, sessionId, targetId);
+    if (writes.length > 0) reorderPins(writes);
+  };
+  usePinOrderPaletteCommands(
+    {
+      pinnedIds: pinnedOrderIds,
+      reorderable: pinReorderEnabled,
+      saving: pinWriting,
+      move: movePin,
+    },
+    resolvedActiveId,
   );
   const pinOrder = useMemo(
     () =>
@@ -3570,6 +3684,113 @@ function ConversationList({
     onToggleSelected,
     onProjectAssigned: expandProject,
   };
+  // The Projects header's controls and the Select sessions entry points: the headers render
+  // from these, and ⌘K offers the same rows while they're offered.
+  const orderLoaded = projectOrder.data !== undefined;
+  const orderSaving = saveOrder.isPending;
+  const editingTitles = editingIds.size > 0;
+  const orderingFacts = useMemo<ProjectOrderingFacts>(
+    () => ({
+      orderLoaded,
+      saving: orderSaving,
+      selecting: selectionMode,
+      editing: editingTitles,
+    }),
+    [orderLoaded, orderSaving, selectionMode, editingTitles],
+  );
+  const projectsSectionShown = !grouped && !showShared;
+  // A unified selection starts from the Projects header's own button.
+  const hasProjectSessions =
+    !unifiedSelection && sections.projectGroups.some((group) => group.conversations.length > 0);
+  // Pinned rows can't be selected, so they don't make a sessions selection worth starting.
+  const hasLooseSessions = sections.shared.length + sections.sessions.length > 0;
+  const selectEntry = useMemo(
+    () =>
+      selectSessionsEntry({
+        selectionMode,
+        unifiedSelection,
+        projectsSectionShown,
+        hasLooseSessions,
+        hasProjectSessions,
+      }),
+    [selectionMode, unifiedSelection, projectsSectionShown, hasLooseSessions, hasProjectSessions],
+  );
+  const manualProjectOrder = projectOrder.data?.sort_mode === "manual";
+  const projectNamesInList = useMemo(
+    () => sections.projectGroups.map((group) => group.name),
+    [sections.projectGroups],
+  );
+  const projectsSectionCollapsed = effectiveCollapsedSections.includes("Projects");
+  const projectControls = useMemo(
+    () =>
+      projectListControls({
+        selectionMode,
+        sectionShown: projectsSectionShown,
+        selectProjectSessions: selectEntry.projectMenuItem,
+        manualOrder: manualProjectOrder,
+        ordering: orderingFacts,
+        projectNames: projectNamesInList,
+        expandedProjects,
+        sectionCollapsed: projectsSectionCollapsed,
+      }),
+    [
+      selectionMode,
+      projectsSectionShown,
+      selectEntry.projectMenuItem,
+      manualProjectOrder,
+      orderingFacts,
+      projectNamesInList,
+      expandedProjects,
+      projectsSectionCollapsed,
+    ],
+  );
+  const changeProjectSort = (order: ProjectSortOrder) => {
+    const ranks = new Map(projectOrder.data?.ordered_project_ids?.map((id, index) => [id, index]));
+    const restored = [...projects].sort(
+      (a, b) => (ranks.get(a.id ?? "") ?? Infinity) - (ranks.get(b.id ?? "") ?? Infinity),
+    );
+    saveOrder.mutate(order === "manual" ? restored : null);
+  };
+  const runProjectExpansion = (id: ProjectExpansionId) => {
+    if (id === "expand-all") expandAllProjects(projectNamesInList);
+    else collapseAllProjects();
+  };
+  // ⌘K's rows run what the controls would run now, not what they ran when the rows were built.
+  const latestProjectRun = useRef({
+    changeProjectSort,
+    runProjectExpansion,
+    enterSelection: onEnterSelectionMode,
+    moveProject,
+  });
+  latestProjectRun.current = {
+    changeProjectSort,
+    runProjectExpansion,
+    enterSelection: onEnterSelectionMode,
+    moveProject,
+  };
+  const projectListCommands = useMemo(
+    () =>
+      sidebarEntryPaletteCommands(projectControls, selectEntry, {
+        changeSort: (order) => latestProjectRun.current.changeProjectSort(order),
+        runExpansion: (id) => latestProjectRun.current.runProjectExpansion(id),
+        enterSelection: (scope) => latestProjectRun.current.enterSelection(scope),
+      }),
+    [projectControls, selectEntry],
+  );
+  useQuickPickPaletteCommands("sidebar-projects", "Projects", projectListCommands);
+  // ⌘K moves the project in view with the folder menu's facts and move.
+  const projectOrderNames = useMemo(() => projects.map((project) => project.name), [projects]);
+  const publishedOrdering = useMemo(
+    () => ({
+      names: projectOrderNames,
+      facts: orderingFacts,
+      move: (name: string, destination: ProjectMoveDestination) =>
+        latestProjectRun.current.moveProject(name, destination),
+    }),
+    [projectOrderNames, orderingFacts],
+  );
+  usePublishProjectOrdering(publishedOrdering);
+
   const sessionsBulkBar =
     sessionsSelecting && !unifiedSelection ? (
       <BulkActionBar
@@ -3589,7 +3810,7 @@ function ConversationList({
           type="button"
           variant="ghost"
           size="icon-xs"
-          aria-label="Select sessions"
+          aria-label={SELECT_SESSIONS.menuLabel}
           data-testid="toggle-selection-mode"
           className="text-muted-foreground mobile-touch-target"
           onClick={(event) => {
@@ -3600,7 +3821,7 @@ function ConversationList({
           <ListChecksIcon className="size-3.5" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">Select sessions</TooltipContent>
+      <TooltipContent side="bottom">{SELECT_SESSIONS.menuLabel}</TooltipContent>
     </Tooltip>
   );
   // A unified selection puts "Select sessions" on the Projects header instead.
@@ -3633,7 +3854,7 @@ function ConversationList({
           New session
         </TooltipContent>
       </Tooltip>
-      {!unifiedSelection && selectSessionsButton}
+      {selectEntry.sessionsHeaderButton && selectSessionsButton}
     </div>
   ) : undefined;
   const sessionsFilterMenu = (
@@ -3886,38 +4107,16 @@ function ConversationList({
                               hostId={defaultProjectHostId}
                               hosts={hosts}
                               hostsLoading={hostsLoading}
-                              onOrderChange={(manual) => {
-                                const ranks = new Map(
-                                  projectOrder.data?.ordered_project_ids?.map((id, index) => [
-                                    id,
-                                    index,
-                                  ]),
-                                );
-                                const restored = [...projects].sort(
-                                  (a, b) =>
-                                    (ranks.get(a.id ?? "") ?? Infinity) -
-                                    (ranks.get(b.id ?? "") ?? Infinity),
-                                );
-                                saveOrder.mutate(manual ? restored : null);
-                              }}
-                              manualOrder={projectOrder.data?.sort_mode === "manual"}
-                              orderDisabled={saveOrder.isPending || !projectOrder.data}
-                              projectNames={sections.projectGroups.map((group) => group.name)}
-                              collapsed={effectiveCollapsedSections.includes("Projects")}
-                              expandedProjects={expandedProjects}
-                              // A unified selection starts from the header's own button.
-                              hasProjectSessions={
-                                !unifiedSelection &&
-                                sections.projectGroups.some(
-                                  (group) => group.conversations.length > 0,
-                                )
-                              }
-                              onExpandAll={expandAllProjects}
-                              onCollapseAll={collapseAllProjects}
+                              menuShown={projectControls.menuShown}
+                              sortChoices={projectControls.sort}
+                              onSortChange={changeProjectSort}
+                              expansion={projectControls.expansion}
+                              onExpansion={runProjectExpansion}
+                              selectProjectSessions={selectEntry.projectMenuItem}
                               onProjectCreated={expandProject}
                               onEnterSelectionMode={() => onEnterSelectionMode("projects")}
                             />
-                            {unifiedSelection && selectSessionsButton}
+                            {selectEntry.projectsHeaderButton && selectSessionsButton}
                           </>
                         ) : undefined
                       }
@@ -4476,26 +4675,6 @@ function SectionHeader({
 
 // Scope filter on the Sessions heading. A radio group: the options are
 // mutually exclusive slices of one list.
-const GROUPING_LABELS: Record<SidebarGrouping, string> = {
-  default: "Default",
-  status: "Status",
-  harness: "Harness",
-  created: "Created",
-  updated: "Updated",
-};
-const ORDERING_LABELS: Record<SidebarOrdering, string> = {
-  updated: "Updated",
-  created: "Created",
-  custom: "Custom",
-};
-const SHOW_LABELS: Record<SidebarShowField, string> = {
-  harness: "Harness",
-  project: "Project",
-  updated: "Updated",
-  environment: "Environment",
-  repo: "Repo",
-  branch: "Branch",
-};
 
 // Mobile has no room for a side flyout, so filter submenus replace the main
 // menu body in place. `open` is the shown submenu's test id, or null for the main list.
@@ -4595,9 +4774,7 @@ function SessionFilterMenu({
   const isMobile = useIsMobileViewport();
   const pages = isMobile ? { open: openPage, setOpen: setOpenPage } : undefined;
   const tooltip = useMenuGuardedTooltip(menuOpen);
-  const filters = multiUser
-    ? SIDEBAR_FILTERS
-    : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
+  const filters = sidebarFilters(multiUser);
   const displayOptions = (
     <DropdownMenuRadioGroup value={value} onValueChange={(next) => onChange(next as SidebarTab)}>
       {filters.map((filter) => (
@@ -4734,42 +4911,32 @@ function ProjectHeaderActions({
   hostId,
   hosts,
   hostsLoading,
-  onOrderChange,
-  manualOrder,
-  orderDisabled,
-  projectNames,
-  collapsed,
-  expandedProjects,
-  hasProjectSessions,
-  onExpandAll,
-  onCollapseAll,
+  menuShown,
+  sortChoices,
+  onSortChange,
+  expansion,
+  onExpansion,
+  selectProjectSessions,
   onProjectCreated,
   onEnterSelectionMode,
 }: {
   hostId: string | null;
   hosts: Host[];
   hostsLoading: boolean;
-  onOrderChange: (manual: boolean) => void;
-  manualOrder: boolean;
-  orderDisabled: boolean;
-  projectNames: string[];
-  collapsed: boolean;
-  expandedProjects: string[];
-  /** Whether any project holds sessions — gates the "Select sessions" item, so
-      it isn't offered when there's nothing under any folder to select. */
-  hasProjectSessions: boolean;
-  onExpandAll: (projectNames: string[]) => void;
-  onCollapseAll: () => void;
+  /** Whether the project list menu shows, from the shared model ⌘K reads. */
+  menuShown: boolean;
+  /** From the shared ordering model, as ⌘K offers them. */
+  sortChoices: readonly ProjectSortChoice[];
+  onSortChange: (order: ProjectSortOrder) => void;
+  /** Expand all and collapse all, only where each would change something. */
+  expansion: readonly ProjectExpansionCommand[];
+  onExpansion: (id: ProjectExpansionId) => void;
+  /** Whether the menu's Select sessions item shows, as `selectSessionsEntry` decides. */
+  selectProjectSessions: boolean;
   onProjectCreated: (projectName: string) => void;
   onEnterSelectionMode: () => void;
 }) {
-  const showExpandControls = !collapsed && projectNames.length > 0;
-  const allExpanded =
-    projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
-  const anyExpanded = projectNames.some((name) => expandedProjects.includes(name));
-  // Hide the menu when there are no projects or sessions to organize.
-  const showMenu = showExpandControls || hasProjectSessions || projectNames.length > 0;
-
+  const sortReason = sortChoices.find((choice) => !choice.availability.available)?.availability;
   return (
     <div className="flex items-center gap-0.5">
       <NewProjectButton
@@ -4777,8 +4944,9 @@ function ProjectHeaderActions({
         hostId={hostId}
         hosts={hosts}
         hostsLoading={hostsLoading}
+        inPalette
       />
-      {showMenu && (
+      {menuShown && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
@@ -4795,43 +4963,44 @@ function ProjectHeaderActions({
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-40">
             <DropdownMenuSub>
-              <DropdownMenuSubTrigger disabled={orderDisabled}>
+              <DropdownMenuSubTrigger disabled={sortReason !== undefined}>
                 Sort projects by
               </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="min-w-40">
                 <DropdownMenuRadioGroup
-                  value={manualOrder ? "manual" : "alphabetical"}
-                  onValueChange={(value) => onOrderChange(value === "manual")}
+                  value={sortChoices.find((choice) => choice.selected)?.value}
+                  onValueChange={(value) => onSortChange(value as ProjectSortOrder)}
                 >
-                  <DropdownMenuRadioItem value="alphabetical">Alphabetically</DropdownMenuRadioItem>
-                  <DropdownMenuRadioItem value="manual">Manual order</DropdownMenuRadioItem>
+                  {sortChoices.map((choice) => (
+                    <DropdownMenuRadioItem key={choice.value} value={choice.value}>
+                      {choice.menuLabel}
+                    </DropdownMenuRadioItem>
+                  ))}
                 </DropdownMenuRadioGroup>
               </DropdownMenuSubContent>
             </DropdownMenuSub>
-            {/* Gated independently: each hides only when it would be a no-op, so
-                a mixed set offers both. */}
-            {showExpandControls && !allExpanded && (
-              <DropdownMenuItem
-                data-testid="expand-all-projects"
-                onSelect={() => onExpandAll(projectNames)}
-              >
-                <Maximize2Icon className="size-3.5" />
-                Expand all
-              </DropdownMenuItem>
-            )}
-            {showExpandControls && anyExpanded && (
-              <DropdownMenuItem data-testid="collapse-all-projects" onSelect={onCollapseAll}>
-                <Minimize2Icon className="size-3.5" />
-                Collapse all
-              </DropdownMenuItem>
-            )}
-            {hasProjectSessions && (
+            {expansion.map((command) => {
+              const Icon = command.id === "expand-all" ? Maximize2Icon : Minimize2Icon;
+              return (
+                <DropdownMenuItem
+                  key={command.id}
+                  data-testid={
+                    command.id === "expand-all" ? "expand-all-projects" : "collapse-all-projects"
+                  }
+                  onSelect={() => onExpansion(command.id)}
+                >
+                  <Icon className="size-3.5" />
+                  {command.menuLabel}
+                </DropdownMenuItem>
+              );
+            })}
+            {selectProjectSessions && (
               <DropdownMenuItem
                 data-testid="projects-select-sessions"
                 onSelect={() => onEnterSelectionMode()}
               >
                 <ListChecksIcon className="size-3.5" />
-                Select sessions
+                {SELECT_SESSIONS.menuLabel}
               </DropdownMenuItem>
             )}
           </DropdownMenuContent>
@@ -6368,7 +6537,11 @@ function ConversationRowImpl({
     label,
     viewerId,
     serverInfo,
-    onLeave: isActive ? () => navigate("/", { replace: true }) : undefined,
+    // Leaving the open session leaves its view, as ⌘K's actions do.
+    onLeave: isActive
+      ? (cause) =>
+          leaveSessionView(cause, { conversation, source: "sidebar_menu", navigate, queryClient })
+      : undefined,
     componentIdPrefix: "sidebar.conversation",
   });
   // Subscribed so the just-recorded optimistic label flips the row
@@ -6377,42 +6550,11 @@ function ConversationRowImpl({
   const isProvisionalLabel =
     pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
   const hasDraft = useHasSessionDraft(conversation.id);
-  // A write for another conversation leaves this primitive snapshot unchanged,
-  // so useSyncExternalStore skips the heavy row render.
-  const readState = useConversationReadState(
-    conversation.id,
-    conversation.updated_at,
-    conversation.status,
+  const { sessionState, unread, hasUnseenMessages, isMuted } = useSessionIndicatorState(
+    conversation,
+    isActive,
   );
-  // Explicit unread overrides active-row suppression; running turns remain
-  // hidden through readState.unseen. Muting hides the dot without marking read.
-  useMutedProjects();
-  const isMuted = isConversationMuted(conversation);
-  const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
-  const hasUnseenMessages = showsUnreadFor(conversation, unread);
   const canMarkUnread = !unread;
-  // Approvals, turns and failures outrank the unread dot without clearing read
-  // state; background work alone yields to it.
-  const badgeConversations = useMemo(() => [conversation], [conversation]);
-  const [derivedState] = useSessionBadgeStates(badgeConversations);
-  const badgeState = withUnreadState(derivedState, hasUnseenMessages);
-  // The bound session's launch/relaunch window: a send is in flight (local
-  // status "streaming") or the runner is auto-creating the PTY
-  // (`terminalPending`), but the server hasn't confirmed `running` yet — a
-  // cold boot, or a send waking a disconnected runner. Without this the row
-  // shows nothing while the session is visibly "Starting up…" in the chat.
-  // Only the bound (open) conversation has this store state; other rows read
-  // false, and the server-derived states above win once they land.
-  const isStartingUp = useChatStore(
-    (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
-  );
-  // A send waking the session shows its startup spinner over background work.
-  const sessionState =
-    badgeState?.kind === "awaiting" || (badgeState?.kind === "running" && !badgeState.background)
-      ? badgeState
-      : isStartingUp
-        ? { kind: "starting" as const }
-        : badgeState;
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
@@ -6766,6 +6908,14 @@ function ConversationRowImpl({
     </>
   );
 
+  let rowHref = `/c/${conversation.id}`;
+  if (selectionMode) rowHref = "#";
+  else if (conversation.nested_draft_source_id) {
+    rowHref = `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`;
+  } else if (conversation.project_draft_name !== undefined) {
+    rowHref = `/?project=${encodeURIComponent(conversation.project_draft_name)}`;
+  }
+
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
@@ -6792,15 +6942,7 @@ function ConversationRowImpl({
       )}
       <Link
         ref={rowLinkRef}
-        to={
-          selectionMode
-            ? "#"
-            : conversation.nested_draft_source_id
-              ? `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`
-              : conversation.project_draft_name !== undefined
-                ? `/?project=${encodeURIComponent(conversation.project_draft_name)}`
-                : `/c/${conversation.id}`
-        }
+        to={rowHref}
         componentId="sidebar.conversation_switcher"
         aria-keyshortcuts={
           shortcutSlot !== undefined
@@ -6865,7 +7007,7 @@ function ConversationRowImpl({
             onToggleSelected(conversation.id, e.shiftKey);
             return;
           }
-          activateRow(conversation.id, e);
+          activateRow(conversation.id, e, rowHref);
           onClick(e);
         }}
         onDoubleClick={(e) => {
@@ -7635,7 +7777,7 @@ function ProjectFolderMenuItems({
             Move
           </C.SubTrigger>
           <C.SubContent>
-            {(["up", "down", "top", "bottom"] as const).map((destination) => (
+            {PROJECT_MOVE_DESTINATIONS.map((destination) => (
               <C.Item
                 key={destination}
                 disabled={
@@ -7646,9 +7788,7 @@ function ProjectFolderMenuItems({
                 }
                 onSelect={() => actions.ordering!.move(destination)}
               >
-                {destination === "top" || destination === "bottom"
-                  ? `Move to ${destination}`
-                  : `Move ${destination}`}
+                {PROJECT_MOVE_MENU_LABELS[destination]}
               </C.Item>
             ))}
           </C.SubContent>
@@ -8124,28 +8264,16 @@ function NestPickerMenu({
     includeArchived: false,
     limit: 20,
   });
-  const label = (row: Conversation) =>
-    row.family?.representative_title ?? conversationDisplayLabel(row);
-  const destinations = [
-    ...new Map(
-      [
-        ...nests.destinations.filter((row) =>
-          label(row).toLowerCase().includes(search.trim().toLowerCase()),
-        ),
-        ...(query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : []),
-      ]
-        .filter(
-          (row) =>
-            nests.canJoin &&
-            row.family &&
-            row.family.id !== conversation.family?.id &&
-            row.id !== conversation.id &&
-            !row.archived &&
-            isOwnedByViewer(row, viewerId),
-        )
-        .map((row) => [row.family!.id, row]),
-    ).values(),
-  ];
+  const destinations = nests.canJoin
+    ? nestDestinations({
+        conversation,
+        loaded: nests.destinations,
+        searchHits:
+          query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : [],
+        search,
+        viewerId,
+      })
+    : [];
   const select = (destination: Conversation | null) => {
     nests.move(conversation.id, destination);
     close();
@@ -8168,11 +8296,11 @@ function NestPickerMenu({
           <C.Item
             key={row.family!.id}
             disabled={nests.saving}
-            textValue={label(row)}
+            textValue={nestLabel(row)}
             onSelect={() => select(row)}
           >
             <GitBranchIcon className="size-3.5" />
-            {label(row)}
+            {nestLabel(row)}
           </C.Item>
         ))}
         {!destinations.length && !result.isFetching && query === search.trim() && (
@@ -8311,6 +8439,7 @@ function BulkActionBar({
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const quickPick = useQuickPickPaletteEnabled();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const archivePrompt = useArchivePrompt();
@@ -8466,7 +8595,22 @@ function BulkActionBar({
     // mutate-level callback — a callback on the unmounted observer never fires,
     // and it would carry a stale `activeId` that could jump the user off a
     // session they switched to meanwhile. Mirrors handleDelete.
-    if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
+    const leavingIds = toArchive.map((c) => c.id);
+    // With quick_pick_palette, a sub-agent's view also leaves with its archived parent.
+    const leavingWithOpenView = quickPick
+      ? leavingSessionOfOpenView(queryClient, activeId, leavingIds)
+      : leavingIds.find((id) => id === activeId);
+    const leaving = toArchive.find((c) => c.id === leavingWithOpenView);
+    if (leaving) {
+      // New session, if nothing is left to open, starts in that session's project.
+      navigateAfterArchiving({
+        leavingIds,
+        source: "bulk",
+        navigate,
+        newSessionPath: newSessionPathFor(queryClient, leaving),
+        queryClient,
+      });
+    }
     onDeselectAll();
     bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
@@ -8499,6 +8643,28 @@ function BulkActionBar({
     onDeselectAll();
     bulkDelete.mutate({ ids, deleteBranchIds: branchesToDelete });
   }
+
+  useBulkSessionPaletteCommands({
+    facts: {
+      selected: count,
+      unread: unreadSelected.length,
+      flaggable: flaggableSelected.length,
+      owned: ownedSelected.length,
+      ownedArchived: archivedSelected.length,
+      canMove: canMoveSelection,
+      busy: isBusy,
+    },
+    selection: selectedIds,
+    projects: projects.map((project) => project.name),
+    run: {
+      "mark-read": handleMarkRead,
+      "mark-unread": handleMarkUnread,
+      archive: handleArchive,
+      unarchive: handleUnarchive,
+      delete: () => setConfirmDeleteOpen(true),
+    },
+    moveToProject: handleMoveToProject,
+  });
 
   return (
     <>

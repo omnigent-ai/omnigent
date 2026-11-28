@@ -10,7 +10,7 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
-import type { ReactNode, RefObject } from "react";
+import { type ReactNode, type RefObject, useEffect } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -28,6 +28,7 @@ import {
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UsePermissionsModule from "@/hooks/usePermissions";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as GadgetRailTabsModule from "@/gadgets/ui/GadgetRailTabs";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
@@ -143,6 +144,23 @@ vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+// Tabs the gadget rail reports, for the cases that keep a gadget open; null uses the real hook.
+const gadgetRailTabs = vi.hoisted(() => ({
+  value: null as { key: string; label: string }[] | null,
+  // More of the rail's state, for cases that pick which gadget is selected and shown.
+  state: null as Partial<GadgetRailTabsModule.GadgetRailTabState> | null,
+}));
+vi.mock("@/gadgets/ui/GadgetRailTabs", async (importOriginal) => {
+  const actual = await importOriginal<typeof GadgetRailTabsModule>();
+  return {
+    ...actual,
+    useGadgetRailTabState: (...args: Parameters<typeof actual.useGadgetRailTabState>) => {
+      const state = actual.useGadgetRailTabState(...args);
+      const tabs = gadgetRailTabs.value === null ? state.tabs : gadgetRailTabs.value;
+      return { ...state, tabs, ...gadgetRailTabs.state };
+    },
+  };
+});
 // A side chat's pane is covered by its own suite; the stub just names its child.
 vi.mock("@/components/chat/SideChatPane", () => ({
   SideChatPane: ({
@@ -553,6 +571,101 @@ describe("WorkspacePanel surface presentation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close notes.md" }));
     rerender({ openFiles: [], selectedFilePath: null });
     expect(onHide).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the rail when the user closes the last file but a gadget is still open", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    gadgetRailTabs.value = [{ key: "gadget:g1", label: "Board" }];
+    try {
+      const { rerender, onHide } = renderWorkspace({
+        selectedFilePath: "README.md",
+        openFiles: ["README.md"],
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Close README.md" }));
+      rerender({ openFiles: [], selectedFilePath: null });
+      expect(onHide).not.toHaveBeenCalled();
+    } finally {
+      gadgetRailTabs.value = null;
+    }
+  });
+
+  it("closes gadgets with Close all tabs, and hides the rail when the last gadget closes", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const close = vi.fn();
+    const tabs = [{ key: "gadget:g1", label: "Board" }];
+    gadgetRailTabs.state = { tabs, canClose: true, close };
+    try {
+      const { rerender, onHide } = renderWorkspace({
+        selectedFilePath: "README.md",
+        openFiles: ["README.md"],
+      });
+      fireEvent.contextMenu(screen.getByTitle("README.md"));
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+      expect(close).toHaveBeenCalledWith("gadget:g1");
+      gadgetRailTabs.state = { tabs: [], canClose: true, close };
+      rerender({ openFiles: [], selectedFilePath: null });
+      expect(onHide).toHaveBeenCalledOnce();
+
+      // A lone gadget closed with its X hides the rail too.
+      onHide.mockClear();
+      close.mockClear();
+      gadgetRailTabs.state = { tabs, canClose: true, close, selected: "gadget:g1" };
+      rerender({ rightRailTab: "gadget" });
+      fireEvent.click(screen.getByRole("button", { name: "Close Board" }));
+      expect(close).toHaveBeenCalledWith("gadget:g1");
+      gadgetRailTabs.state = { tabs: [], canClose: true, close, selected: null };
+      rerender({});
+      expect(onHide).toHaveBeenCalledOnce();
+    } finally {
+      gadgetRailTabs.state = null;
+    }
+  });
+
+  it("runs a gadget once: in the rail on a desktop, only in its drawer on a phone", () => {
+    let mounted = 0;
+    function CountedGadget() {
+      useEffect(() => {
+        mounted += 1;
+        return () => {
+          mounted -= 1;
+        };
+      }, []);
+      return <div data-testid="counted-gadget" />;
+    }
+    const rail = (mobileOpen: boolean) => ({
+      tabs: [{ key: "gadget:g1", label: "Board" }],
+      selected: "gadget:g1",
+      loading: false,
+      mobileOpen,
+      render: () => <CountedGadget />,
+    });
+    gadgetRailTabs.state = rail(false);
+    try {
+      const { rerender } = renderWorkspace({
+        rightRailTab: "gadget",
+        openFiles: [],
+        selectedFilePath: null,
+      });
+      expect(mounted).toBe(1);
+
+      // On a phone the hidden rail keeps the selection but not a second runtime.
+      isMobileMock.mockReturnValue(true);
+      rerender({});
+      expect(mounted).toBe(0);
+      gadgetRailTabs.state = rail(true);
+      rerender({});
+      expect(mounted).toBe(1);
+      gadgetRailTabs.state = rail(false);
+      rerender({});
+      expect(mounted).toBe(0);
+
+      // Back on a desktop, the selected gadget shows in the rail again.
+      isMobileMock.mockReturnValue(false);
+      rerender({});
+      expect(mounted).toBe(1);
+    } finally {
+      gadgetRailTabs.state = null;
+    }
   });
 
   it("keeps the rail when Close other tabs keeps a pinned page", async () => {

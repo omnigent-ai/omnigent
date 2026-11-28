@@ -4,6 +4,8 @@
 import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 
+import { cn } from "@/lib/utils";
+
 /** A section title and its optional picker trigger, in a fixed-height row. */
 export function PullRequestSectionHeader({
   id,
@@ -34,19 +36,28 @@ export function PullRequestChipAction({
   title,
   icon: Icon,
   onClick,
+  disabled = false,
 }: {
   label: string;
   title?: string;
   icon: LucideIcon;
   onClick: () => void;
+  /** Shown but inert, with `title` saying why; still reachable by keyboard. */
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       aria-label={label}
       title={title}
-      onClick={onClick}
-      className="shrink-0 cursor-pointer rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+      aria-disabled={disabled || undefined}
+      onClick={disabled ? undefined : onClick}
+      className={cn(
+        "shrink-0 rounded-full p-0.5 text-muted-foreground",
+        disabled
+          ? "cursor-default opacity-50"
+          : "cursor-pointer hover:bg-muted hover:text-foreground",
+      )}
     >
       <Icon aria-hidden className="size-3" />
     </button>

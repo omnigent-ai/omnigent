@@ -26,12 +26,14 @@ import {
   isOwnerLevel,
   listAutomationPermissions,
   listPermissions,
+  listGadgetPermissions,
   listWorkflowPermissions,
   revokePermission,
   revokeSharePermission,
 } from "@/lib/permissionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useSession } from "./useSession";
+import type { Session } from "@/lib/types";
 
 /** Every session's grants list, which also names the automation managing it. */
 const SESSION_PERMISSIONS_KEY = ["permissions"] as const;
@@ -53,6 +55,7 @@ function grantListQuery(rawTarget: ShareTarget | null, enabled: boolean) {
     queryFn: () => {
       if (target!.kind === "session") return listPermissions(target!.id);
       if (target!.kind === "workflow") return listWorkflowPermissions(target!.id);
+      if (target!.kind === "gadget") return listGadgetPermissions(target!.id);
       return listAutomationPermissions(target!.id);
     },
     enabled: enabled && !!target,
@@ -107,6 +110,8 @@ function invalidateAfterShareChange(qc: QueryClient, target: ShareTarget): void 
   void qc.invalidateQueries({ queryKey: permissionsKey(target) });
   // The server shares an automation's continued session at once.
   if (target.kind === "automation") invalidateSessionGrants(qc);
+  // A change can be the viewer's own access, which every open view of the gadget shows.
+  if (target.kind === "gadget") void qc.invalidateQueries({ queryKey: ["gadgets"] });
   void qc.invalidateQueries({ queryKey: ["conversations"] });
   void qc.invalidateQueries({ queryKey: ["project-sessions"] });
   void qc.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
@@ -114,7 +119,8 @@ function invalidateAfterShareChange(qc: QueryClient, target: ShareTarget): void 
 
 /**
  * Grant or update a permission. Invalidates the grants and session lists on
- * success. An automation or a workflow is shared at read access whatever `level` says.
+ * success. An automation or a workflow is shared at read access whatever `level` says;
+ * a gadget at the level given.
  */
 export function useGrantPermission(target: ShareTarget) {
   const qc = useQueryClient();
@@ -128,6 +134,10 @@ export function useGrantPermission(target: ShareTarget) {
       level: number;
       ensureMinimum?: boolean;
     }): Promise<ShareGrant> => {
+      if (target.kind === "gadget")
+        return ensureMinimum
+          ? grantSharePermission(target, userId, level, true)
+          : grantSharePermission(target, userId, level);
       if (target.kind !== "session") return grantSharePermission(target, userId, LEVEL_READ);
       return ensureMinimum
         ? grantPermission(target.id, userId, level, true)
@@ -193,3 +203,37 @@ export function useIsSessionOwner(sessionId: string | null | undefined): boolean
 }
 
 export type { GrantList, Permission, ShareGrant, ShareTarget };
+
+/**
+ * Who may change a session's pull requests: on a shared session only its owner, since
+ * every change runs as the owner's code-host account or speaks for the session. "unknown"
+ * while the session loads, so neither the controls nor the owner-only note flash.
+ */
+export type PullRequestChangeAccess = "owner" | "not_owner" | "unknown";
+/**
+ * The server's answer for whether the viewer owns the session's root (its owner grant, never
+ * an admin flag; everyone where permissions are off), sent as `side_chat_allowed`. Older
+ * servers fall back to the viewer's own level.
+ */
+export function pullRequestChangeAccess(
+  session: Pick<Session, "sideChatAllowed" | "permissionLevel"> | null | undefined,
+  isLoading: boolean,
+): PullRequestChangeAccess {
+  if (!session) return isLoading ? "unknown" : "not_owner";
+  const owner = session.sideChatAllowed ?? isOwnerLevel(session.permissionLevel ?? null);
+  return owner ? "owner" : "not_owner";
+}
+/** {@link pullRequestChangeAccess} for `sessionId`. */
+export function usePullRequestChangeAccess(sessionId: string): PullRequestChangeAccess {
+  const { session, isLoading } = useSession(sessionId);
+  return pullRequestChangeAccess(session, isLoading);
+}
+/**
+ * The one gate for changing a session's pull requests here, through its machine or this
+ * Mac alike: edit access, held by the session's owner.
+ */
+export function useCanChangePullRequests(sessionId: string): boolean {
+  const canEdit = useCanEdit(sessionId);
+  const access = usePullRequestChangeAccess(sessionId);
+  return canEdit && access === "owner";
+}

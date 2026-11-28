@@ -10,6 +10,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type * as TabStoreModule from "@/components/BrowserPane/agentTools/tabStore";
 import type { WorkspaceTabsHostProps } from "./workspaceTabs/WorkspaceTabsHost";
+import type { GoToFileHostProps } from "./goToFile/GoToFileHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext } from "react";
@@ -79,6 +80,15 @@ vi.mock("./fileCommands/FileActionHost", () => ({
   FileActionHost: () => {
     if (fileActionHost.throws) throw new Error("file action host broke");
     return <div data-testid="file-action-host" />;
+  },
+}));
+
+// Go to File has its own suites; these tests check where it mounts and what it's handed.
+const goToFile = vi.hoisted(() => ({ props: null as GoToFileHostProps | null }));
+vi.mock("./goToFile/GoToFileHost", () => ({
+  GoToFileHost: (props: GoToFileHostProps) => {
+    goToFile.props = props;
+    return <div data-testid="go-to-file-host" />;
   },
 }));
 
@@ -190,6 +200,10 @@ vi.mock("./InlineTerminalsSection", () => ({ InlineTerminalsSection: () => null 
 vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useSession } from "@/hooks/useSession";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
+import { LEVEL_READ } from "@/lib/permissionsApi";
+import { readRecentWorkspaceFiles } from "@/lib/recentWorkspaceFiles";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
@@ -369,6 +383,7 @@ function agentTabs(request: AgentBrowserTabRequest) {
 
 beforeEach(() => {
   localStorage.clear();
+  goToFile.props = null;
   sessionStorage.clear();
   writeWorkspacePanelDefault("open");
   tabs.host = null;
@@ -400,6 +415,15 @@ describe("workspace_sidebar_v2", () => {
     expect(await screen.findAllByTestId("file-action-host")).toHaveLength(1);
   });
 
+  it("keeps the classic sidebar, which has gadget tabs, when the server has gadgets too", async () => {
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, gadgets: true } });
+
+    expect(await screen.findByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("tabs-host")).toBeNull();
+  });
+
   it("keeps the shell when the file action host throws", async () => {
     fileActionHost.throws = true;
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -429,6 +453,93 @@ describe("workspace_sidebar_v2", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
+  });
+
+  it("mounts Go to File for the session with the flag on", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws", textSearch: false });
+  });
+
+  it.each([
+    [
+      "a read-only viewer the session doesn't share its files with",
+      () => {
+        const session = vi.mocked(useSession);
+        const original = session.getMockImplementation()!;
+        session.mockImplementation(
+          () =>
+            ({
+              session: { id: "conv_ws", permissionLevel: LEVEL_READ, shareWorkspaceFiles: false },
+              isLoading: false,
+              error: null,
+            }) as never,
+        );
+        onTestFinished(() => {
+          session.mockImplementation(original);
+        });
+      },
+    ],
+    [
+      "a session whose environment has no filesystem",
+      () => {
+        const environment = vi.mocked(useWorkspaceEnvironment);
+        const original = environment.getMockImplementation()!;
+        environment.mockImplementation(
+          () => ({ data: { available: false, root: null }, isLoading: false }) as never,
+        );
+        onTestFinished(() => {
+          environment.mockImplementation(original);
+        });
+      },
+    ],
+  ])("keeps Go to File's Sessions but searches no files for %s", async (_, arrange) => {
+    arrange();
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: null, textSearch: false });
+  });
+
+  it("offers Go to File's text search when the session has content search", async () => {
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props?.textSearch).toBe(true);
+    act(() => goToFile.props?.showTextSearch());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith(
+        "conv_ws",
+        "content-search",
+      ),
+    );
+  });
+
+  it.each([
+    ["off", withFlag(false)],
+    ["omitted", WITHOUT_FLAG],
+  ])("leaves Go to File out, and lists no recent files, when the flag is %s", async (_, info) => {
+    setViewport(DESKTOP);
+    renderShell(info);
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+    expect(readRecentWorkspaceFiles("conv_ws")).toEqual([]);
+  });
+
+  it("leaves Go to File out on a phone", async () => {
+    setViewport(390, "coarse");
+    renderShell(withFlag(true));
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
   });
 
   it("offers ⌘K's Show all pull requests with the flag on, which opens the session's list", async () => {
@@ -583,6 +694,16 @@ describe("workspace_sidebar_v2", () => {
     expect(tabs.host!.onHide).toBeUndefined();
     fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
     expect(drawer).toHaveAttribute("data-state", "closed");
+
+    // Go to File serves the drawer's tabs too, and a resize keeps an open finder mounted.
+    const finder = screen.getByTestId("go-to-file-host");
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws" });
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
+    resizeTo(NARROW_DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "drawer" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
   });
 
   it("opens the Workspace drawer on a page from the session's menu in a narrow window", async () => {

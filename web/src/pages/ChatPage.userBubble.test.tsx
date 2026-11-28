@@ -454,7 +454,7 @@ describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
   it.each([false, true])(
-    "stays visible beside the hover-revealed timestamp and actions (mobile=%s)",
+    "shows the whole footer beside the note until the agent reads it (mobile=%s)",
     (mobile) => {
       vi.stubGlobal("matchMedia", () => ({
         matches: mobile,
@@ -476,16 +476,8 @@ describe("UserBubble awaiting-agent marker", () => {
       expect(actions).toContainElement(screen.getByRole("button", { name: "Copy" }));
       expect(row).toHaveClass("pt-1");
       expect(row?.className).not.toMatch(/opacity|invisible/);
-      if (mobile) {
-        expect(actions).toHaveClass("opacity-100");
-        expect(actions).not.toHaveClass("invisible");
-      } else {
-        expect(actions).toHaveClass(
-          "md:opacity-0",
-          "md:group-hover:opacity-100",
-          "md:group-focus-within:opacity-100",
-        );
-      }
+      expect(actions).toHaveClass("opacity-100");
+      expect(actions?.className).not.toMatch(/invisible|opacity-0/);
       expect(explanation).toHaveClass("truncate");
       expect(explanation.querySelector("svg")).toBeNull();
     },
@@ -514,16 +506,26 @@ describe("UserBubble awaiting-agent marker", () => {
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
+    const hoverReveal = [
+      "md:opacity-0",
+      "md:group-hover:opacity-100",
+      "md:group-focus-within:opacity-100",
+    ];
     const [pending] = buildPendingBubbles([{ tempId: "pend_2", content }], null);
-    const { rerender } = renderBubble(pending!);
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    const { rerender } = renderBubble({ ...pending, createdAtS: 1_762_000_000 });
     expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
+    expect(screen.getByTestId("message-timestamp").parentElement).toHaveClass(...hoverReveal);
     // A promoted bubble drops the marker even if a stale flag were carried over.
     rerender(
       <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-        <BubbleView bubble={userBubble("steer", { awaitingAgent: true })} />
+        <BubbleView
+          bubble={userBubble("steer", { awaitingAgent: true, createdAtS: 1_762_000_000 })}
+        />
       </FileViewerContext.Provider>,
     );
     expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
+    expect(screen.getByTestId("message-timestamp").parentElement).toHaveClass(...hoverReveal);
   });
 });
 

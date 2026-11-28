@@ -17,6 +17,7 @@ import {
   Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
+  PanelsTopLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   SearchIcon,
@@ -141,6 +142,8 @@ interface MobileSessionMenuProps {
   showSideChats: boolean;
   /** Open the mobile side-chats drawer. */
   onOpenSideChats: () => void;
+  /** The gadgets shown beside the session; each opens over it. */
+  gadgets?: readonly { key: string; label: string; onSelect: () => void }[];
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -169,6 +172,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** The URL-owned workspace can lag a warm header switch. */
+  workspaceConversationId?: string | null;
   workingDirectory?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
@@ -369,6 +374,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  workspaceConversationId = conversationId,
   workingDirectory,
   permissionLevel,
   actionConversation = null,
@@ -400,7 +406,7 @@ export function ChatHeader({
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
   // Floating panes give the switch to the chat pane's own strip.
-  const viewToggleHost = useChatPaneViewToggleHost(conversationId);
+  const viewToggleHost = useChatPaneViewToggleHost(workspaceConversationId ?? undefined);
   const info = useServerInfo();
   const overrides = activeUiFeatureOverrides(info);
   const overrideNames = overrides.map(({ label, value }) => `${label} ${value ? "On" : "Off"}`);
@@ -513,6 +519,16 @@ export function ChatHeader({
             Side chats
           </DropdownMenuItem>
         )}
+        {mobileMenu.gadgets?.map((gadget) => (
+          <DropdownMenuItem
+            key={gadget.key}
+            onSelect={gadget.onSelect}
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <PanelsTopLeftIcon className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">{gadget.label}</span>
+          </DropdownMenuItem>
+        ))}
         {/* Shells — the mobile entry into the session's shells
             (desktop has no Shells tab; it opens shells as soft tabs):
             visible when a real shell exists, or when the agent spec

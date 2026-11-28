@@ -15,6 +15,8 @@ export interface PanelSizePreferences {
   commentsPanelWidthPx?: number;
   /** Width for the session panel beside every project's board. */
   projectSessionPanelWidthPx?: number;
+  /** Width for the list of pull requests beside one in the workspace. */
+  pullRequestListWidthPx?: number;
   /** Width for the Files tree docked beside a file in the workspace. */
   filesTreeWidthPx?: number;
   /** The Files tree's share of the page it's docked in, between 0 and 1. */
@@ -31,6 +33,7 @@ const WIDTH_KEYS = [
   "sidebarWidthPx",
   "commentsPanelWidthPx",
   "projectSessionPanelWidthPx",
+  "pullRequestListWidthPx",
   "filesTreeWidthPx",
 ] as const satisfies readonly (keyof PanelSizePreferences)[];
 

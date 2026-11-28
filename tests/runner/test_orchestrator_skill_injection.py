@@ -74,11 +74,15 @@ def test_native_workflow_skills_require_server_flag_and_journal_tools(
 
     # Memory is off so that only the workflow skills vary; the memory skill has its own test.
     with_journal, without = tmp_path / "with", tmp_path / "without"
-    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=False))
+    # Without the gadget and memory tools, so only the workflow skills depend on these settings.
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(gadgets=False, memory=False))
     _ensure_orchestrator_skills_in_bundle(with_journal, spec, workflows_enabled=workflows_enabled)
     _ensure_orchestrator_skills_in_bundle(
         without,
-        AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False, memory=False)),
+        AgentSpec(
+            spec_version=1,
+            tool_groups=ToolGroupsConfig(journal=False, gadgets=False, memory=False),
+        ),
         workflows_enabled=workflows_enabled,
     )
 
@@ -92,7 +96,10 @@ def test_native_workflow_skills_require_server_flag_and_journal_tools(
     disabled_spec = (
         None
         if disabled_by == "missing_spec"
-        else AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False, memory=False))
+        else AgentSpec(
+            spec_version=1,
+            tool_groups=ToolGroupsConfig(journal=False, gadgets=False, memory=False),
+        )
         if disabled_by == "journal"
         else spec
     )
@@ -107,6 +114,30 @@ def test_native_workflow_skills_require_server_flag_and_journal_tools(
         with_journal, disabled_spec, workflows_enabled=disabled_by != "server"
     )
     assert user_skill.read_text() == "User-authored workflow instructions"
+
+
+@pytest.mark.parametrize("workflows_enabled", [False, True])
+def test_native_gadget_skill_follows_the_gadget_tools(
+    tmp_path: Path, workflows_enabled: bool
+) -> None:
+    """The gadget skill comes with the gadget tools, whatever the workflow flag says."""
+    from omnigent.automations_availability import without_gadget_tools
+    from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+
+    with_gadgets, without = tmp_path / "with", tmp_path / "without"
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False, memory=False))
+    _ensure_orchestrator_skills_in_bundle(with_gadgets, spec, workflows_enabled=workflows_enabled)
+    assert (with_gadgets / "skills" / "gadget" / "SKILL.md").is_file()
+
+    # A server without gadgets: the runner turns the tool group off, and a reused bundle
+    # loses the link.
+    stripped = without_gadget_tools(spec)
+    _ensure_orchestrator_skills_in_bundle(without, stripped, workflows_enabled=workflows_enabled)
+    _ensure_orchestrator_skills_in_bundle(
+        with_gadgets, stripped, workflows_enabled=workflows_enabled
+    )
+    for bundle in (with_gadgets, without):
+        assert [p.name for p in (bundle / "skills").iterdir()] == [SKILL_NAME]
 
 
 @pytest.mark.parametrize("workflows_enabled", [False, True])

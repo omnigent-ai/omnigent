@@ -1,10 +1,15 @@
-"""Unit coverage for captured mock-LLM request inspection."""
+"""Unit coverage for mock-LLM readiness and captured request inspection."""
 
 from __future__ import annotations
 
+import socket
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
 
-from tests._helpers.mock_llm import captured_tool_result, tool_result_text
+from tests._helpers.mock_llm import captured_tool_result, mock_llm_answers, tool_result_text
 
 
 def _messages_result(content: object, call_id: str = "call-1", is_error: object = None) -> dict:
@@ -90,3 +95,57 @@ def test_tool_result_text_formats_payload_and_error_flag(
     payload: object, error: object, expected: str
 ) -> None:
     assert tool_result_text(payload, error=error) == expected
+
+
+class _StatsHandler(BaseHTTPRequestHandler):
+    """Answers ``/stats`` 200 and other paths 404, or drops the connection while *booting*."""
+
+    booting = False
+
+    def do_GET(self) -> None:
+        if type(self).booting:
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
+        if self.path != "/stats":
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *_args: object) -> None:
+        """Keep the test output quiet."""
+
+
+@pytest.fixture
+def stats_server() -> Iterator[tuple[str, type[_StatsHandler]]]:
+    """A local ``/stats`` endpoint whose handler class sets whether it's still booting."""
+    handler = type("StatsHandler", (_StatsHandler,), {"booting": False})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", handler
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_mock_llm_answers_once_stats_replies(stats_server) -> None:
+    base_url, _handler = stats_server
+    assert mock_llm_answers(base_url) is True
+
+
+def test_mock_llm_answers_not_yet_when_the_server_drops_the_request(stats_server) -> None:
+    base_url, handler = stats_server
+    handler.booting = True
+    assert mock_llm_answers(base_url) is False
+
+
+def test_mock_llm_answers_not_yet_when_nothing_listens() -> None:
+    # Held bound but not listening, so no other process can take the port meanwhile.
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+        assert mock_llm_answers(f"http://127.0.0.1:{port}") is False

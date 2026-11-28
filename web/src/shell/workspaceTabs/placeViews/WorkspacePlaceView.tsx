@@ -237,7 +237,9 @@ function FilesPlaceView({
     >
       {place.path === undefined ? (
         <div className={cn("flex flex-col bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)}>
-          <div className={cn(WORKSPACE_TOOLBAR_CLASS, WORKSPACE_SIDEBAR_LAYOUT.toolbar)}>
+          <div
+            className={cn(WORKSPACE_TOOLBAR_CLASS, "justify-end", WORKSPACE_SIDEBAR_LAYOUT.toolbar)}
+          >
             {treeToggle}
           </div>
           <div
@@ -271,7 +273,7 @@ function FilesPlaceView({
           path={place.path}
           position={shownPosition}
           active={active}
-          toolbarLeading={treeToggle}
+          toolbarTrailing={treeToggle}
           registerLeaveGuard={registerLeaveGuard}
           permissionLevel={files.permissionLevel}
           commentId={place.comment}
@@ -329,7 +331,8 @@ function ChangesPlaceView({
             place.comparison ??
             (range ? { kind: "typed", base: range.base, head: range.head ?? "" } : undefined)
           }
-          onComparisonShown={(shown, { step }) => run(changesComparisonShown(place, shown, step))}
+          comparisonRoot={place.comparisonRoot ?? null}
+          onComparisonShown={(shown, options) => run(changesComparisonShown(place, shown, options))}
           landing={landing}
           active={active}
           sort={files.sort}

@@ -1,5 +1,6 @@
-// The diff review's toolbar: the file tree toggle, how many files and lines
-// changed, and the view controls. Each control runs a shared review command.
+// The diff review's toolbar: what changed (files and lines) at the left, then the view
+// controls, and last the toggle of the file tree docked below it at the right. Each control
+// runs a shared review command.
 // A narrow review gathers the view controls into one menu, and anything that
 // still doesn't fit wraps onto a second row instead of being clipped.
 
@@ -64,8 +65,8 @@ export interface DiffReviewToolbarProps {
   /** The source's own controls, after the review's. */
   extra?: ReactNode;
   /**
-   * The source's progress, just left of the line counts: they and everything after them stay
-   * put as it comes and goes. See `DiffReviewToolbarProgress`.
+   * The source's progress, first of the controls at the right: they stay put as it comes and
+   * goes. See `DiffReviewToolbarProgress`.
    */
   status?: ReactNode;
   /** Gathers the view controls into a "More view options" menu, for a narrow review. */
@@ -117,12 +118,22 @@ export function DiffReviewToolbar({
       aria-label="Diff review"
       className="flex min-h-9 shrink-0 flex-wrap items-center gap-x-1 gap-y-0.5 border-b border-border px-2 py-0.5 text-ui"
     >
-      {tree && <TreeToggle command={tree} popover={treePopover} />}
       <span
-        className="whitespace-nowrap text-muted-foreground"
+        className="pl-1 whitespace-nowrap text-muted-foreground"
         data-testid="diff-review-file-count"
       >
         {fileCount} {fileCount === 1 ? "file" : "files"}
+      </span>
+      <span className="flex items-center tabular-nums whitespace-nowrap">
+        <LanguageBreakdown
+          command={byId.get("show-language-breakdown")}
+          breakdown={breakdown}
+          filters={filters}
+          dispatchFilter={dispatchFilter}
+          open={languagesOpen}
+          onOpenChange={setLanguagesOpen}
+          restoreFocus={reviewActive}
+        />
       </span>
       {comparison ?? (base && <DiffReviewBaseMenu base={base} />)}
       {ownedFiles?.pressed && (
@@ -138,18 +149,7 @@ export function DiffReviewToolbar({
           }}
         />
       )}
-      <span className="ml-auto flex items-center gap-2 pr-1 tabular-nums whitespace-nowrap">
-        {status}
-        <LanguageBreakdown
-          command={byId.get("show-language-breakdown")}
-          breakdown={breakdown}
-          filters={filters}
-          dispatchFilter={dispatchFilter}
-          open={languagesOpen}
-          onOpenChange={setLanguagesOpen}
-          restoreFocus={reviewActive}
-        />
-      </span>
+      <span className="ml-auto flex items-center pr-1">{status}</span>
       {filter && (
         <DropdownMenu open={filtersOpen} onOpenChange={setFiltersOpen}>
           <Tooltip>
@@ -203,6 +203,7 @@ export function DiffReviewToolbar({
           {extra}
         </span>
       )}
+      {tree && <TreeToggle command={tree} popover={treePopover} />}
     </div>
   );
 }

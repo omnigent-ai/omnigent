@@ -2463,16 +2463,6 @@ export function DiffReview<A = undefined>({
             <DiffReviewToolbar {...toolbarProps} />
           )}
           <div ref={bodyRef} className="relative flex min-h-0 flex-1">
-            {treeDocked && (
-              <div
-                data-diff-review-tree-column
-                style={{ width: `${treeColumn.width}px` }}
-                className="relative shrink-0 border-r border-border"
-              >
-                <PaneResizeHandle resize={treeColumn} testId="diff-review-tree-resize-handle" />
-                {renderTree()}
-              </div>
-            )}
             <div data-diff-review-content className="relative min-w-0 flex-1">
               {findOpen && (
                 <div className="pointer-events-none absolute top-2 right-4 z-20 flex max-w-[calc(100%-2rem)] justify-end">
@@ -2516,10 +2506,25 @@ export function DiffReview<A = undefined>({
               )}
               {body}
             </div>
+            {/* The tree docks at the right, so showing or hiding it leaves the code in place. */}
+            {treeDocked && (
+              <div
+                data-diff-review-tree-column
+                style={{ width: `${treeColumn.width}px` }}
+                className="relative shrink-0 border-l border-border"
+              >
+                <PaneResizeHandle
+                  resize={treeColumn}
+                  side="left"
+                  testId="diff-review-tree-resize-handle"
+                />
+                {renderTree()}
+              </div>
+            )}
           </div>
         </div>
         <PopoverContent
-          align="start"
+          align="end"
           collisionPadding={8}
           className={cn("h-96 p-0", treePopoverFullWidth ? "w-[calc(100vw-1rem)]" : "w-72")}
           data-layout={treePopoverFullWidth ? "full-width" : "anchored"}

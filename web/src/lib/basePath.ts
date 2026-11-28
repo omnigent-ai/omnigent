@@ -22,6 +22,8 @@ declare global {
   interface Window {
     /** Public base path injected by the server, e.g. `"/proxy/6767"`. */
     __OMNIGENT_BASE_PATH__?: string;
+    /** Where the server's API lives when it isn't under the app's base path. */
+    __OMNIGENT_API_BASE_PATH__?: string;
   }
 }
 
@@ -31,7 +33,20 @@ declare global {
  */
 export function getBasePath(): string {
   if (typeof window === "undefined") return "";
-  const raw = window.__OMNIGENT_BASE_PATH__;
+  return normalizeBasePath(window.__OMNIGENT_BASE_PATH__);
+}
+
+/**
+ * Where the server's API lives: the separate API base when one is injected,
+ * else the app's base path. Data kept per server is keyed by it.
+ */
+export function getApiBasePath(): string {
+  if (typeof window === "undefined") return "";
+  const apiBase = window.__OMNIGENT_API_BASE_PATH__;
+  return typeof apiBase === "string" ? normalizeBasePath(apiBase) : getBasePath();
+}
+
+function normalizeBasePath(raw: unknown): string {
   if (typeof raw !== "string") return "";
   const trimmed = raw.trim();
   if (trimmed === "" || trimmed === "/") return "";

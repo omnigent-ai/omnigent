@@ -81,6 +81,7 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { leaveSessionView } from "./sessionCommands/archiveNavigation";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
@@ -245,8 +246,9 @@ export function HeaderConversationMenu({
     // the cached `archived` flag in onMutate), and we're viewing the session
     // being archived, so leave its chat surface now — synchronously, like
     // confirmDelete — rather than in an onSuccess callback that fires a
-    // round-trip later with a stale active session.
-    navigate("/", { replace: true });
+    // round-trip later with a stale active session. With quick_pick_palette it opens the
+    // session ⌃[ would, as ⌘K's and the sidebar's Archive do.
+    leaveSessionView("archive", { conversation, source: "header_menu", navigate, queryClient });
     archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
     // and per-call mutate callbacks don't fire once their observer unmounts.

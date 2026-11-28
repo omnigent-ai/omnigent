@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { publishShownReview, resetShownReviewsForTests } from "@/lib/reviewFileLinks";
+import {
+  sessionChoiceCount,
+  workingCopyComparisonsAt,
+  workspaceKeyOf,
+} from "@/lib/workingCopyComparisons";
 
 import type { WorkspaceTab } from "./workspaceTab";
 import { saveWorkspaceTabsSession } from "./workspaceTabsPersistence";
@@ -485,5 +490,15 @@ describe("a file's cited lines", () => {
     session.store.select(fileTab("a.md").id);
     session.store.select(tabId);
     expect(session.fileRequest(tabId)?.position).toEqual({ line: 50 });
+  });
+});
+
+describe("a tab's landing", () => {
+  it("counts a comparison chosen in a folder's review as the session's choice", async () => {
+    const { store } = workspaceTabsSession("s1");
+    workingCopyComparisonsAt(".worktrees/feature", workspaceKeyOf("host_1", "/repo")).chose("s1");
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    expect(store.landing(store.selectedTabId()!)?.choices).toBe(sessionChoiceCount("s1"));
+    expect(sessionChoiceCount("s1")).toBeGreaterThan(0);
   });
 });

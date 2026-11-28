@@ -68,6 +68,7 @@ from tests._helpers.compat import (
     runner_executable,
     server_executable,
 )
+from tests._helpers.mock_llm import mock_llm_answers
 from tests._helpers.native_session import create_native_session
 from tests._helpers.operator_agents import operator_agent_store, post_operator_session
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
@@ -621,13 +622,8 @@ def mock_llm_server_url(
     # Wait for the mock server to be ready
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
-            if resp.status_code == 200:
-                break
-        except httpx.ConnectError:
-            # Expected while the mock server is still booting.
-            pass
+        if mock_llm_answers(base_url):
+            break
         time.sleep(0.1)
     else:
         proc.kill()

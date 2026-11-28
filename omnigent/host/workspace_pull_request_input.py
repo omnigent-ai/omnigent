@@ -11,7 +11,10 @@ from typing import Any
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 
+from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
+from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 from omnigent.runner import pr_resource
+from omnigent.runner.github_lookup import MAX_PULL_REQUEST_URLS
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
     COMMENT_REVIEW_EVENT,
@@ -21,6 +24,8 @@ from omnigent.runner.github_review_fields import (
     SHA256,
     VERDICT_STATES,
 )
+from omnigent.runner.github_search import MAX_REVIEWERS
+from omnigent.runner.pr_actions import AUTO_MERGE_BATCH_LIMIT
 
 # The largest pull request attachment, a video; the runner checks each type's own limit.
 # The call frame carries it base64-encoded, a third larger, under the tunnel's message cap.
@@ -28,6 +33,17 @@ MAX_ATTACHMENT_BYTES = pr_resource.MAX_VIDEO_ATTACHMENT_BYTES
 # Caps on an upload's other fields, so the largest allowed call still fits one frame.
 MAX_ATTACHMENT_NAME_CHARACTERS = 255
 MAX_PULL_REQUEST_URL_CHARACTERS = 2048
+# GitHub label names are at most 50 characters; a search needs no more than a few.
+MAX_LABEL_SEARCH_CHARACTERS = 256
+# A login or team name is far shorter; the same cap bounds the other searches.
+MAX_SEARCH_CHARACTERS = MAX_LABEL_SEARCH_CHARACTERS
+_COMPLETION_KINDS = frozenset({pb.COMPLETION_KIND_MENTION, pb.COMPLETION_KIND_REFERENCE})
+MAX_IMAGE_URL_CHARACTERS = 2048
+# A ref name's limit on common filesystems.
+MAX_BRANCH_NAME_BYTES = 255
+_LONG_PULL_REQUEST_URL = (
+    f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
+)
 
 # Each review method's allowed events; the others carry none.
 _EVENTS: dict[str, frozenset[str]] = {
@@ -60,6 +76,20 @@ class PullRequestRefused(ConnectError):
         self.reason = reason
 
 
+def _auto_merge_refusal(request: Any) -> str | None:
+    """Why an auto-merge batch can't be vouched for, before the server checks each PR."""
+    if not 1 <= len(request.pull_requests) <= AUTO_MERGE_BATCH_LIMIT:
+        return f"Enable auto-merge for 1 to {AUTO_MERGE_BATCH_LIMIT} pull requests at once"
+    for item in request.pull_requests:
+        if not item.pr_url:
+            return "Name each pull request to merge automatically"
+        if len(item.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+            return (
+                f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
+            )
+    return None
+
+
 def refuse_unserved_request(method: str, request: Any) -> None:
     """Refuse a request for something this API doesn't do, before any other work.
 
@@ -78,17 +108,37 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         # Without an account the merge would run as the saved one, not the confirmed one.
         if not request.account.strip():
             reason = "Expected an account to merge as"
-    elif method == "ListLabels" and request.text:
-        reason = "Label search isn't available on this host"
+    elif method == "ListLabels" and len(request.text) > MAX_LABEL_SEARCH_CHARACTERS:
+        reason = f"The label search is longer than {MAX_LABEL_SEARCH_CHARACTERS} characters"
+    elif method in {"SearchReviewers", "SearchCompletions"}:
+        reason = _search_refusal(method, request)
+    elif method == "LookupPullRequest":
+        reason = _named_url_refusal(request.pr_url)
+    elif method == "GetPullRequestListStats":
+        reason = _list_stats_refusal(request.pr_urls)
+    elif method == "ListBranchPullRequests":
+        reason = _branch_refusal(request.branch)
+    elif (
+        method == "GetPullRequestNativeStack"
+        and len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS
+    ):
+        reason = _LONG_PULL_REQUEST_URL
+    elif method == "EnableAutoMerge":
+        reason = _auto_merge_refusal(request)
+    elif method == "ReadPullRequestImage":
+        if not request.image_url:
+            reason = "Expected an image URL"
+        elif len(request.image_url) > MAX_IMAGE_URL_CHARACTERS:
+            reason = f"The image URL is longer than {MAX_IMAGE_URL_CHARACTERS} characters"
+        elif len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+            reason = _LONG_PULL_REQUEST_URL
     elif method == "UploadAttachment":
         if not request.name.strip():
             reason = "Expected the file's name"
         elif len(request.name) > MAX_ATTACHMENT_NAME_CHARACTERS:
             reason = f"The file's name is longer than {MAX_ATTACHMENT_NAME_CHARACTERS} characters"
         elif len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
-            reason = (
-                f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
-            )
+            reason = _LONG_PULL_REQUEST_URL
         elif not request.content:
             reason = "The attachment is empty"
         elif len(request.content) > MAX_ATTACHMENT_BYTES:
@@ -97,6 +147,48 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         reason = _review_refusal(method, request)
     if reason is not None:
         raise PullRequestRefused(Code.INVALID_ARGUMENT, reason, INVALID_INPUT_REASON)
+
+
+def _search_refusal(method: str, request: Any) -> str | None:
+    """Why a reviewer or completion search's fields are malformed, or ``None``."""
+    if len(request.text) > MAX_SEARCH_CHARACTERS:
+        return f"The search is longer than {MAX_SEARCH_CHARACTERS} characters"
+    if len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+        return _LONG_PULL_REQUEST_URL
+    if method == "SearchReviewers" and not 0 <= request.page_size <= MAX_REVIEWERS:
+        return f"Ask for at most {MAX_REVIEWERS} reviewers"
+    if method == "SearchCompletions" and request.kind not in _COMPLETION_KINDS:
+        return "Choose what to complete: people or pull requests"
+    return None
+
+
+def _named_url_refusal(pr_url: str) -> str | None:
+    if not pr_url:
+        return "Expected a pull request URL"
+    if len(pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+        return _LONG_PULL_REQUEST_URL
+    return None
+
+
+def _list_stats_refusal(pr_urls: Any) -> str | None:
+    """Why a list-stats read can't be sent: no URLs, too many, or one empty or too long."""
+    if not 1 <= len(pr_urls) <= MAX_PULL_REQUEST_URLS:
+        return f"Ask for 1 to {MAX_PULL_REQUEST_URLS} pull requests"
+    return next(filter(None, (_named_url_refusal(url) for url in pr_urls)), None)
+
+
+def _branch_refusal(branch: str) -> str | None:
+    """Why ``branch`` can't name a branch, by git's ref rules and its length limit."""
+    if len(branch.encode()) > MAX_BRANCH_NAME_BYTES:
+        return f"The branch name is longer than {MAX_BRANCH_NAME_BYTES} bytes"
+    # ``git check-ref-format --branch`` refuses it; it names the checkout, not a branch.
+    if branch == "HEAD":
+        return "branch name must not be 'HEAD'"
+    try:
+        validate_branch_name(branch)
+    except WorktreeError as exc:
+        return str(exc)
+    return None
 
 
 def _review_refusal(method: str, request: Any) -> str | None:

@@ -71,15 +71,20 @@ export function changedFileViewed(path: string): PlaceViewAction {
   return { type: "open", link: { place: { kind: "files", path } }, options: USER };
 }
 
-/** The comparison the session shows, kept on the visit: a step when the person picked it. */
+/**
+ * The comparison the session shows, kept on the visit with the folder whose review shows it
+ * (`root`, null for the workspace): a step when the person picked it.
+ */
 export function changesComparisonShown(
   current: ChangesPlace,
   comparison: ComparisonChoice,
-  step: boolean,
+  { step, root }: { step: boolean; root: string | null },
 ): PlaceViewAction {
   // The recorded comparison replaces a link's range, which would otherwise outlive it.
-  const { range: _range, ...rest } = current;
-  return { type: "navigate", place: { ...rest, comparison }, replace: !step };
+  const { range: _range, comparisonRoot: _root, ...rest } = current;
+  const place: ChangesPlace = { ...rest, comparison };
+  if (root !== null) place.comparisonRoot = root;
+  return { type: "navigate", place, replace: !step };
 }
 
 /** Leaves a comparison a link asked for, for the session's own, keeping the file. */
@@ -103,6 +108,7 @@ export function changesFileInNewTab(
   const place: ChangesPlace = { kind: "changes", path, fileTab: true };
   if (current.range) place.range = current.range;
   if (current.comparison) place.comparison = current.comparison;
+  if (current.comparisonRoot !== undefined) place.comparisonRoot = current.comparisonRoot;
   return {
     type: "open",
     link: { place },
@@ -124,6 +130,7 @@ export function changesOverview(current: ChangesPlace): PlaceViewAction {
       kind: "changes",
       ...(current.range ? { range: current.range } : {}),
       ...(current.comparison ? { comparison: current.comparison } : {}),
+      ...(current.comparisonRoot !== undefined ? { comparisonRoot: current.comparisonRoot } : {}),
     },
     replace: false,
   };

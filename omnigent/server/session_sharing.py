@@ -12,6 +12,8 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_READ,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
@@ -30,6 +32,9 @@ SCHEDULED_TASK_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 # Levels a saved workflow may grant: people it is shared with view, run and copy it.
 # The permission store enforces it; widening it needs no migration.
 WORKFLOW_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
+
+# Levels a gadget may grant: Can view, Can edit (records and versions) and Can manage.
+GADGET_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE})
 
 
 def is_reserved_grantee(user_id: str) -> bool:

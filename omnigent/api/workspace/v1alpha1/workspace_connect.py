@@ -21,7 +21,7 @@ from connectrpc.protocol import ProtocolType
 from connectrpc.server import ConnectASGIApplication, ConnectWSGIApplication, DEFAULT_READ_MAX_BYTES, Endpoint, EndpointSync
 from pyqwest import Client, SyncClient
 
-from .workspace_pb2 import AddPendingReviewCommentRequest, AddPendingReviewCommentResponse, AddReactionRequest, AddReactionResponse, ComparePullRequestRangeRequest, ComparePullRequestRangeResponse, CreateCommentRequest, CreateCommentResponse, CreateReviewThreadRequest, CreateReviewThreadResponse, DeleteCommentRequest, DeleteCommentResponse, DeletePendingReviewCommentRequest, DeletePendingReviewCommentResponse, DequeuePullRequestRequest, DequeuePullRequestResponse, DisableAutoMergeRequest, DisableAutoMergeResponse, DiscardPendingReviewRequest, DiscardPendingReviewResponse, EditCommentRequest, EditCommentResponse, EnableAutoMergeRequest, EnableAutoMergeResponse, EnqueuePullRequestRequest, EnqueuePullRequestResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetCommitDiffRequest, GetCommitDiffResponse, GetMergeOptionsRequest, GetMergeOptionsResponse, GetMergeQueueRequest, GetMergeQueueResponse, GetMergeReadinessRequest, GetMergeReadinessResponse, GetPendingReviewRequest, GetPendingReviewResponse, GetPullRequestDiffRequest, GetPullRequestDiffResponse, GetPullRequestListStatsRequest, GetPullRequestListStatsResponse, GetPullRequestRequest, GetPullRequestResponse, GetPullRequestStackRequest, GetPullRequestStackResponse, ListBranchCommitsRequest, ListBranchCommitsResponse, ListBranchPullRequestsRequest, ListBranchPullRequestsResponse, ListDirectoryRequest, ListDirectoryResponse, ListLabelsRequest, ListLabelsResponse, ListPullRequestCommitsRequest, ListPullRequestCommitsResponse, ListPullRequestFilesRequest, ListPullRequestFilesResponse, ListRepositoryRefsRequest, ListRepositoryRefsResponse, ListReviewThreadCommentsRequest, ListReviewThreadCommentsResponse, ListReviewThreadsRequest, ListReviewThreadsResponse, ListReviewerCandidatesRequest, ListReviewerCandidatesResponse, ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse, LookupPullRequestRequest, LookupPullRequestResponse, MergePullRequestAsAccountRequest, MergePullRequestAsAccountResponse, MergePullRequestRequest, MergePullRequestResponse, PreviewReviewerPingRequest, PreviewReviewerPingResponse, ReadBaseFileRequest, ReadBaseFileResponse, ReadFileRequest, ReadFileResponse, ReadLinkTextRequest, ReadLinkTextResponse, ReadPullRequestImageRequest, ReadPullRequestImageResponse, RemoveReactionRequest, RemoveReactionResponse, ReplyToReviewThreadRequest, ReplyToReviewThreadResponse, ResolveRepositoryContextRequest, ResolveRepositoryContextResponse, ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse, SearchCompletionsRequest, SearchCompletionsResponse, SearchFilesRequest, SearchFilesResponse, SearchReviewersRequest, SearchReviewersResponse, SearchTextRequest, SearchTextResponse, SendReviewerPingRequest, SendReviewerPingResponse, SetPullRequestAccountRequest, SetPullRequestAccountResponse, SetPullRequestDraftRequest, SetPullRequestDraftResponse, SetPullRequestStateRequest, SetPullRequestStateResponse, SetReviewThreadResolvedRequest, SetReviewThreadResolvedResponse, StartPendingReviewRequest, StartPendingReviewResponse, StatPathRequest, StatPathResponse, SubmitPendingReviewRequest, SubmitPendingReviewResponse, SubmitReviewRequest, SubmitReviewResponse, SubmitReviewVerdictRequest, SubmitReviewVerdictResponse, UpdateLabelsRequest, UpdateLabelsResponse, UpdatePendingReviewCommentRequest, UpdatePendingReviewCommentResponse, UpdatePullRequestDetailsRequest, UpdatePullRequestDetailsResponse, UpdateReviewersRequest, UpdateReviewersResponse, UploadAttachmentRequest, UploadAttachmentResponse
+from .workspace_pb2 import AddPendingReviewCommentRequest, AddPendingReviewCommentResponse, AddReactionRequest, AddReactionResponse, ComparePullRequestRangeRequest, ComparePullRequestRangeResponse, CreateCommentRequest, CreateCommentResponse, CreateReviewThreadRequest, CreateReviewThreadResponse, DeleteCommentRequest, DeleteCommentResponse, DeletePendingReviewCommentRequest, DeletePendingReviewCommentResponse, DequeuePullRequestRequest, DequeuePullRequestResponse, DisableAutoMergeRequest, DisableAutoMergeResponse, DiscardPendingReviewRequest, DiscardPendingReviewResponse, EditCommentRequest, EditCommentResponse, EnableAutoMergeRequest, EnableAutoMergeResponse, EnqueuePullRequestRequest, EnqueuePullRequestResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetCommitDiffRequest, GetCommitDiffResponse, GetMergeOptionsRequest, GetMergeOptionsResponse, GetMergeQueueRequest, GetMergeQueueResponse, GetMergeReadinessRequest, GetMergeReadinessResponse, GetPendingReviewRequest, GetPendingReviewResponse, GetPullRequestDiffRequest, GetPullRequestDiffResponse, GetPullRequestListStatsRequest, GetPullRequestListStatsResponse, GetPullRequestNativeStackRequest, GetPullRequestNativeStackResponse, GetPullRequestRequest, GetPullRequestResponse, GetPullRequestStackRequest, GetPullRequestStackResponse, ListBranchCommitsRequest, ListBranchCommitsResponse, ListBranchPullRequestsRequest, ListBranchPullRequestsResponse, ListDirectoryRequest, ListDirectoryResponse, ListLabelsRequest, ListLabelsResponse, ListPullRequestCommitsRequest, ListPullRequestCommitsResponse, ListPullRequestFilesRequest, ListPullRequestFilesResponse, ListRepositoryRefsRequest, ListRepositoryRefsResponse, ListReviewThreadCommentsRequest, ListReviewThreadCommentsResponse, ListReviewThreadsRequest, ListReviewThreadsResponse, ListReviewerCandidatesRequest, ListReviewerCandidatesResponse, ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse, LookupPullRequestRequest, LookupPullRequestResponse, MergePullRequestAsAccountRequest, MergePullRequestAsAccountResponse, MergePullRequestRequest, MergePullRequestResponse, PreviewReviewerPingRequest, PreviewReviewerPingResponse, ReadBaseFileRequest, ReadBaseFileResponse, ReadFileRequest, ReadFileResponse, ReadLinkTextRequest, ReadLinkTextResponse, ReadPullRequestImageRequest, ReadPullRequestImageResponse, RemoveReactionRequest, RemoveReactionResponse, ReplyToReviewThreadRequest, ReplyToReviewThreadResponse, ResolveRepositoryContextRequest, ResolveRepositoryContextResponse, ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse, SearchCompletionsRequest, SearchCompletionsResponse, SearchFilesRequest, SearchFilesResponse, SearchReviewersRequest, SearchReviewersResponse, SearchTextRequest, SearchTextResponse, SendReviewerPingRequest, SendReviewerPingResponse, SetPullRequestAccountRequest, SetPullRequestAccountResponse, SetPullRequestDraftRequest, SetPullRequestDraftResponse, SetPullRequestStateRequest, SetPullRequestStateResponse, SetReviewThreadResolvedRequest, SetReviewThreadResolvedResponse, StartPendingReviewRequest, StartPendingReviewResponse, StatPathRequest, StatPathResponse, SubmitPendingReviewRequest, SubmitPendingReviewResponse, SubmitReviewRequest, SubmitReviewResponse, SubmitReviewVerdictRequest, SubmitReviewVerdictResponse, UpdateLabelsRequest, UpdateLabelsResponse, UpdatePendingReviewCommentRequest, UpdatePendingReviewCommentResponse, UpdatePullRequestDetailsRequest, UpdatePullRequestDetailsResponse, UpdateReviewersRequest, UpdateReviewersResponse, UploadAttachmentRequest, UploadAttachmentResponse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Iterator, Mapping
@@ -332,6 +332,12 @@ class WorkspaceService(Protocol):
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
+    async def get_pull_request_native_stack(self, request: GetPullRequestNativeStackRequest, ctx: RequestContext[GetPullRequestNativeStackRequest, GetPullRequestNativeStackResponse], /) -> GetPullRequestNativeStackResponse:
+        """
+        GitHub's own record of the stack this pull request is in, where its host has stacks.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
     async def list_branch_pull_requests(self, request: ListBranchPullRequestsRequest, ctx: RequestContext[ListBranchPullRequestsRequest, ListBranchPullRequestsResponse], /) -> ListBranchPullRequestsResponse:
         """
         The pull requests for a branch of the workspace's own repository.
@@ -352,7 +358,11 @@ class WorkspaceService(Protocol):
 
     def read_pull_request_image(self, request: ReadPullRequestImageRequest, ctx: RequestContext[ReadPullRequestImageRequest, ReadPullRequestImageResponse], /) -> AsyncIterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -977,6 +987,17 @@ class WorkspaceServiceASGIApplication(ConnectASGIApplication[WorkspaceService]):
                         stream_type=StreamType.UNARY,
                     ),
                     function=svc.get_pull_request_stack,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPullRequestNativeStack": Endpoint.unary(
+                    method=MethodInfo(
+                        name="GetPullRequestNativeStack",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPullRequestNativeStackRequest,
+                        output=GetPullRequestNativeStackResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.get_pull_request_native_stack,
                 ),
                 "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListBranchPullRequests": Endpoint.unary(
                     method=MethodInfo(
@@ -2365,6 +2386,31 @@ class WorkspaceServiceClient(ConnectClient):
             timeout_ms=timeout_ms,
             use_get=use_get,
         )
+    async def get_pull_request_native_stack(
+        self,
+        request: GetPullRequestNativeStackRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPullRequestNativeStackResponse:
+        """
+        GitHub's own record of the stack this pull request is in, where its host has stacks.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPullRequestNativeStack",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPullRequestNativeStackRequest,
+                output=GetPullRequestNativeStackResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
     async def list_branch_pull_requests(
         self,
         request: ListBranchPullRequestsRequest,
@@ -2446,7 +2492,11 @@ class WorkspaceServiceClient(ConnectClient):
         timeout_ms: int | None = None,
     ) -> AsyncIterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         return self.execute_server_stream(
             request=request,
@@ -3062,6 +3112,12 @@ class WorkspaceServiceSync(Protocol):
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
+    def get_pull_request_native_stack(self, request: GetPullRequestNativeStackRequest, ctx: RequestContext[GetPullRequestNativeStackRequest, GetPullRequestNativeStackResponse], /) -> GetPullRequestNativeStackResponse:
+        """
+        GitHub's own record of the stack this pull request is in, where its host has stacks.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
     def list_branch_pull_requests(self, request: ListBranchPullRequestsRequest, ctx: RequestContext[ListBranchPullRequestsRequest, ListBranchPullRequestsResponse], /) -> ListBranchPullRequestsResponse:
         """
         The pull requests for a branch of the workspace's own repository.
@@ -3082,7 +3138,11 @@ class WorkspaceServiceSync(Protocol):
 
     def read_pull_request_image(self, request: ReadPullRequestImageRequest, ctx: RequestContext[ReadPullRequestImageRequest, ReadPullRequestImageResponse], /) -> Iterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -3705,6 +3765,17 @@ class WorkspaceServiceWSGIApplication(ConnectWSGIApplication):
                         stream_type=StreamType.UNARY,
                     ),
                     function=service.get_pull_request_stack,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPullRequestNativeStack": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="GetPullRequestNativeStack",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPullRequestNativeStackRequest,
+                        output=GetPullRequestNativeStackResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.get_pull_request_native_stack,
                 ),
                 "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListBranchPullRequests": EndpointSync.unary(
                     method=MethodInfo(
@@ -5093,6 +5164,31 @@ class WorkspaceServiceClientSync(ConnectClientSync):
             timeout_ms=timeout_ms,
             use_get=use_get,
         )
+    def get_pull_request_native_stack(
+        self,
+        request: GetPullRequestNativeStackRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPullRequestNativeStackResponse:
+        """
+        GitHub's own record of the stack this pull request is in, where its host has stacks.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPullRequestNativeStack",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPullRequestNativeStackRequest,
+                output=GetPullRequestNativeStackResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
     def list_branch_pull_requests(
         self,
         request: ListBranchPullRequestsRequest,
@@ -5174,7 +5270,11 @@ class WorkspaceServiceClientSync(ConnectClientSync):
         timeout_ms: int | None = None,
     ) -> Iterator[ReadPullRequestImageResponse]:
         """
-        Streams an image the pull request links to: its metadata, then its bytes.
+        Streams an attachment image on the pull request's host: its metadata, then its bytes.
+        Only the session's owner may call it. A caller that leaves early may hold one of the
+        host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+        system resolver gives up. A client may keep an image in memory, keyed by
+        `(pr_url, image_url)`, for as long as the page that shows it stays open.
         """
         return self.execute_server_stream(
             request=request,

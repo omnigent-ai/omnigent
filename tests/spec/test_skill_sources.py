@@ -1089,8 +1089,10 @@ def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
     )
     assert out == []
     rejection = next(m for m in caplog.messages if "outside the trusted roots" in m)
-    assert str((cfg / "plugins").resolve()) in rejection
-    assert str((tmp_path / "shared-cache").resolve()) in rejection
+    assert "sp@mkt" in rejection
+    assert str(install) not in rejection
+    assert str((cfg / "plugins").resolve()) not in rejection
+    assert str((tmp_path / "shared-cache").resolve()) not in rejection
 
 
 @pytest.mark.parametrize("cache_link", ["loop", "dangling", "loop_then_parent"])
@@ -1959,7 +1961,7 @@ def test_framework_skills_gate_each_on_its_own_tool_group(
     memory_on: bool, workflows_enabled: bool
 ) -> None:
     """Workflow skills need the workflows flag; the memory skill needs only its tool group."""
-    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=memory_on))
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=memory_on, gadgets=False))
 
     names = {s.name for s in framework_skills(spec, workflows_enabled=workflows_enabled)}
 

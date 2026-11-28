@@ -106,6 +106,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "project_repository_creation": True,
         "quick_pick_palette": False,
         "workspace_sidebar_v2": False,
+        "gadgets": False,
         # Off: it follows workspace_sidebar_v2 while no deployment names it.
         "floating_panes": False,
         "session_orchestration": True,
@@ -119,6 +120,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "pull_requests_v2": False,
     }
     assert data["sibling_sessions"] is True
+    # Gadgets are off: the top-level capabilities the web reads say so too.
+    assert data["gadgets"] is False
+    assert data["gadget_sharing"] is False
+    assert data["gadget_copy"] is False
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank
@@ -138,6 +143,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
+    # Without it, the automation dialog keeps new sandbox sessions hourly.
+    assert data["scheduled_task_subhour_new_sandbox"] is True
     # The one_time_automations release feature is off by default.
     assert data["scheduled_task_one_time"] is False
     # Lets the trigger form save its header; older servers would send it to the model.

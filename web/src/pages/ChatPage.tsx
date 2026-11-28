@@ -1,5 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
+import { useWarmSwitchConversationId } from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -157,6 +158,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { quoteTextStart, settleQuoteLines } from "@/lib/replyDraftDocument";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -228,6 +230,11 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
+import {
+  GADGET_FULL_SCREEN_PARAM,
+  gadgetCoversConversation,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -251,7 +258,7 @@ import {
   subscribeSessionHostChanges,
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
-import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
+import { MobileHeaderControlPortal, SessionControlPortal } from "@/shell/MobileHeaderControlsSlot";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -294,6 +301,11 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import {
+  type GadgetComposerQuote,
+  retryGadgetComposerQuotes,
+  useGadgetComposerQuotes,
+} from "@/lib/gadgetComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -453,19 +465,29 @@ export function BtwSidechatAnswer({ answer }: { answer: string }) {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
-  // The id for every server-scoped fetch/hook — `undefined` while the URL holds
-  // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
-  // the session exists. `switchTo` still gets the raw `urlConvId`.
-  const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const rebasePath = useRebasePath();
+  const effectiveConvId = useWarmSwitchConversationId(urlConvId);
+  const warmSwitchPending = effectiveConvId !== urlConvId;
+  const [sessionUi, setSessionUi] = useState({ conversationId: effectiveConvId, key: 0 });
+  if (sessionUi.conversationId !== effectiveConvId) {
+    // Session creation promotes the same draft; every other switch starts fresh local UI.
+    const promoting =
+      isTempConvId(sessionUi.conversationId) &&
+      effectiveConvId !== undefined &&
+      !isTempConvId(effectiveConvId);
+    setSessionUi({ conversationId: effectiveConvId, key: sessionUi.key + (promoting ? 0 : 1) });
+  }
+  // Client-only temp ids must not reach server-scoped hooks before the session exists.
+  const sessionConvId = isTempConvId(effectiveConvId) ? undefined : effectiveConvId;
   const navigate = useNavigate();
   const { pathname, search } = useLocation();
-  const rebasePath = useRebasePath();
   const appName = useAppName();
   const {
     data: agents,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents({ enabled: !urlConvId });
+  } = useAgents({ enabled: !effectiveConvId });
   const { data: conversationsData } = useLoadedConversations();
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
@@ -474,9 +496,21 @@ export function ChatPage() {
 
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
-  // (every 4 s) so messages arriving while viewing are marked seen.
+  // (every 4 s) so messages arriving while viewing are marked seen. A gadget
+  // filling the screen hides the conversation, so its new messages stay new.
+  // That holds from the start: a URL naming the gadget hides the conversation until the side
+  // panel shows the gadget or finds it can't (then the conversation shows and is read).
+  const pageServerInfo = useServerInfo();
+  const gadgetsMaybeOn =
+    pageServerInfo === "loading" || isFeatureEnabled(pageServerInfo, "gadgets");
+  const urlGadget = gadgetsMaybeOn
+    ? new URLSearchParams(search).get(GADGET_FULL_SCREEN_PARAM)
+    : null;
+  const gadgetCoversChat = useGadgetRailRequest((state) =>
+    gadgetCoversConversation(state, sessionConvId, urlGadget),
+  );
   useMarkConversationSeen(
-    sessionConvId,
+    gadgetCoversChat ? undefined : sessionConvId,
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
@@ -491,6 +525,7 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    if (warmSwitchPending) return;
     // A temporary route has no client session after a reload. Return to its
     // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
@@ -504,9 +539,9 @@ export function ChatPage() {
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate, pathname, search, rebasePath]);
+  }, [urlConvId, warmSwitchPending, navigate, pathname, search, rebasePath]);
 
-  useConversationRedirect(urlConvId);
+  useConversationRedirect(effectiveConvId);
 
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
@@ -539,7 +574,6 @@ export function ChatPage() {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
-  const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
@@ -576,15 +610,25 @@ export function ChatPage() {
     }
   }, [boundAgentId, agents, refetchAgents]);
 
-  const sendAgentId = initialPromptAgentId({ urlConvId, boundAgentId, agentId });
-  const dispatchFirstMessage = useCallback((prompt: PendingInitialPrompt, agent: string) => {
-    const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(prompt, agent, send, sendSlashCommand);
-  }, []);
+  const sendAgentId = initialPromptAgentId({ urlConvId: effectiveConvId, boundAgentId, agentId });
+  const dispatchFirstMessage = useCallback(
+    (prompt: PendingInitialPrompt, agent: string) => {
+      if (!effectiveConvId) return;
+      const { send, sendSlashCommand } = useChatStore.getState();
+      dispatchInitialPrompt(
+        prompt,
+        agent,
+        (text, id, files) => send(text, id, files, { pinnedConversationId: effectiveConvId }),
+        (name, args, id) =>
+          sendSlashCommand(name, args, id, { pinnedConversationId: effectiveConvId }),
+      );
+    },
+    [effectiveConvId],
+  );
   useInitialPromptDispatch({
-    conversationId: urlConvId,
+    conversationId: effectiveConvId,
     agentId: sendAgentId,
-    loadingConversation,
+    loadingConversation: loadingConversation || activeConversationId !== effectiveConvId,
     dispatch: dispatchFirstMessage,
   });
 
@@ -616,13 +660,15 @@ export function ChatPage() {
   // effect uses. If the user switched away before the clone started, the
   // prompt stays pinned and waits; it never floats into another session.
   useEffect(() => {
-    if (pendingResumePrompt === null || !agentId || !urlConvId) return;
-    if (pendingResumePrompt.sessionId !== urlConvId) return;
+    if (pendingResumePrompt === null || !agentId || !effectiveConvId) return;
+    if (pendingResumePrompt.sessionId !== effectiveConvId) return;
     if (runnerOnline !== true) return;
     const { text, files, replyDraft } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files, { replyDraft });
-  }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
+    void useChatStore
+      .getState()
+      .send(text, agentId, files, { replyDraft, pinnedConversationId: effectiveConvId });
+  }, [pendingResumePrompt, runnerOnline, agentId, effectiveConvId]);
 
   // A pending blocking card parks the turn, so suppress shimmer. Must sit before the
   // early returns (Rules of Hooks); a boolean selector avoids re-rendering on every
@@ -821,10 +867,10 @@ export function ChatPage() {
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
       : (activeSession?.title ?? null);
   useEffect(() => {
-    const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
+    const fallback = effectiveConvId ? UNTITLED_CONVERSATION_LABEL : appName;
     const base = truncateTitle(activeConv?.title || sessionTabTitle || fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, sessionTabTitle, showsWorking, urlConvId, appName]);
+  }, [activeConv?.title, sessionTabTitle, showsWorking, effectiveConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const fallbackPickerKind = modelPickerKindForConv({
@@ -895,18 +941,18 @@ export function ChatPage() {
     activeSession,
     sessionLoading,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     conversationsData !== undefined,
   );
   const permissionPending = isPermissionLevelPending(
     activeSession,
     sessionLoading,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     conversationsData !== undefined,
   );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
-  const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
+  const reconnectHostOnline = useSessionHostOnline(effectiveConvId ?? undefined);
   const {
     reconnect,
     reconnectsArca,
@@ -916,7 +962,7 @@ export function ChatPage() {
     localReconnect,
     arcaReconnect,
   } = useSessionReconnect({
-    sessionId: urlConvId ?? null,
+    sessionId: effectiveConvId ?? null,
     hostId: reconnectHostId,
     hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
     hostResumable: activeSession?.hostResumable ?? false,
@@ -936,25 +982,30 @@ export function ChatPage() {
     ) => {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
-      if (isTempConvId(urlConvId)) return;
+      if (isTempConvId(effectiveConvId)) return;
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never
       // into a session the user may switch to first; carry any attachments
       // so the replay sends the same payload.
-      if (urlConvId && runnerOnline === false && routesToResumePicker) {
-        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [], replyDraft });
+      if (effectiveConvId && runnerOnline === false && routesToResumePicker) {
+        setPendingResumePrompt({
+          sessionId: effectiveConvId,
+          text,
+          files: files ?? [],
+          replyDraft,
+        });
         setResumeDirDialogOpen(true);
         return;
       }
       // Recover the unreachable host before dispatching another turn.
-      if (urlConvId && isUnreachable) {
+      if (effectiveConvId && isUnreachable) {
         void reconnect();
         // Posting now could record a failed turn, so the message waits for the host.
         if (sendReconnectsArca) {
           useChatStore
             .getState()
-            .enqueueMessage(text, files, replyDraft, urlConvId, { waitingForHost: true });
+            .enqueueMessage(text, files, replyDraft, effectiveConvId, { waitingForHost: true });
         }
         return;
       }
@@ -980,10 +1031,11 @@ export function ChatPage() {
           holdsInitialDraft(chat),
         )
       ) {
-        chat.enqueueMessage(text, files, replyDraft);
+        chat.enqueueMessage(text, files, replyDraft, effectiveConvId);
         return;
       }
       void useChatStore.getState().send(text, agentId, files, {
+        pinnedConversationId: effectiveConvId,
         replyDraft,
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
@@ -996,7 +1048,7 @@ export function ChatPage() {
     },
     [
       agentId,
-      urlConvId,
+      effectiveConvId,
       runnerOnline,
       routesToResumePicker,
       isUnreachable,
@@ -1011,21 +1063,30 @@ export function ChatPage() {
       if (!agentId) return;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
-      if (urlConvId && runnerOnline === false && routesToResumePicker) {
+      if (effectiveConvId && runnerOnline === false && routesToResumePicker) {
         setResumeDirDialogOpen(true);
         return;
       }
-      if (urlConvId && isUnreachable) {
+      if (effectiveConvId && isUnreachable) {
         void reconnect();
         return;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        pinnedConversationId: effectiveConvId,
         onConversationCreated: (newId) => {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
     },
-    [agentId, urlConvId, runnerOnline, routesToResumePicker, isUnreachable, reconnect, navigate],
+    [
+      agentId,
+      effectiveConvId,
+      runnerOnline,
+      routesToResumePicker,
+      isUnreachable,
+      reconnect,
+      navigate,
+    ],
   );
 
   const onStop = useCallback(() => {
@@ -1035,7 +1096,7 @@ export function ChatPage() {
   // A client-only conversation has no server session to POST to yet. Keep the
   // composer editable so the user can draft the next message during creation,
   // but gate submission until the temp id is promoted below.
-  const sendDisabledReason = isTempConvId(urlConvId) ? "Starting the session…" : null;
+  const sendDisabledReason = isTempConvId(effectiveConvId) ? "Starting the session…" : null;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Opening an asleep sandbox's session presses Reconnect host for the user. The
   // snapshot's launch stage counts too: the chat store may not have loaded it yet.
@@ -1060,8 +1121,8 @@ export function ChatPage() {
     // Keep the seeded native identity through the temp-to-real ID handoff,
     // until the session snapshot can supply its wrapper label and harness.
     if (
-      isTempConvId(urlConvId) ||
-      (composerSessionModelSeeded && activeConversationId === urlConvId)
+      isTempConvId(effectiveConvId) ||
+      (composerSessionModelSeeded && activeConversationId === effectiveConvId)
     ) {
       const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
       const seededLabels: Record<string, string | null> = nativeAgent
@@ -1077,7 +1138,7 @@ export function ChatPage() {
   }, [
     activeSession,
     activeConv,
-    urlConvId,
+    effectiveConvId,
     composerSessionHarness,
     composerSessionModelSeeded,
     activeConversationId,
@@ -1148,21 +1209,27 @@ export function ChatPage() {
 
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
-  if (urlConvId) {
+  if (effectiveConvId) {
     const promotingTempConversation =
-      isTempConvId(urlConvId) &&
+      isTempConvId(effectiveConvId) &&
       activeConversationId !== null &&
       !isTempConvId(activeConversationId);
-    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
+    if (
+      loadingConversation ||
+      (activeConversationId !== effectiveConvId && !promotingTempConversation)
+    )
       return <HydratingPlaceholder />;
     if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+      return (
+        <ConversationLoadError conversationId={effectiveConvId} error={conversationLoadError} />
+      );
     }
   }
 
   const mainAgent = (
     <MainAgentSurface
-      conversationId={urlConvId ?? null}
+      sessionUiKey={sessionUi.key}
+      conversationId={effectiveConvId ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1215,7 +1282,7 @@ export function ChatPage() {
   // first message and silently create a session — but sessions are
   // bound 1:1 to a local runner that only the CLI can launch. Show
   // the CLI instructions instead so users learn the right entry point.
-  if (!urlConvId) return <NewChatLandingScreen />;
+  if (!effectiveConvId) return <NewChatLandingScreen />;
 
   // Pick the reconnect dialog's state from the session's host binding, not
   // from liveness: the dialog opens both from an unreachable send AND from the
@@ -1236,7 +1303,7 @@ export function ChatPage() {
         onOpenChange={setDialogOpen}
         localReconnect={localReconnect}
         arcaReconnect={arcaReconnect}
-        conversationId={urlConvId}
+        conversationId={effectiveConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
         harness={activeSession?.harness}
@@ -1254,7 +1321,7 @@ export function ChatPage() {
         <ResumeWithDirectoryDialog
           open={resumeDirDialogOpen}
           onOpenChange={setResumeDirDialogOpen}
-          sessionId={urlConvId}
+          sessionId={effectiveConvId}
           // Fork clone prefills from its source; a host-less session has none
           // and prefills from its own recorded host/workspace/branch instead.
           sourceSessionId={isUnboundFork ? forkSourceId : null}
@@ -1299,6 +1366,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
+  sessionUiKey: number;
   onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
@@ -1505,6 +1573,7 @@ export function updateWarmTerminalSurfaces(
  * see ViewModeToggle) so the user can flip back to Chat.
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+  sessionUiKey,
   conversationId,
   status,
   isWorking,
@@ -1815,6 +1884,18 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   });
 
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+  // A gadget's Reply and Ask in side chat land here like the transcript's own; the
+  // terminal view switches to chat first.
+  useGadgetComposerQuotes(conversationId ?? null, (quote) =>
+    takeGadgetComposerQuote(quote, {
+      permissionPending: !!permissionPending,
+      composerReadOnly,
+      showTerminal,
+      showChat: () => terminalFirst?.setView("chat"),
+      composer: composerRef.current,
+      sideChat: supportsSideChat(selectionSessionHarness, canStartSideChat),
+    }),
+  );
 
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
@@ -1854,6 +1935,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           structurally non-interactive session), as SideChatPane does. */}
           {!composerReadOnly && (
             <SelectionPopup
+              key={`selection:${sessionUiKey}`}
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
               onAskInSideChat={
@@ -1865,6 +1947,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           )}
 
           <Composer
+            key={sessionUiKey}
             ref={composerRef}
             disabled={disabled}
             status={status}
@@ -1978,11 +2061,45 @@ export function ConversationLoadError({
   );
 }
 
+/**
+ * Adds a quote a gadget queued for this session's composer, as Reply and Ask in side chat do
+ * for a transcript selection. False keeps it queued, to be tried on a later render.
+ */
+export function takeGadgetComposerQuote(
+  quote: GadgetComposerQuote,
+  page: {
+    /** The session's permissions are still loading; a loaded session without any isn't. */
+    permissionPending: boolean;
+    composerReadOnly: boolean;
+    showTerminal: boolean;
+    showChat: () => void;
+    composer: Pick<ComposerHandle, "appendReplyQuote" | "canTakeQuote" | "startSideChat"> | null;
+    sideChat: boolean;
+  },
+): boolean {
+  if (page.permissionPending) return false;
+  // A read-only session can't use the quote, so it isn't kept.
+  if (page.composerReadOnly) return true;
+  if (page.showTerminal) {
+    page.showChat();
+    return false;
+  }
+  // The composer restores this session's saved draft first, which would replace the quote.
+  if (!page.composer?.canTakeQuote()) return false;
+  // A composer that can't take it yet (offline, read-only) keeps the quote queued.
+  if (quote.kind === "side_chat" && page.sideChat) return page.composer.startSideChat(quote.text);
+  return page.composer.appendReplyQuote(quote.text);
+}
+
 interface ComposerHandle {
-  appendReplyQuote: (text: string) => void;
+  /** Whether the quote went in; a blocked composer refuses it. */
+  appendReplyQuote: (text: string) => boolean;
+  /** Whether a quote added now stays: this session's saved draft has been restored. */
+  canTakeQuote: () => boolean;
   /** Load a sent message into the composer, confirming before replacing a draft. */
   editSentMessage: (message: SentMessage) => void;
-  startSideChat: (selectedText: string) => void;
+  /** Quote in a side chat; whether the quote was taken (not while offline or read-only). */
+  startSideChat: (selectedText: string) => boolean;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
   focus: () => void;
 }
@@ -2381,19 +2498,24 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  const composerEngine = useRequestedComposerEngine();
+  // On the CodeMirror engine the whole draft is one document; ChatComposer says when it switches.
   const {
     draft,
     value,
     setValue,
     fullText,
     storedReplyDraft,
+    replyDocument,
+    setReplyDocument,
+    setSingleDocument,
     activeTextId,
     focusText,
     editText,
     replaceText,
     appendQuote,
     removeQuote,
-  } = useReplyDraft();
+  } = useReplyDraft(composerEngine === "codemirror");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   useDismissOnEscape(commandError !== null, () => setCommandError(null));
@@ -2475,14 +2597,53 @@ function ComposerImpl(
     setTailTextareaNode(element);
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  const composerEngine = useRequestedComposerEngine();
   // An engine switch replaces every input; keep the active one current even without focus.
   const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
     textareaRef.current = target;
   }, []);
+  // A take in the one document: the document before it, the one dictation last left, and
+  // whether anything else edited it since. See onVoiceDiscard.
+  const voiceTakeRef = useRef<{ before: string; last: string; clean: boolean } | null>(null);
+  // Set while dictation writes through the editor, so its own change doesn't count as another edit.
+  const writingDictationRef = useRef(false);
+  // In the one document dictation writes through the editor, so its card rules apply.
+  // Only a final is an undo step, so undo takes back a whole utterance and never shows a partial.
+  const writeDictation = (
+    next: string,
+    change: { from: number; to: number; insert: string },
+    final: boolean,
+  ) => {
+    const target = textareaRef.current;
+    if (replyDocument === null) return setValue(next);
+    if (!target || isComposerTextarea(target)) {
+      // No editor to apply the card rules, so the document is settled here.
+      const settled = settleQuoteLines(next);
+      setReplyDocument(settled);
+      return settled;
+    }
+    const take = voiceTakeRef.current;
+    if (take && target.value !== take.last) take.clean = false;
+    writingDictationRef.current = true;
+    try {
+      target.insertText(change.insert, change.from, change.to, { history: final });
+    } finally {
+      writingDictationRef.current = false;
+    }
+    if (take) take.last = target.value;
+    return target.value;
+  };
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
+  const dictation = useDictationInsert(
+    replyDocument ?? value,
+    writeDictation,
+    textareaRef,
+    // The editor holds the whole document, and a keystroke there can beat its render.
+    () => {
+      const target = textareaRef.current;
+      return replyDocument !== null && target && !isComposerTextarea(target) ? target.value : null;
+    },
+  );
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3893,14 +4054,24 @@ function ComposerImpl(
   });
 
   const replyQuoteInsertedRef = useRef(false);
+  // A quote a gadget queued while this composer couldn't take one (its draft still
+  // restoring, a Quick Answer open, the host unreachable) is tried again once it can.
+  const canTakeQuoteNow = settledConversationId === conversationId && !inputDisabled;
+  useEffect(() => {
+    if (canTakeQuoteNow) retryGadgetComposerQuotes();
+  }, [canTakeQuoteNow]);
   useImperativeHandle(ref, () => ({
     focus() {
       if (isMobileRef.current || composerLockedByBtw) return;
       textareaRef.current?.focus({ preventScroll: true });
     },
+    canTakeQuote() {
+      // The saved draft must be restored first, or it would replace the quote.
+      return settledConversationId === conversationId && !composerLockedByBtw;
+    },
     appendReplyQuote(text) {
       const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-      if (blocked || composerLockedByBtw || !text.trim()) return;
+      if (blocked || composerLockedByBtw || !text.trim()) return false;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -3909,6 +4080,7 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+      return true;
     },
     editSentMessage(message) {
       editSentMessage(message);
@@ -3918,7 +4090,7 @@ function ComposerImpl(
       // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
-        return;
+        return false;
       }
       const store = useChatStore.getState();
       const target = store.sideChatSelectionTarget;
@@ -3930,6 +4102,7 @@ function ComposerImpl(
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
       }
+      return true;
     },
   }));
 
@@ -3939,8 +4112,10 @@ function ComposerImpl(
     replyQuoteInsertedRef.current = false;
     const textarea = tailTextareaRef.current;
     if (!textarea) return;
+    // Under the new card, set before focus, or the editor would take focus at its start.
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
     if (!isMobileRef.current) textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(0, 0);
+    if (!isComposerTextarea(textarea)) textarea.revealCaret();
     const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
     if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
@@ -4351,7 +4526,9 @@ function ComposerImpl(
       !e.altKey
     ) {
       const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+      // In the one document the caret's top is under any cards that open it.
+      const top = replyDocument === null ? 0 : quoteTextStart(ta.value);
+      if (e.key === "ArrowUp" && ta.selectionStart === top) {
         // Empty-composer recall takes the last queued row before browsing history.
         if (composerEmptyForRecall) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -4383,7 +4560,10 @@ function ComposerImpl(
     const input = e.currentTarget;
     noteMentionTextChange(e);
     slashCompletion.onSelectionChange(input);
-    editText(id, input.value);
+    // Any edit but dictation's own keeps the take from being discarded, even one undone by hand.
+    if (voiceTakeRef.current && !writingDictationRef.current) voiceTakeRef.current.clean = false;
+    if (replyDocument !== null) setReplyDocument(input.value);
+    else editText(id, input.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
@@ -4534,9 +4714,11 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
+        onRenderedEngineChange={(engine) => setSingleDocument(engine === "codemirror")}
         input={{
           ref: bindTailTextarea,
-          value: draft.text,
+          value: replyDocument ?? draft.text,
+          replyQuotes: true,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
@@ -4573,7 +4755,7 @@ function ComposerImpl(
                         ? "Send a follow-up (queued) — Esc to stop"
                         : readyPlaceholder,
           rows: 1,
-          heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
+          heightMode: draft.quotes.length > 0 && replyDocument === null ? "unbounded" : "compact",
           disabled: inputDisabled,
           "data-slash-command": highlight.input["data-slash-command"],
           "data-shell-command": highlight.input["data-shell-command"],
@@ -4585,7 +4767,7 @@ function ComposerImpl(
         }}
         slots={{
           inputPrefix:
-            draft.quotes.length > 0 ? (
+            draft.quotes.length > 0 && replyDocument === null ? (
               <ReplyDraftBlocks
                 quotes={draft.quotes}
                 activeTextId={activeTextId}
@@ -4787,7 +4969,7 @@ function ComposerImpl(
                 onOpen={savedWorkflows.refresh}
               />
               {!subAgentLabel && composerSessionId && (
-                <MobileHeaderControlPortal sessionId={composerSessionId}>
+                <MobileHeaderControlPortal sessionId={composerSessionId} popoverSlot="host">
                   <HostBadge
                     sessionId={composerSessionId}
                     appearance={isMobile ? "header" : "composer"}
@@ -4803,31 +4985,40 @@ function ComposerImpl(
                 </MobileHeaderControlPortal>
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
-                <ComposerPermissionPicker
-                  label="Permission mode"
-                  value={permissionLabel || "Permission mode"}
-                  harness={sessionHarness}
-                  selectedValue={selectedPermissionMode}
-                  options={permissionOptions}
-                  disabled={!permissionControlInteractive || configBusy}
-                  disabledReason={
-                    isOwnerLevel(permissionLevel)
-                      ? undefined
-                      : "Only the session owner can change the permission mode"
-                  }
-                  // The message box takes ⇧Tab, so not while it's disabled.
-                  shortcut={
-                    nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
-                  }
-                  onSelect={(mode) => void changePermission(mode)}
-                  openNonce={permissionPickerOpenNonce}
-                />
+                <SessionControlPortal
+                  sessionId={composerSessionId}
+                  slot="permission"
+                  offered={composerSessionId !== null}
+                >
+                  <ComposerPermissionPicker
+                    label="Permission mode"
+                    value={permissionLabel || "Permission mode"}
+                    harness={sessionHarness}
+                    selectedValue={selectedPermissionMode}
+                    options={permissionOptions}
+                    disabled={!permissionControlInteractive || configBusy}
+                    disabledReason={
+                      isOwnerLevel(permissionLevel)
+                        ? undefined
+                        : "Only the session owner can change the permission mode"
+                    }
+                    // The message box takes ⇧Tab, so not while it's disabled.
+                    shortcut={
+                      nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
+                    }
+                    onSelect={(mode) => void changePermission(mode)}
+                    openNonce={permissionPickerOpenNonce}
+                  />
+                </SessionControlPortal>
               )}
             </>
           ),
           trailing: (
             <>
-              <MobileHeaderControlPortal sessionId={composerSessionId}>
+              <MobileHeaderControlPortal
+                sessionId={composerSessionId}
+                popoverSlot={composerSessionId === null ? undefined : "harness"}
+              >
                 <div className="flex min-w-0 items-center rounded-lg">
                   <SessionHarnessPicker
                     appearance={isMobile ? "header" : "composer"}
@@ -4836,6 +5027,16 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    renderIcon={(icon) => (
+                      <SessionControlPortal
+                        sessionId={composerSessionId}
+                        slot="icon"
+                        inPlace={false}
+                        offered={composerSessionId !== null}
+                      >
+                        {icon}
+                      </SessionControlPortal>
+                    )}
                     paletteSettingsSource={
                       composerSessionId &&
                       isFeatureEnabled(composerServerInfo, "quick_pick_palette")
@@ -4851,14 +5052,43 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
+                  dictation.release();
                   voiceSnapshotRef.current = value;
+                  voiceTakeRef.current =
+                    replyDocument === null
+                      ? null
+                      : { before: replyDocument, last: replyDocument, clean: true };
                 }}
                 onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
+                  const take = voiceTakeRef.current;
+                  voiceTakeRef.current = null;
+                  // A take belongs to the engine it began on; after a switch the draft stays.
+                  if (replyDocument === null) {
+                    if (take === null) setValue(voiceSnapshotRef.current);
+                    return;
+                  }
+                  // Only a take nothing else edited goes back, so a quote or edit made in it stays.
+                  const untouched = take?.clean && textareaRef.current?.value === take.last;
+                  if (untouched && take.last !== take.before) setReplyDocument(take.before);
                 }}
-                onListeningChange={setDictating}
+                onListeningChange={(listening) => {
+                  setDictating(listening);
+                  // However a take ends, a partial it leaves is the user's text from now on.
+                  if (!listening) dictation.release();
+                  // A take leaves focus on the mic button, where the editor's undo and redo keys
+                  // don't reach; give it back to the editor once the take ends.
+                  const active = document.activeElement;
+                  const onOwnButton =
+                    active instanceof HTMLButtonElement &&
+                    composerFormRef.current?.contains(active);
+                  if (!listening && replyDocument !== null && onOwnButton && !isMobileRef.current) {
+                    textareaRef.current?.focus({ preventScroll: true });
+                  }
+                }}
                 inputRef={textareaRef}
                 onTranscript={(text) => {
+                  // In the editor the partial goes first, so the final is inserted as one step.
+                  if (replyDocument !== null) dictation.replaceInterim("");
                   dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode

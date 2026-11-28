@@ -9,6 +9,7 @@ import {
   reportConversationShown,
   openDesktopSessionWindow,
   setDesktopCommandState,
+  shellRoutesDesktopCommands,
   startSystemDictation,
   supportsDesktopCommands,
   supportsDesktopSessionWindows,
@@ -824,6 +825,24 @@ describe("desktop command bridge", () => {
     expect(supportsDesktopCommands()).toBe(false);
     installDesktop({ onDesktopCommand: () => () => {}, setDesktopCommandState: () => {} });
     expect(supportsDesktopCommands()).toBe(true);
+  });
+
+  it("routes commands only where the shell lists every one of them", () => {
+    const bridge = { onDesktopCommand: () => () => {}, setDesktopCommandState: () => {} };
+    // No shell, or a shell from before the command bridge.
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    installDesktop({ desktopCommands: ["go-back", "go-forward"] });
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    // A bridge from before the list, a malformed list, then a list missing one of them.
+    installDesktop(bridge);
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    installDesktop({ ...bridge, desktopCommands: "go-back" });
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    installDesktop({ ...bridge, desktopCommands: ["close", "go-back"] });
+    expect(shellRoutesDesktopCommands(["go-back", "go-forward"])).toBe(false);
+    // A shell that lists them all.
+    installDesktop({ ...bridge, desktopCommands: ["close", "go-back", "go-forward"] });
+    expect(shellRoutesDesktopCommands(["go-back", "go-forward"])).toBe(true);
   });
 
   it("forwards known commands and drops ones this page doesn't know", () => {

@@ -21,19 +21,10 @@ from __future__ import annotations
 import json
 from urllib.parse import urlparse
 
-from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
-
-
-def _row(page: Page, session_id: str) -> Locator:
-    """Locate the sidebar row (``<li>``) for *session_id* by its href."""
-    return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
-
-
-def _unread_dot(row: Locator) -> Locator:
-    """Locate the row's unread (pink) dot — the unseen session-state badge."""
-    return row.locator('[data-testid="session-state-badge"][data-state="unseen"]')
+from tests.e2e_ui.sessions._sidebar_helpers import sidebar_row, unread_dot
 
 
 def test_mark_unread_lights_the_dot_and_persists_across_reload(
@@ -50,10 +41,10 @@ def test_mark_unread_lights_the_dot_and_persists_across_reload(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    row = _row(page, session_id)
+    row = sidebar_row(page, session_id)
     expect(row).to_be_visible()
     # The row starts seen — no unread dot.
-    expect(_unread_dot(row)).to_have_count(0)
+    expect(unread_dot(row)).to_have_count(0)
 
     # Open the row kebab and pick "Mark as unread". Hover first so the
     # desktop hover-revealed kebab trigger is interactable.
@@ -63,14 +54,14 @@ def test_mark_unread_lights_the_dot_and_persists_across_reload(
 
     # The dot lights immediately (optimistic mirror write), even though this
     # is the session you're currently viewing.
-    expect(_unread_dot(row)).to_be_visible()
+    expect(unread_dot(row)).to_be_visible()
 
     # Reload: the dot must come back. The mark-unread persisted the baseline
     # to localStorage AND best-effort PUT it to the server, so either source
     # re-lights it after a fresh page load.
     page.reload()
-    expect(_row(page, session_id)).to_be_visible()
-    expect(_unread_dot(_row(page, session_id))).to_be_visible()
+    expect(sidebar_row(page, session_id)).to_be_visible()
+    expect(unread_dot(sidebar_row(page, session_id))).to_be_visible()
 
 
 def test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty(
@@ -97,14 +88,14 @@ def test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty(
     base_url, session_id = seeded_session
 
     page.goto(f"{base_url}/c/{session_id}")
-    row = _row(page, session_id)
+    row = sidebar_row(page, session_id)
     expect(row).to_be_visible()
-    expect(_unread_dot(row)).to_have_count(0)
+    expect(unread_dot(row)).to_have_count(0)
 
     row.hover()
     row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("mark-unread-conversation").click()
-    expect(_unread_dot(row)).to_be_visible()
+    expect(unread_dot(row)).to_be_visible()
 
     # Simulate the reload landing on a replica whose seed lacks this user's
     # read-state: strip viewer_unread / viewer_last_seen from every row of
@@ -134,6 +125,6 @@ def test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty(
     # the dot can ONLY come from localStorage. Its presence proves the
     # browser-durable baseline survived and is pod-independent.
     page.reload()
-    reloaded = _row(page, session_id)
+    reloaded = sidebar_row(page, session_id)
     expect(reloaded).to_be_visible()
-    expect(_unread_dot(reloaded)).to_be_visible()
+    expect(unread_dot(reloaded)).to_be_visible()

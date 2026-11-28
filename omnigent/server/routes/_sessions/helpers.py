@@ -225,6 +225,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _KIMI_NATIVE_HARNESS,
     _LABEL_VALUE_MAX_LEN,
     _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY,
+    _LAST_TASK_ERROR_AT_LABEL_KEY,
     _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
     _LAST_TASK_ERROR_CODE_LABEL_KEY,
     _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
@@ -5759,6 +5760,7 @@ async def _persist_session_status_error_labels(
     # must not leak onto a later, unclassified one.
     updates = (
         {
+            _LAST_TASK_ERROR_AT_LABEL_KEY: str(int(time.time())),
             _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
             _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_error_message_label(error.message),
             _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: _truncate_label(agent_name or ""),
@@ -5770,6 +5772,7 @@ async def _persist_session_status_error_labels(
         }
         if error is not None
         else {
+            _LAST_TASK_ERROR_AT_LABEL_KEY: "",
             _LAST_TASK_ERROR_CODE_LABEL_KEY: "",
             _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "",
             _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: "",

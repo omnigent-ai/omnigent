@@ -1,0 +1,18 @@
+/* This PR's row in the stack menu and on the Overview's stack card, marked in every palette. */
+.pr-stack-current-row {
+  /* A wash of the text color, which always differs from the surface. */
+  background-color: color-mix(in oklab, var(--foreground) 9%, transparent);
+  /* The header tabs' accent, drawn toward the text color so it holds 3:1 where it's pale. */
+  box-shadow: inset 3px 0 0 color-mix(in oklab, var(--brand-accent) 60%, var(--foreground));
+  /* Its text a step further from the wash than the palette's, so it keeps 4.5:1 on it. */
+  color: color-mix(in oklab, var(--foreground) 80%, black);
+}
+
+/* Under the keyboard or the pointer, a deeper wash, as other rows take one. */
+.pr-stack-current-row[data-highlighted] {
+  background-color: color-mix(in oklab, var(--foreground) 15%, transparent);
+}
+
+.dark .pr-stack-current-row {
+  color: color-mix(in oklab, var(--foreground) 80%, white);
+}

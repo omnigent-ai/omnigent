@@ -239,6 +239,11 @@ service WorkspaceService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
 
+  // GitHub's own record of the stack this pull request is in, where its host has stacks.
+  rpc GetPullRequestNativeStack(GetPullRequestNativeStackRequest) returns (GetPullRequestNativeStackResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
   // The pull requests for a branch of the workspace's own repository.
   rpc ListBranchPullRequests(ListBranchPullRequestsRequest) returns (ListBranchPullRequestsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
@@ -252,7 +257,11 @@ service WorkspaceService {
   // Previews a reviewer ping, and returns the single-use token that sends it.
   rpc PreviewReviewerPing(PreviewReviewerPingRequest) returns (PreviewReviewerPingResponse);
 
-  // Streams an image the pull request links to: its metadata, then its bytes.
+  // Streams an attachment image on the pull request's host: its metadata, then its bytes.
+  // Only the session's owner may call it. A caller that leaves early may hold one of the
+  // host's four image reads for up to 30 seconds, or, while a DNS lookup stalls, until the
+  // system resolver gives up. A client may keep an image in memory, keyed by
+  // `(pr_url, image_url)`, for as long as the page that shows it stays open.
   rpc ReadPullRequestImage(ReadPullRequestImageRequest) returns (stream ReadPullRequestImageResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -1071,8 +1080,9 @@ message ListReviewThreadCommentsResponse {
 
 message ListLabelsRequest {
   string pr_url = 1;
-  // Labels whose name matches; unset lists the repository's labels.
-  // Not supported yet: setting this field returns INVALID_ARGUMENT.
+  // Labels whose name or description matches, best match first, at most 50;
+  // unset lists the repository's labels by name. Longer than 256 characters
+  // returns INVALID_ARGUMENT.
   string text = 2;
 }
 
@@ -1427,11 +1437,14 @@ message PullRequestAutoMerge {
 }
 
 message EnableAutoMergeRequest {
+  // 1 to 20 pull requests the session links, each named once.
   repeated PullRequestAutoMerge pull_requests = 1;
 }
 
 message EnableAutoMergeResponse {
-  // Each pull request's result, in request order.
+  // Each pull request's result, in request order: `enabled_at`, or an `error` with its
+  // `reason`, and `unconfirmed: true` when GitHub may have turned auto-merge on. The
+  // results stop at the first pull request whose head moved; the rest weren't sent.
   google.protobuf.Struct payload = 1;
 }
 
@@ -1527,9 +1540,17 @@ message GetPullRequestStackResponse {
   google.protobuf.Struct payload = 1;
 }
 
+message GetPullRequestNativeStackRequest {
+  string pr_url = 1;
+}
+
+message GetPullRequestNativeStackResponse {
+  google.protobuf.Struct payload = 1;
+}
+
 message ReadPullRequestImageRequest {
   string pr_url = 1;
-  // An image URL the pull request's description or comments link to.
+  // An attachment on the pull request's host: https://<host>/user-attachments/assets/<id>.
   string image_url = 2;
 }
 
@@ -1575,6 +1596,8 @@ message ReadPullRequestImageResponse {
 
 // Attached to a refused pull request call's error: why it was refused, for a client to act on.
 message PullRequestFailure {
-  // One of "comment_changed", "pull_request_changed" or "invalid_input".
+  // One of "comment_changed", "pull_request_changed", "invalid_input" or
+  // "read_only_code_host"; for an image read, one of "host_not_allowed", "too_large",
+  // "not_image" or "fetch_failed".
   string reason = 1;
 }

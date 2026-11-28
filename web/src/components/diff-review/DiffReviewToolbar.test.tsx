@@ -1,6 +1,6 @@
-// The review toolbar's status slot: a source's progress sits just left of the line counts,
-// inside the group that anchors them right, so they and every control after them keep their
-// place as it comes and goes.
+// The review toolbar's status slot: a source's progress starts the controls anchored right,
+// after the line counts at the left, so the counts and every control keep their place as it
+// comes and goes.
 
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -45,15 +45,20 @@ function toolbar(active: boolean) {
 }
 
 describe("DiffReviewToolbar's status", () => {
-  it("shows a spinner named by its label just before the line counts, in their group", () => {
+  it("shows a spinner named by its label first of the controls, after the line counts", () => {
     render(toolbar(true));
     const status = screen.getByRole("status");
     expect(status).toHaveTextContent("Loading review threads");
     const lineCounts = screen.getByTestId("diff-review-line-counts");
     expect(lineCounts).toHaveTextContent("+126−125");
-    expect(status.nextElementSibling).toBe(lineCounts);
-    // The group the counts anchor to the right, so what the status adds grows leftward.
+    // What changed reads at the left; the status starts the controls anchored to the right.
+    expect(
+      lineCounts.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(status.parentElement).toHaveClass("ml-auto");
+    // It comes before the source's own controls, which follow it at the right.
+    const find = screen.getByRole("button", { name: "Find in changes" });
+    expect(status.compareDocumentPosition(find) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("keeps an empty live region of the spinner's size while idle, so nothing rewraps", () => {

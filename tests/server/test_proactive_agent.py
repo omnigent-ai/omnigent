@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 import pytest_asyncio
+import yaml
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
@@ -44,6 +45,7 @@ from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxIte
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.tools.builtins.gadgets import GADGET_TOOL_NAMES
 from tests.server.helpers import FakeSandboxLauncher
 
 _BUNDLE = Path(proactive_agent.__file__).parent.parent / "resources" / "proactive" / "bundle"
@@ -78,6 +80,21 @@ def test_request_timezone_keeps_a_valid_name() -> None:
     assert request_timezone("America/Los_Angeles") == "America/Los_Angeles"
 
 
+# The tool groups runners released before the gadgets and files groups accept. The bundle is
+# served to those runners too, and they refuse a config naming any other group.
+_GROUPS_RELEASED_RUNNERS_ACCEPT = {
+    "user_inbox",
+    "browser",
+    "scheduled_tasks",
+    "comments",
+    "policies",
+    "agent_discovery",
+    "projects",
+    "journal",
+    "memory",
+}
+
+
 def test_bundle_opts_into_the_inbox_tools_only() -> None:
     spec = load(_BUNDLE)
 
@@ -85,7 +102,21 @@ def test_bundle_opts_into_the_inbox_tools_only() -> None:
     groups = dataclasses.asdict(spec.tool_groups)
     # A new framework group defaults to on, so the bundle must turn it off explicitly.
     assert groups.pop("user_inbox") is True
+    # Gadgets stay on as a group for older runners' sake; a policy denies their tools instead.
+    assert groups.pop("gadgets") is True
     assert not any(groups.values()), groups
+    raw = yaml.safe_load(_BUNDLE.joinpath("config.yaml").read_text())
+    assert set(raw["tool_groups"]) <= _GROUPS_RELEASED_RUNNERS_ACCEPT
+
+
+@pytest.mark.parametrize("tool", sorted(GADGET_TOOL_NAMES))
+@pytest.mark.asyncio
+async def test_bundle_denies_every_gadget_tool(tool: str) -> None:
+    gate = RunnerToolPolicyGate.from_spec(load(_BUNDLE))
+
+    verdict = await gate.evaluate_tool_call(tool, {})
+
+    assert verdict.action == "deny", verdict
 
 
 @pytest.mark.parametrize(

@@ -53,6 +53,7 @@ from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
     NativeLaunchContext,
+    _antigravity_startup_agent_spec,
     _auto_create_qwen_terminal,
     _auto_create_repl_terminal,
     _claude_native_bridge_id_for_session,
@@ -503,13 +504,6 @@ def register_resource_routes(
                     "and could not be closed."
                 )
 
-            elif terminal_name == "antigravity":
-                _ensure_is_owned = _is_runner_owned_antigravity_terminal
-                _ensure_conflict = (
-                    "Existing antigravity terminal is not a runner-owned agy TUI "
-                    "and could not be closed."
-                )
-
             elif terminal_name in ("pi", "opencode"):
                 # pi/opencode resolve the spec unwrapped — a resolution error
                 # surfaces as a terminal-start error (the resolver does not
@@ -524,6 +518,7 @@ def register_resource_routes(
                 _ensure_build = _spec_ensure_build
 
             elif terminal_name in (
+                "antigravity",
                 "cursor",
                 "kimi",
                 "devin",
@@ -536,11 +531,22 @@ def register_resource_routes(
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
-                    return dataclasses.replace(
-                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
+                    spec = (
+                        await _antigravity_startup_agent_spec(
+                            session_id, _resolve_session_agent_spec_or_none
+                        )
+                        if terminal_name == "antigravity"
+                        else await _resolve_session_agent_spec_or_none(session_id)
                     )
+                    return dataclasses.replace(ctx, agent_spec=spec)
 
                 _ensure_build = _spec_or_none_ensure_build
+                if terminal_name == "antigravity":
+                    _ensure_is_owned = _is_runner_owned_antigravity_terminal
+                    _ensure_conflict = (
+                        "Existing antigravity terminal is not a runner-owned agy TUI "
+                        "and could not be closed."
+                    )
 
             _ensure_result = await _ensure_native_terminal(
                 terminal_name,
@@ -1546,12 +1552,14 @@ def register_resource_routes(
         server_tracked: bool = False,
         default_pr_url: str | None = None,
         allow_cached: bool = False,
+        account_rights: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "cached_pr_info",
             pr_url=pr_url,
             allow_cached=allow_cached,
+            account_rights=account_rights,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )

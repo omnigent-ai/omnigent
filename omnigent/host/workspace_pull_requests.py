@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
@@ -20,7 +20,8 @@ from connectrpc.errors import ConnectError
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import PullRequestVouch
 from omnigent.host.workspace_pull_request_input import PullRequestRefused
-from omnigent.runner import pr_actions, pr_resource
+from omnigent.runner import github_lookup, github_search, pr_actions, pr_resource
+from omnigent.runner.github_images import ImageRefused, PullRequestImage
 from omnigent.runner.pull_request_errors import (
     InvalidPullRequestInput,
     PullRequestError,
@@ -47,6 +48,9 @@ class PullRequestCall:
 
 # One pull request method: the reader, the call and the request, to the REST payload.
 PullRequestOp = Callable[[WorkspaceReader, PullRequestCall, Any], dict[str, Any]]
+# One streamed pull request method: the reader, the call and the request, to the bytes.
+PullRequestStreamOp = Callable[[WorkspaceReader, PullRequestCall, Any], PullRequestImage]
+_Result = TypeVar("_Result")
 
 
 def _url(request: Any) -> str | None:
@@ -122,6 +126,7 @@ def _set_account(
         remote=None,
         session_id=call.session_id,
         pr_url=request.pr_url,
+        account_rights=call.account_rights,
     )
 
 
@@ -151,6 +156,23 @@ def _named(action: Callable[..., dict[str, Any]], *fields: str) -> PullRequestOp
         )
 
     return run
+
+
+def _enable_auto_merge(
+    reader: WorkspaceReader, call: PullRequestCall, request: pb.EnableAutoMergeRequest
+) -> dict[str, Any]:
+    return pr_actions.enable_auto_merge(
+        _root(reader),
+        session_id=call.session_id,
+        items=[
+            {
+                "pr_url": item.pr_url,
+                "merge_method": item.merge_method,
+                "expected_head_oid": item.expected_head_oid,
+            }
+            for item in request.pull_requests
+        ],
+    )
 
 
 # The session owner's review and comment changes, and the pending review they work on.
@@ -194,10 +216,17 @@ _REVIEW_OPS: dict[str, PullRequestOp] = {
     "RemoveReaction": _named(pr_actions.remove_reaction, "kind", "comment_id", "content"),
 }
 
+# The session owner's merge queue: where the pull request stands, and adding or removing it.
+_MERGE_QUEUE_OPS: dict[str, PullRequestOp] = {
+    "GetMergeQueue": _named(pr_actions.get_merge_queue),
+    "EnqueuePullRequest": _named(pr_actions.enqueue_pull_request, "expected_head_oid"),
+    "DequeuePullRequest": _named(pr_actions.dequeue_pull_request),
+}
+
 
 PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "GetPullRequest": lambda reader, call, request: reader.github_info(
-        call.session_id, _url(request)
+        call.session_id, _url(request), account_rights=call.account_rights
     ),
     "ListPullRequestFiles": lambda reader, call, request: reader.github_changes(
         call.session_id,
@@ -235,10 +264,22 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     ),
     # The session owner's: what the edit controls offer, and the changes themselves.
     "ListLabels": lambda reader, call, request: reader.github_labels(
-        call.session_id, _url(request)
+        call.session_id, _url(request), request.text
     ),
     "ListReviewerCandidates": lambda reader, call, request: reader.github_reviewers(
         call.session_id, _url(request)
+    ),
+    "SearchReviewers": lambda reader, call, request: github_search.search_reviewers(
+        _root(reader),
+        pr_actions._target(call.session_id, _url(request)),
+        text=request.text,
+        page_size=request.page_size,
+    ),
+    "SearchCompletions": lambda reader, call, request: github_search.search_completions(
+        _root(reader),
+        pr_actions._target(call.session_id, _url(request)),
+        kind=pb.CompletionKind.Name(request.kind).removeprefix("COMPLETION_KIND_"),
+        text=request.text,
     ),
     "GetMergeOptions": lambda reader, call, request: reader.github_merge_options(
         call.session_id, _url(request)
@@ -287,7 +328,26 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "DisableAutoMerge": lambda reader, call, request: pr_resource.disable_pr_auto_merge(
         _root(reader), session_id=call.session_id, pr_url=_url(request)
     ),
+    "SetPullRequestState": _named(pr_actions.set_pull_request_state, "state"),
+    "SetPullRequestDraft": _named(pr_actions.set_pull_request_draft, "draft"),
+    "EnableAutoMerge": _enable_auto_merge,
     **_REVIEW_OPS,
+    **_MERGE_QUEUE_OPS,
+    # The stack read lists the repository's other pull requests as the host's account.
+    "GetPullRequestStack": _named(pr_actions.get_pull_request_stack),
+    # GitHub's own stack, where the host's schema has stacks; members are data only.
+    "GetPullRequestNativeStack": _named(pr_actions.get_pull_request_native_stack),
+    # Read the URLs the request names, never the session's or the vouch's pull requests.
+    "LookupPullRequest": lambda reader, _call, request: github_lookup.lookup_pull_request(
+        _root(reader), pr_url=request.pr_url
+    ),
+    "GetPullRequestListStats": lambda reader, _call, request: (
+        github_lookup.pull_request_list_stats(_root(reader), pr_urls=list(request.pr_urls))
+    ),
+    # Finds pull requests from the request alone, never from the session's or the vouch.
+    "ListBranchPullRequests": lambda reader, _call, request: github_search.branch_pull_requests(
+        _root(reader), branch=request.branch
+    ),
     # The runner takes the media type from the bytes, as on the REST route.
     "UploadAttachment": lambda reader, call, request: pr_resource.upload_pr_attachment(
         _root(reader),
@@ -297,6 +357,21 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
         content=request.content,
     ),
 }
+
+
+# The owner's: the images a pull request links to, which GitHub serves only to its viewers.
+PULL_REQUEST_STREAM_OPS: dict[str, PullRequestStreamOp] = {
+    "ReadPullRequestImage": lambda reader, call, request: pr_actions.read_pull_request_image(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        image_url=request.image_url,
+    ),
+}
+# Every pull request method this host serves, unary or streamed.
+PULL_REQUEST_METHODS: frozenset[str] = frozenset(PULL_REQUEST_OPS) | frozenset(
+    PULL_REQUEST_STREAM_OPS
+)
 
 
 def run_pull_request_op(
@@ -310,10 +385,25 @@ def run_pull_request_op(
     :raises PullRequestRefused: FAILED_PRECONDITION for a PR the session doesn't link, or
         another refusal with its code and reason; UNKNOWN for a change GitHub never confirmed.
     """
+    return _under_vouch(call, lambda: PULL_REQUEST_OPS[name](reader, call, request))
+
+
+def run_pull_request_stream_op(
+    name: str, reader: WorkspaceReader, call: PullRequestCall, request: Any
+) -> PullRequestImage:
+    """Run one streamed pull request method under the server's vouch; blocking, as above.
+
+    :raises PullRequestRefused: As :func:`run_pull_request_op`; UNAVAILABLE for an image
+        GitHub didn't send, which a client may retry.
+    """
+    return _under_vouch(call, lambda: PULL_REQUEST_STREAM_OPS[name](reader, call, request))
+
+
+def _under_vouch(call: PullRequestCall, operation: Callable[[], _Result]) -> _Result:
     vouch = call.vouch or PullRequestVouch()
     with pr_resource.server_tracking(vouch.server_tracked is True, vouch.default_pr_url):
         try:
-            return PULL_REQUEST_OPS[name](reader, call, request)
+            return operation()
         except ValueError as exc:
             raise _refusal(exc) from exc
 
@@ -321,6 +411,8 @@ def run_pull_request_op(
 def _refusal(exc: ValueError) -> PullRequestRefused:
     """The Connect error for a failed operation, with the reason a client reads."""
     reason = exc.reason if isinstance(exc, PullRequestError) else None
+    if isinstance(exc, ImageRefused) and exc.reason == "fetch_failed":
+        return PullRequestRefused(Code.UNAVAILABLE, str(exc), reason)
     if isinstance(exc, UnknownOutcomeError):
         # The change may have been made: never a refusal a client would retry past.
         return PullRequestRefused(Code.UNKNOWN, str(exc), None)

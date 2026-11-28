@@ -5,9 +5,34 @@ import type { ReactNode } from "react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+// Counts renders of ⌘K's Mark all as read and Resume sandbox, which render nothing themselves.
+const paletteCommandMounts = vi.hoisted(() => ({ markAllRead: 0, resumeSandbox: 0 }));
+vi.mock("@/shell/markAllReadPaletteCommand", async (importOriginal) => {
+  const original = await importOriginal<typeof MarkAllReadPaletteCommandModule>();
+  return {
+    ...original,
+    MarkAllReadPaletteCommand: () => {
+      paletteCommandMounts.markAllRead += 1;
+      return original.MarkAllReadPaletteCommand();
+    },
+  };
+});
+vi.mock("@/shell/resumeSandboxCommand", async (importOriginal) => {
+  const original = await importOriginal<typeof ResumeSandboxCommandModule>();
+  return {
+    ...original,
+    ResumeSandboxPaletteCommand: () => {
+      paletteCommandMounts.resumeSandbox += 1;
+      return original.ResumeSandboxPaletteCommand();
+    },
+  };
+});
+
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import type * as MarkAllReadPaletteCommandModule from "@/shell/markAllReadPaletteCommand";
+import type * as ResumeSandboxCommandModule from "@/shell/resumeSandboxCommand";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
@@ -18,6 +43,18 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
+import { getGadgetShelf, getSessionGadgets, listGadgets } from "@/gadgets/api/gadgetApi";
+import {
+  GADGET_FULL_SCREEN_PARAM,
+  gadgetCoversConversation,
+  resetGadgetRailRequests,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
+import { MOBILE_BREAKPOINT_PX } from "@/hooks/useIsMobileViewport";
+import { gadgetFixture } from "@/gadgets/ui/testUtils";
+import { IN_APP_GADGET_OPEN } from "@/gadgets/ui/gadgetNavigation";
+import { resetGadgetTabOrders } from "@/gadgets/ui/GadgetRailTabs";
 
 import { lazy, useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -148,6 +185,17 @@ vi.mock("@/hooks/useAgents", () => ({
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
 
+// Gadgets render only in the gadget full screen contract below, where the feature is on. The
+// gadget itself (frame, SDK) has its own tests; here it names itself.
+vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof GadgetApiModule>()),
+  getSessionGadgets: vi.fn(),
+  getGadgetShelf: vi.fn(),
+  listGadgets: vi.fn(),
+}));
+vi.mock("@/gadgets/ui/GadgetView", () => ({
+  GadgetView: ({ gadget }: { gadget: { name: string } }) => <p>shows {gadget.name}</p>,
+}));
 vi.mock("./Sidebar", () => ({
   isMobileViewport: () => !window.matchMedia("(min-width: 1181px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
@@ -2867,6 +2915,169 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
       "md:absolute",
     );
+  });
+});
+
+/** Pins intended behavior: in-app gadget opens preserve sidebar state; fresh links collapse it. */
+describe("gadget full screen contract", () => {
+  const BOARD = gadgetFixture({ id: "board", name: "Board" });
+  const GADGETS_ON = serverInfo({ features: { gadgets: true } });
+
+  beforeEach(() => {
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    vi.mocked(getSessionGadgets).mockResolvedValue([BOARD]);
+    vi.mocked(getGadgetShelf).mockResolvedValue({ pinned: [], hasOwned: true });
+    vi.mocked(listGadgets).mockResolvedValue([BOARD]);
+  });
+  afterEach(() => {
+    resetGadgetRailRequests();
+    resetGadgetTabOrders();
+    vi.mocked(getSessionGadgets).mockReset();
+  });
+
+  /** Opens the gadget from inside the app, as the gadget link page does for an in-app open. */
+  function OpenGadget({ state }: { state?: unknown }) {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/c/conv_abc?gadget=board", { state })}>
+        open gadget
+      </button>
+    );
+  }
+
+  function renderSession(entry: string, content: ReactNode = null) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={GADGETS_ON}>
+        {shellTree(
+          qc,
+          entry,
+          <Route
+            path="c/:conversationId"
+            element={
+              <>
+                {content}
+                <LocationDisplay />
+              </>
+            }
+          />,
+        )}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  const rail = () => screen.getByRole("complementary", { name: "Workspace" });
+  const sidebar = () => screen.getByTestId("sidebar");
+  async function expectGadgetFullScreen() {
+    await waitFor(() => expect(rail()).toHaveClass("md:absolute"));
+    expect(within(rail()).getByText("shows Board")).toBeInTheDocument();
+  }
+
+  it.each([
+    ["with the sidebar open", true],
+    ["with the sidebar collapsed", false],
+  ])(
+    "leaves the sidebar as it was for a gadget opened from inside Omnigent, %s",
+    async (_case, open) => {
+      renderSession("/c/conv_abc", <OpenGadget state={IN_APP_GADGET_OPEN} />);
+      if (open) fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+      expect(sidebar()).toHaveAttribute("data-open", String(open));
+
+      fireEvent.click(screen.getByRole("button", { name: "open gadget" }));
+
+      await expectGadgetFullScreen();
+      expect(sidebar()).toHaveAttribute("data-open", String(open));
+      // Open session leaves full screen for the session, and the sidebar stays as it is.
+      fireEvent.click(within(rail()).getByRole("button", { name: "Open session" }));
+      await waitFor(() => expect(rail()).not.toHaveClass("md:absolute"));
+      expect(sidebar()).toHaveAttribute("data-open", String(open));
+    },
+  );
+
+  it("leaves the sidebar as it was for an in-app navigation that carries no state", async () => {
+    // A host's router may drop link state; an in-app entry still has its own key.
+    renderSession("/c/conv_abc", <OpenGadget />);
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+
+    fireEvent.click(screen.getByRole("button", { name: "open gadget" }));
+
+    await expectGadgetFullScreen();
+    expect(sidebar()).toHaveAttribute("data-open", "true");
+  });
+
+  /** What the session page asks: whether a gadget covers conv_abc, so it leaves it unread. */
+  function CoverProbe() {
+    const { search } = useLocation();
+    const urlGadget = new URLSearchParams(search).get(GADGET_FULL_SCREEN_PARAM);
+    const covers = useGadgetRailRequest((state) =>
+      gadgetCoversConversation(state, "conv_abc", urlGadget),
+    );
+    return <span data-testid="covers-chat">{String(covers)}</span>;
+  }
+  const covers = () => screen.getByTestId("covers-chat").textContent;
+
+  it("keeps the session unread from the start of a gadget link until Open session", async () => {
+    // The session's gadgets are still loading when the page first shows.
+    let listed: (gadgets: (typeof BOARD)[]) => void = () => {};
+    vi.mocked(getSessionGadgets).mockReturnValue(
+      new Promise((resolve) => {
+        listed = resolve;
+      }),
+    );
+    renderSession("/c/conv_abc?gadget=board", <CoverProbe />);
+    expect(covers()).toBe("true");
+
+    await act(async () => listed([BOARD]));
+    await expectGadgetFullScreen();
+    expect(covers()).toBe("true");
+
+    fireEvent.click(within(rail()).getByRole("button", { name: "Open session" }));
+    await waitFor(() => expect(covers()).toBe("false"));
+  });
+
+  it("reads the session when the gadget its link names isn't linked there", async () => {
+    let listed: (gadgets: (typeof BOARD)[]) => void = () => {};
+    vi.mocked(getSessionGadgets).mockReturnValue(
+      new Promise((resolve) => {
+        listed = resolve;
+      }),
+    );
+    renderSession("/c/conv_abc?gadget=elsewhere", <CoverProbe />);
+    expect(covers()).toBe("true");
+
+    await act(async () => listed([BOARD]));
+    await waitFor(() => expect(covers()).toBe("false"));
+    // Nothing was asked of the rail for it, so no later visit can open it for nothing.
+    expect(useGadgetRailRequest.getState().requested).toBeNull();
+  });
+
+  describe("opened from a fresh link", () => {
+    beforeEach(() => {
+      // A desktop window, where the sidebar starts open.
+      const baseMatchMedia = window.matchMedia;
+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+        ...baseMatchMedia(query),
+        matches: query === `(min-width: ${MOBILE_BREAKPOINT_PX}px)`,
+      }));
+      onTestFinished(() => matchMedia.mockRestore());
+    });
+
+    it("fills the screen with the sidebar collapsed for a page load of the gadget's URL", async () => {
+      renderSession("/c/conv_abc?gadget=board");
+
+      await expectGadgetFullScreen();
+      expect(sidebar()).toHaveAttribute("data-open", "false");
+    });
+
+    it("fills the screen with the sidebar collapsed when the gadget link page hands a fresh load on", async () => {
+      renderSession("/c/conv_abc", <OpenGadget state={{ keepSidebar: false }} />);
+      expect(sidebar()).toHaveAttribute("data-open", "true");
+
+      fireEvent.click(screen.getByRole("button", { name: "open gadget" }));
+
+      await expectGadgetFullScreen();
+      expect(sidebar()).toHaveAttribute("data-open", "false");
+    });
   });
 });
 
@@ -7852,5 +8063,17 @@ describe("AppShell desktop Close", () => {
     expect(screen.queryByText("home")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("Mark all as read and Resume sandbox in ⌘K", () => {
+  it.each([false, true])("mount only with quick_pick_palette on (%s)", async (quickPick) => {
+    paletteCommandMounts.markAllRead = 0;
+    paletteCommandMounts.resumeSandbox = 0;
+    mockConversations([{ id: "conv_mark_all", permission_level: null }]);
+    renderShell("/c/conv_mark_all", serverInfo({ features: { quick_pick_palette: quickPick } }));
+    await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+    expect(paletteCommandMounts.markAllRead > 0).toBe(quickPick);
+    expect(paletteCommandMounts.resumeSandbox > 0).toBe(quickPick);
   });
 });

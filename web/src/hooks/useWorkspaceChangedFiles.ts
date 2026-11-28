@@ -15,7 +15,13 @@
 // (e.g. cloud-only agents).
 
 import { useCallback, useEffect, useRef } from "react";
-import { type UseQueryResult, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  type QueryClient,
+  type UseQueryResult,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -75,7 +81,8 @@ export function useWorkspaceServeable(conversationId: string | undefined): boole
 export function useTrailingInvalidate(
   conversationId: string | undefined,
   sessionActive: boolean,
-  queryKeyPrefix: string,
+  /** A query-key prefix, or the function that invalidates the session's data. */
+  invalidate: string | ((queryClient: QueryClient, conversationId: string) => void),
 ) {
   const queryClient = useQueryClient();
   const prev = useRef<{ id: string | undefined; active: boolean }>({
@@ -86,10 +93,10 @@ export function useTrailingInvalidate(
     const sameSession = prev.current.id === conversationId;
     const justWentIdle = sameSession && prev.current.active && !sessionActive;
     prev.current = { id: conversationId, active: sessionActive };
-    if (justWentIdle && conversationId) {
-      queryClient.invalidateQueries({ queryKey: [queryKeyPrefix, conversationId] });
-    }
-  }, [conversationId, sessionActive, queryClient, queryKeyPrefix]);
+    if (!justWentIdle || !conversationId) return;
+    if (typeof invalidate === "function") invalidate(queryClient, conversationId);
+    else void queryClient.invalidateQueries({ queryKey: [invalidate, conversationId] });
+  }, [conversationId, sessionActive, queryClient, invalidate]);
 }
 
 // The primary workspace environment is always "default".  Terminals also each
@@ -699,6 +706,16 @@ export function browseLocationSegment(location: string): string {
  */
 export function browseLocationBase(location: string): "host" | null {
   return location.startsWith("/") ? "host" : null;
+}
+
+/**
+ * The Go to File query a tree rooted at ``location`` starts with: the folder's
+ * workspace-relative path, e.g. ``src/shell/``. The workspace root and a folder
+ * outside the workspace, which the finder doesn't search, start empty.
+ */
+export function finderQueryPrefix(location: string): string {
+  if (location === "" || location.startsWith("/") || /^[A-Za-z]:[\\/]/.test(location)) return "";
+  return `${location.replace(/\/+$/, "")}/`;
 }
 
 /**

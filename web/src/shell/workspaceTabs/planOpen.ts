@@ -181,15 +181,17 @@ function sameShownPlace(left: WorkspacePlace, right: WorkspacePlace): boolean {
 }
 
 /**
- * The place a hidden tab brought forward shows. A Changes visit's old comparison would undo the
- * session's since; only a comparison the open asks for lands with it.
+ * The place a hidden tab brought forward shows. A Changes visit's old comparison, and the folder
+ * that showed it, would undo the session's since; only those the open asks for land with it.
  */
 function broughtForward(state: OpenState, tab: PlanTab, asked: WorkspacePlace): WorkspacePlace {
   const shown = tab.place;
   if (shown.kind !== "changes" || tab.id === state.selectedTabId) return shown;
-  const { comparison: _recorded, ...rest } = shown;
-  const comparison = asked.kind === "changes" ? asked.comparison : undefined;
-  return comparison === undefined ? rest : { ...rest, comparison };
+  const { comparison: _recorded, comparisonRoot: _recordedRoot, ...rest } = shown;
+  if (asked.kind !== "changes" || asked.comparison === undefined) return rest;
+  const place: WorkspacePlace = { ...rest, comparison: asked.comparison };
+  if (asked.comparisonRoot !== undefined) place.comparisonRoot = asked.comparisonRoot;
+  return place;
 }
 
 function withoutPosition(place: WorkspacePlace): WorkspacePlace {

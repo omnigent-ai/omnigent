@@ -505,18 +505,10 @@ def one_time_schedules_supported(request: Request) -> bool:
     return bool(getattr(request.app.state, "one_time_automations_enabled", False))
 
 
-async def _validate_rrule_or_400(
-    rrule: str, session_mode: str, execution_target: str, *, allow_single_fire: bool
-) -> None:
+async def _validate_rrule_or_400(rrule: str, *, allow_single_fire: bool) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
-        await asyncio.to_thread(
-            validate_rrule,
-            rrule,
-            session_mode=session_mode,
-            execution_target=execution_target,
-            allow_single_fire=allow_single_fire,
-        )
+        await asyncio.to_thread(validate_rrule, rrule, allow_single_fire=allow_single_fire)
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
@@ -1469,10 +1461,7 @@ def create_scheduled_tasks_router(
             _refuse_workflow_reuse(await _workflow_reuse_problem(typed_prompt, body.session_mode))
             await _require_runnable_workflow(request, typed_prompt, owner)
         await _validate_rrule_or_400(
-            body.rrule,
-            body.session_mode,
-            body.execution_target,
-            allow_single_fire=one_time_schedules_supported(request),
+            body.rrule, allow_single_fire=one_time_schedules_supported(request)
         )
         if body.first_run_at is not None and not one_time_schedules_supported(request):
             # Only the database scheduler saves the next run the check compares.
@@ -2196,12 +2185,9 @@ def create_scheduled_tasks_router(
         if body.prompt is not None and body.prompt != existing.prompt:
             await _require_runnable_workflow(request, body.prompt, owner)
         target_execution = fields.get("execution_target") or existing.execution_target
-        if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
+        if body.rrule is not None:
             await _validate_rrule_or_400(
-                body.rrule if body.rrule is not None else existing.rrule,
-                target_session_mode,
-                target_execution,
-                allow_single_fire=one_time_schedules_supported(request),
+                body.rrule, allow_single_fire=one_time_schedules_supported(request)
             )
         if target_session_mode == "new":
             if fields.get("session_id") is not None:

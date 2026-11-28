@@ -69,3 +69,65 @@ export function useWorkingCopyBaseIntent(): WorkingCopyBaseIntent {
     () => "automatic",
   );
 }
+
+/** Where a review reads and saves its base: the device's preference, or a folder's own. */
+export interface BaseIntentSource {
+  read: () => WorkingCopyBaseIntent;
+  write: (intent: WorkingCopyBaseIntent) => void;
+  subscribe: (listener: () => void) => () => void;
+}
+
+const WORKSPACE_BASE_INTENT: BaseIntentSource = {
+  read: readWorkingCopyBaseIntent,
+  write: (intent) => void writeWorkingCopyBaseIntent(intent),
+  subscribe: subscribeWorkingCopyBaseIntent,
+};
+
+/** Bases chosen in a repository folder's review, such as a worktree's, for this window. */
+const folderIntents = new Map<string, WorkingCopyBaseIntent>();
+const folderListeners = new Set<() => void>();
+const folderSources = new Map<string, BaseIntentSource>();
+
+/**
+ * The base source for `repository`, a folder relative to the workspace `workspaceKey` names;
+ * empty for the workspace's own preference. A folder follows that preference until a base is
+ * chosen in its review, and its choice changes neither the workspace's nor a folder of the
+ * same name in another workspace or on another host.
+ */
+export function baseIntentSource(repository: string, workspaceKey = ""): BaseIntentSource {
+  if (!repository) return WORKSPACE_BASE_INTENT;
+  const key = `${workspaceKey}\u0000${repository}`;
+  let source = folderSources.get(key);
+  if (!source) {
+    source = {
+      read: () => folderIntents.get(key) ?? readWorkingCopyBaseIntent(),
+      write: (intent) => {
+        folderIntents.set(key, intent);
+        folderListeners.forEach((listener) => listener());
+      },
+      subscribe: (listener) => {
+        folderListeners.add(listener);
+        const stopWorkspace = subscribeWorkingCopyBaseIntent(listener);
+        return () => {
+          folderListeners.delete(listener);
+          stopWorkspace();
+        };
+      },
+    };
+    folderSources.set(key, source);
+  }
+  return source;
+}
+
+/** `repository`'s current base, kept live; the workspace's preference for an empty one. */
+export function useBaseIntent(repository: string, workspaceKey = ""): WorkingCopyBaseIntent {
+  const source = baseIntentSource(repository, workspaceKey);
+  return useSyncExternalStore(source.subscribe, source.read, () => "automatic");
+}
+
+/** Forgets the bases chosen in folders, for tests. */
+export function resetFolderBaseIntentsForTests(): void {
+  folderIntents.clear();
+  folderSources.clear();
+  folderListeners.forEach((listener) => listener());
+}

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   canonicalPullRequestUrl,
+  githubPullRequestLocation,
   parsePullRequestReference,
   pullRequestIn,
   pullRequestKey,
@@ -468,5 +469,30 @@ describe("pullRequestIn", () => {
     expect(pullRequestKey("https://GitHub.com/ACME/App/pull/42/")).toBe(
       "https://github.com/acme/app/pull/42",
     );
+  });
+});
+
+describe("githubPullRequestLocation", () => {
+  it.each([
+    [
+      "https://github.com/Acme/App/pull/7",
+      { host: "github.com", repository: "Acme/App", number: 7 },
+    ],
+    [
+      "https://GHE.example.com:8443/acme/app/pull/12/files",
+      { host: "ghe.example.com:8443", repository: "acme/app", number: 12 },
+    ],
+  ])("reads %s", (url, location) => {
+    expect(githubPullRequestLocation(url)).toEqual(location);
+  });
+
+  it.each([
+    null,
+    "",
+    "not a link",
+    "ftp://github.com/acme/app/pull/7",
+    "https://github.com/acme/app/issues/7",
+  ])("is null for %j", (url) => {
+    expect(githubPullRequestLocation(url)).toBeNull();
   });
 });

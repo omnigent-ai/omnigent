@@ -78,7 +78,7 @@ import { subagentSessionIdFromTab, subagentTabId } from "@/lib/subagentTabs";
 import { ApiError, getSessionSlim } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
-import { requestTextSearch, useFileFinderAvailable } from "@/store/fileFinder";
+import { requestTextSearch, useTextSearchAvailable } from "@/store/fileFinder";
 import { isCommandAvailable } from "@/store/paletteCommands";
 import { usePullRequestListCount } from "@/store/pullRequestListCounts";
 
@@ -761,7 +761,7 @@ function WorkspaceTabsPanelImpl({
   }, [sideChatToOpen, conversationId, store, onReveal, clearSideChatToOpen]);
 
   // The New tab's "Search text" opens the same finder as ⌘K and its shortcut, where offered.
-  const textSearchAvailable = useFileFinderAvailable(conversationId);
+  const textSearchAvailable = useTextSearchAvailable(conversationId);
   const contentRef = useRef<HTMLDivElement>(null);
 
   // ── Closing ──────────────────────────────────────────────────────────────

@@ -524,6 +524,126 @@ async def test_forward_session_cost_splits_display_and_policy(
 
 
 @pytest.mark.asyncio
+async def test_forward_session_cost_prices_saved_inference_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Saved bindings price child spend; invalid bindings still forward known cost."""
+    from omnigent.llms.context_window import ModelPricing
+
+    def provider(rate: float, *, default: bool) -> dict[str, Any]:
+        return {
+            "kind": "local",
+            "default": default,
+            "anthropic": {
+                "base_url": "${OMNI_NATIVE_PRICING_ENDPOINT}",
+                "api_key": "${OMNI_NATIVE_PRICING_KEY}",
+                "pricing": {"input_per_million": rate, "output_per_million": 0.0},
+            },
+        }
+
+    monkeypatch.delenv("OMNI_NATIVE_PRICING_ENDPOINT", raising=False)
+    monkeypatch.delenv("OMNI_NATIVE_PRICING_KEY", raising=False)
+    ambient_config: dict[str, Any] = {"providers": {"ambient": provider(1.0, default=True)}}
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config._load_config",
+        lambda: ambient_config,
+    )
+    saved_path = tmp_path / "inference.json"
+    saved_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "cheap-default": provider(0.25, default=True),
+                    "launch-named": provider(7.0, default=False),
+                },
+                "inference": {"harnesses": {"claude-native": {"provider": "launch-named"}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(saved_path))
+    monkeypatch.setattr(bridge, "_TRANSCRIPT_PRICING_CACHE", {})
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda _model: pytest.fail("Static provider rates must not query the catalog"),
+    )
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    child = forwarder._subagents_dir_for_transcript(parent) / "agent-aaa.jsonl"
+    child.parent.mkdir(parents=True)
+    for path, tokens in [(parent, 100_000), (child, 200_000)]:
+        path.write_text(
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "model": "self-hosted",
+                        "usage": {"input_tokens": tokens, "output_tokens": 0},
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _: {"total_cost_usd": 0.01})
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") == "external_session_usage":
+            posted.append(body["data"])
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def poll() -> None:
+            await forwarder._forward_session_cost(
+                client=client,
+                session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                parent_transcript_path=parent,
+                subagent_state=forwarder.SubagentForwardState(
+                    subagents={
+                        "aaa": forwarder.SubagentEntry(
+                            subagent_id="aaa", child_conversation_id="conv_child"
+                        )
+                    }
+                ),
+                dedupe=forwarder._ForwardDedupeState(),
+                cost_cache={},
+            )
+
+        await poll()
+        caplog.clear()
+        monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG")
+        ambient_config.clear()
+        ambient_config["inference"] = {
+            "harnesses": {"claude-native": {"provider": "removed-provider"}}
+        }
+        monkeypatch.setattr(
+            "omnigent.llms.context_window.fetch_model_pricing",
+            lambda _: ModelPricing(input_per_token=3.0 / 1_000_000, output_per_token=0.0),
+        )
+        await poll()
+        assert "Could not resolve transcript pricing provider; using legacy pricing" in caplog.text
+    assert posted == [
+        {
+            "cumulative_cost_usd": pytest.approx(0.01),
+            "policy_cost_usd": pytest.approx(2.1),
+            "subagent_costs_usd": {"conv_child": pytest.approx(1.4)},
+        },
+        {
+            "cumulative_cost_usd": pytest.approx(0.01),
+            "policy_cost_usd": pytest.approx(0.9),
+            "subagent_costs_usd": {"conv_child": pytest.approx(0.6)},
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_forward_session_cost_attaches_changed_subagent_estimates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

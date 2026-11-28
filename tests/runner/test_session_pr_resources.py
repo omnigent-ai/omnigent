@@ -868,6 +868,124 @@ def _is_panel_view(args: list[str]) -> bool:
     return args[:2] == ["pr", "view"] and "statusCheckRollup" in args[-1]
 
 
+# What GitHub says the host's account may do with a conversation comment, or did there.
+_ACCOUNT_RIGHTS = ("can_react", "can_update", "can_delete", "viewer_did_author")
+
+
+def _comment_rights_gh(views: list[str]) -> Any:
+    """A ``gh`` whose selected PR has one conversation comment the host's account wrote."""
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        url = B if any("example/two" in arg for arg in args) else A
+        comment = {
+            "id": "IC_1",
+            "author": {"login": "amy"},
+            "body": "Looks good",
+            "createdAt": "2026-11-01T00:00:00Z",
+            "url": f"{url}#issuecomment-501",
+            "isMinimized": False,
+        }
+        if _is_panel_view(args):
+            views.append(url)
+            return 0, json.dumps({"number": 42, "url": url, "comments": [comment]}), ""
+        if "graphql" in args:
+            node = {
+                **comment,
+                "viewerCanReact": True,
+                "viewerCanUpdate": True,
+                "viewerCanDelete": True,
+                "viewerDidAuthor": True,
+                "reactionGroups": [
+                    {"content": "HEART", "viewerHasReacted": True, "reactors": {"totalCount": 1}}
+                ],
+            }
+            pull_request = {
+                "comments": {"nodes": [node]},
+                "timelineItems": {"nodes": [], "pageInfo": {"hasPreviousPage": False}},
+            }
+            return 0, json.dumps({"data": {"repository": {"pullRequest": pull_request}}}), ""
+        return 0, json.dumps({"title": "Listed"}), ""
+
+    return gh
+
+
+def _shows_account_rights(info: dict[str, Any]) -> bool:
+    """Whether any of the five account fields reach the caller; IDs and counts always do."""
+    (comment,) = info["pr"]["comments"]
+    assert comment["id"] == "IC_1"
+    assert comment["database_id"] == 501
+    assert [reaction["count"] for reaction in comment["reactions"]] == [1]
+    fields = [name for name in _ACCOUNT_RIGHTS if name in comment]
+    fields += [
+        "viewer_reacted" for reaction in comment["reactions"] if "viewer_reacted" in reaction
+    ]
+    assert fields in ([], [*_ACCOUNT_RIGHTS, "viewer_reacted"]), fields
+    return bool(fields)
+
+
+def test_a_panel_read_hands_out_the_accounts_rights_only_when_asked_whatever_it_cached(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One cached read serves both, so neither reader's ask decides what the other gets."""
+    views: list[str] = []
+    monkeypatch.setattr(github, "_gh", _comment_rights_gh(views))
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    read = functools.partial(pr_resource.cached_pr_info, tracked, session_id="session")
+
+    # The owner reads first; a poll that didn't ask answers from that read without them.
+    assert _shows_account_rights(read(pr_url=B, account_rights=True))
+    assert not _shows_account_rights(read(pr_url=B, allow_cached=True))
+    # A read that didn't ask comes first; the owner's poll from it still gets them.
+    assert not _shows_account_rights(read(pr_url=A))
+    assert _shows_account_rights(read(pr_url=A, allow_cached=True, account_rights=True))
+    assert views == [B, A]
+
+
+def test_the_hosts_overview_reads_and_changes_hand_out_the_accounts_rights_only_when_asked(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github, "_gh", _comment_rights_gh([]))
+    reader = WorkspaceReader(Path(tracked))
+    assert not _shows_account_rights(reader.github_info("session", B))
+    assert _shows_account_rights(reader.github_info("session", B, account_rights=True))
+    preference = functools.partial(
+        pr_resource.set_pr_preference, tracked, session_id="session", pr_url=B
+    )
+    assert not _shows_account_rights(preference())
+    assert _shows_account_rights(preference(account_rights=True))
+    assert not _shows_account_rights(
+        pr_resource.update_session_pr(tracked, "session", B, "attach")
+    )
+
+
+@pytest.mark.parametrize("transport", ["runner", "host"])
+@pytest.mark.parametrize("account_rights", [False, True], ids=["older-server", "owner-asks"])
+async def test_the_overview_reaches_its_caller_with_the_accounts_rights_only_when_asked(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, transport: str, account_rights: bool
+) -> None:
+    monkeypatch.setattr(github, "_gh", _comment_rights_gh([]))
+    params: dict[str, Any] = {"pr_url": B}
+    if transport == "runner":
+        if account_rights:
+            params["account_rights"] = "true"
+        app = create_runner_app(runner_workspace=Path(tracked), server_client=NullServerClient())  # type: ignore[arg-type]
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await client.get("/v1/sessions/session/resources/github", params=params)
+        assert response.status_code == 200, response.text
+        info = response.json()
+    else:
+        from omnigent.host.connect import HostProcess
+
+        if account_rights:
+            params["account_rights"] = True
+        info = HostProcess._dispatch_fs_op(
+            WorkspaceReader(Path(tracked)), "github_info", "session", params
+        )
+    assert _shows_account_rights(info) is account_rights
+
+
 def test_panel_polls_share_a_recent_read_and_refresh_an_older_one_in_the_background(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -66,7 +66,16 @@ the header menu), and each place is a separate entry point.
   marked, so a just-archived session leads the list; Find a session by name
   (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
-  the search. Desktop and mobile search use the same context.
+  the search. Desktop and mobile search use the same context. With the tabs
+  sidebar on a desktop window, ⌘K's **Search in Sessions…** opens Go to File on
+  its **Sessions** tab, with or without an open session: the same search, with a
+  preview of the matching message beside the list; a failed search or page
+  shows with Retry. Ctrl-N and Ctrl-P step the palette's rows as the arrows do,
+  in the Windows and Linux desktop app too: its menu's New Session accelerator
+  yields Ctrl+N while the palette has focus (see `composer.md`'s new-session
+  hotkey).
+  Closing it with Escape, or with a command that leaves focus alone, returns the
+  keyboard to the field it was opened from.
 - `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
   sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
   device for this server; changing one reloads the page. **Clear all flag overrides**
@@ -77,19 +86,38 @@ the header menu), and each place is a separate entry point.
   under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,
   Rename, Mark as unread, Create automation, Archive or Unarchive, and Delete.
   The QuickPick palette (`quick_pick_palette`) always lists them; the default
-  palette lists them where `workspace_sidebar_v2` shows feature commands. They're
+  palette lists them where `workspace_sidebar_v2` shows feature commands (with the
+  `gadgets` feature on, sessions keep the classic sidebar, so it doesn't). They're
   offered to the session's owner, as the header menu is; one that can't run
   stays listed with the reason, and a dialog such as Rename opens with focus in
   it. With `quick_pick_palette`, **Go to Session…** turns the open palette into
   the session switcher; Escape returns focus to where ⌘K was opened.
+- `palette-session-actions`: with `quick_pick_palette` on, ⌘↵ (Ctrl+Enter) on
+  any session's ⌘K row lists that session's row-menu actions, such as Open in
+  new window, Pin, Rename, Add to project, Mute, Archive and Delete; Back
+  returns to the row. Verb-first rows such as **Archive a Session…** ask which
+  session first, searching as ⌘K does (a pasted `#123` or pull request link
+  finds the loaded session linked to it), then list the picked session's
+  actions on that verb, or say why it doesn't apply. Each action is checked
+  against the session's current state as it runs and uses the row menu's
+  dialogs. Archiving or deleting the open session leaves its view; an archive
+  opens the session visited before it. In the desktop app the flag also
+  replaces Ctrl+Tab's recent sessions switcher with Next and Previous session.
+  On macOS, ⌃] / ⌃[ open the held recent-session switcher, from ⌘K too
+  (`web/src/shell/QuickPickCommandPalette.sessionActions.test.tsx`,
+  `web/src/shell/sessionCommands/SessionActionHost.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py`).
 - `palette-screen-commands`: with `quick_pick_palette` on (off by default), ⌘K
   also lists the open screen's own actions, each run by its button's handler.
   Under **Conversation**: Copy latest response, Copy link to latest response,
   Fork from latest response… (the message's Fork, opening the same dialog), Copy
-  latest prompt, Copy link to latest prompt, Scroll to newest message, and Stop
-  response while a turn runs. They target the latest message the transcript
-  shows, and one that can't run yet, such as before the first response or for
-  an attachment-only prompt, stays listed with the reason. Under **Canvas**,
+  latest prompt, Copy link to latest prompt, Go to previous message and Go to
+  next message (⌘⌥↑ / ⌘⌥↓, Ctrl+Alt off macOS, the transcript's own steps),
+  Scroll to newest message, and Stop response while a turn runs. They target
+  the latest message the transcript shows, and one that can't run yet, such as
+  before the first response or for an attachment-only prompt, stays listed with
+  the reason. With the flag on, Ctrl+Alt+Shift+↑/↓ off macOS is Previous and
+  Next session rather than a message step. Under **Canvas**,
   while a conversation pane is open: Back to canvas when it fills the window,
   else Focus conversation or Show canvas beside conversation, and Close
   conversation pane. The open grid's sidebar row adds Rename grid…, which edits
@@ -98,6 +126,15 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+  On the Inbox, ⌘K lists under **Inbox** the **Inbox filter** setting (the tabs)
+  and, for each card, what the card itself offers: Open, Open to respond, Mark
+  as read, Reply…, which expands the card and focuses its reply field where the
+  viewer can reply, and an automation's Open or Mark failed as read. Under
+  **Sessions**, Mark all as read clears every loaded unread session, and the
+  open session's **Conversation** group adds Resume sandbox while its sandbox
+  sleeps or failed to wake (`web/src/pages/InboxPage.test.tsx`,
+  `web/src/shell/markAllReadPaletteCommand.test.tsx`,
+  `web/src/shell/resumeSandboxCommand.test.tsx`).
 - `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
   `floating_panes` on, and not a touch device), the QuickPick palette lists the
   **Pane corners** setting. **Automatic** follows the server's `floating_panes`
@@ -113,6 +150,18 @@ the header menu), and each place is a separate entry point.
   The classic layout, a phone and a grid route don't offer them
   (`web/src/shell/AppShell.workspaceSidebarV2.test.tsx`,
   `tests/e2e_ui/sessions/test_workspace_sidebar_v2.py`).
+- `palette-project-commands`: with `quick_pick_palette` on, ⌘K lists the project
+  in view's folder actions under **Project**, each naming it: New session in it,
+  Project settings, Rename project and Delete project. The project in view is the
+  open session's, or the one the new-session view is filed under, which skips
+  New session. Each opens the folder menu's own dialog. A rename keeps the
+  folder expanded, and the new-session view follows a rename or leaves once the
+  project is deleted. A session filed in a project the viewer doesn't have,
+  such as a shared one, offers none, and a session's project label counts only
+  on the viewer's own session. The project home lists its own. **New project…**
+  opens the Projects header's dialog while the sidebar lists projects
+  (`web/src/shell/projectCommands/ProjectActionHost.test.tsx`,
+  `web/src/shell/NewProjectButton.test.tsx`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -301,6 +350,12 @@ the header menu), and each place is a separate entry point.
   folder glyph) under the title wherever the row isn't inside that project's folder: pins,
   Shared with me, and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
+  With `quick_pick_palette` on, ⌘K offers each submenu as a setting showing its
+  choice ("Session List: Group by", "Session List: Display", "Session List: Sort
+  by", and "Session List: Show …" for each field), running the menu's handlers;
+  without the grouping flag only Display is offered
+  (`web/src/shell/Sidebar.paletteCommands.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_switches_the_session_lists_display`).
   Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
@@ -350,6 +405,37 @@ the header menu), and each place is a separate entry point.
   with its cost, including its own sub-agents; an unpriced one shows no cost.
   A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
   Agents list and graph show the same costs beside each agent.
+- `gadgets`: with the server's `gadgets` feature on, a session's side panel
+  shows the gadgets linked to it as tabs, and **New → Gadget** adds one; with it
+  off none of this appears. A tab can fill the screen, leaving only the gadget
+  and its **Open session** button. Opening a gadget from inside the app (the
+  Gadget page, its pin under **Gadget** in the sidebar, an in-app link) fills the
+  screen and leaves the sidebar as it was; loading a gadget's link fresh fills
+  the screen with the sidebar collapsed. A gadget action that needs a session
+  keeps the gadget full screen: it goes to the linked session, or opens the
+  **Create session** menu over a dimmed page, and the session created there is
+  linked to the gadget and gets the action. On a phone, the session header's menu
+  lists each linked gadget by name; choosing one opens it in a drawer over the
+  session, and **Close** shows the session again. New gadgets start on the
+  Gadget page's **New** button (also at `/gadget/new`): describe one and press
+  **Build**, or open a template's **Preview** and press **Use template**; Blank
+  is made in one click. With gadgets on, sessions keep this side panel even when
+  `workspace_sidebar_v2` is on, because gadget tabs and full screen live only in
+  it. A gadget's toolbar renames it in place from its name, and has **Comments**
+  (where **Address all** sends the open comments to its session), **Share** (only where
+  the server offers gadget sharing; the bundled SQL store doesn't yet), and a **⋯** menu with
+  **Gadget details**, **Make a copy** (for a published gadget: a copy the viewer owns, with
+  its data if they check **Copy its data too**) and **Delete gadget**.
+  A gadget's collections are shared, or per viewer (`collection_scopes`): in a
+  per-viewer collection each viewer, even one who can only view, keeps their own
+  records, which no one else sees and a copy never takes. A gadget that asks to
+  read the viewer's sessions waits for **Allow** / **Don’t allow** first; a gadget
+  that navigated itself stops with **Reload gadget**, after which it asks again.
+  The Gadget page lists the viewer's gadgets and, with sharing, a **Shared with you** section; each
+  row's **⋯** menu has **Rename**, **Pin to sidebar** / **Unpin from sidebar** and
+  **Delete gadget**, as the viewer's access allows. Closing a gadget's tab takes it out
+  of that session's side panel for the viewer who closed it only; it stays linked for
+  others who show it there.
 
 ## How to get to it (user POV)
 
@@ -509,6 +595,12 @@ Escape cancels, and the dialog remains the place to change its emoji. Delete pro
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
+With `quick_pick_palette` on, open a session filed in a project, press
+Cmd/Ctrl+K and type "rename project" to open the same dialog for its project.
+Type "move project" there for the folder menu's Move choices (greyed at the
+list's edges and while the order loads or saves), or "sort projects", "expand
+all projects", "collapse all projects" and "select sessions" for the Projects
+header's actions, which ⌘K offers whenever the header does.
 
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
@@ -524,7 +616,10 @@ project still opens that folder.
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot: the line marks whether it lands above or below the row. Release it
 just below the last pin to pin it at the bottom. Only standalone sessions and
-family representatives can be dragged to pin or reorder a pin.
+family representatives can be dragged to pin or reorder a pin. With
+`quick_pick_palette` on, open a pinned session and press Cmd/Ctrl+K for Move to
+top of Pinned, Move up in Pinned and Move down in Pinned, each offered only
+where it would move the pin and making the same write as a drop.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
@@ -535,6 +630,11 @@ drawer, then drag it. Ordering → Custom in the filter menu keeps the order sho
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (mark as read or unread, archive, unarchive, delete). Deleting sessions
 automations run from names those automations and deletes them first.
+With `quick_pick_palette` on, ⌘K offers Select all sessions and Deselect all sessions while
+selecting, and the selection bar's actions greyed as its buttons are; archiving
+the open session from the bar lands where ⌘K's Archive does
+(`web/src/shell/Sidebar.selectionPaletteCommands.test.tsx`,
+`web/src/shell/Sidebar.archive.test.tsx`).
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, export, rename, mark as unread, create automation, add to project,
@@ -638,6 +738,8 @@ host-dependent unlink behavior.
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
 cards. Choosing Canvas in the sidebar returns to the selected board.
+With `quick_pick_palette` on, ⌘K's Go to Canvas and Go to Usage open the same
+pages as the sidebar's links, and are offered exactly when those links show.
 Drag the divider to resize, or focus it and use Left/Right arrows to
 adjust the split and Home/End to reach its limits. Double-click the divider to
 restore the default split. Focus the session to use the full area; Escape
@@ -791,7 +893,7 @@ from the composer's add tray. Selecting assistant text also offers **Ask in side
 chat** unless the composer is read-only. Viewers and editors of a shared session
 see none of these. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
-chats** reopens it. With `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a touch client), side chats open as
+chats** reopens it. With `workspace_sidebar_v2` on and the `gadgets` feature off, in a desktop app or desktop browser (not a touch client), side chats open as
 tabs in the workspace sidebar, and **Side chats** shows the session's side chat
 tab, or a New tab to start one. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
@@ -1571,6 +1673,18 @@ outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
 its discoverability.
+- **`gadgets`:** no browser test drives it. `web/src/shell/AppShell.test.tsx`
+  ("gadget full screen contract") renders the real shell: an in-app open keeps the
+  sidebar as it was, a fresh link collapses it. `web/src/gadgets/host/gadgetSession.test.ts`
+  (same name) covers actions staying full screen and the Create session menu;
+  `web/src/gadgets/ui/GadgetRailTabs.test.tsx` covers the tabs, New → Gadget and
+  full screen, and `web/src/gadgets/ui/GadgetOpenSessionButton.test.tsx` the menu.
+  By hand: start a local server with `OMNIGENT_FEATURES=gadgets`, create a gadget
+  from the Gadget page, open it from the sidebar pin (sidebar stays) and from its
+  copied link in a new tab (sidebar collapses). The templates' own buttons send
+  actions to the gadget's session the same way: Data story's **Find stories in my
+  work** (before a story exists) and **Refresh data**, and the agent-designed views'
+  **Back to the previous look**; `web/src/gadgets/templates/*.test.ts` drive them.
 
 ## Gotchas
 

@@ -71,6 +71,8 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.claude_paths import claude_account_home_dir as _account_home_dir
+from omnigent.claude_paths import claude_joined_path as _claude_joined_path
 from omnigent.harnesses.claude_native import (
     PEER_MESSAGE_WAKE_KIND,
     PEER_MESSAGE_WAKE_TEXT,
@@ -2011,7 +2013,7 @@ def claude_global_config_path(
     :returns: The config file path, e.g. ``Path("/home/user/.claude.json")``.
     """
     env = os.environ if env is None else env
-    base = cwd if cwd is not None else Path.cwd()
+    base = cwd
     # Claude builds these with ``path.join``: no ``~`` expansion, ``..`` removed
     # lexically, and relative results resolved against its cwd.
     home_value = env.get("HOME") or str(_account_home_dir())
@@ -2021,7 +2023,7 @@ def claude_global_config_path(
         legacy_dir = unicodedata.normalize("NFC", os.path.join(home_value, ".claude"))
         legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
     elif not config_dir:
-        legacy_path = base / ".config.json"
+        legacy_path = _claude_joined_path(base, "", ".config.json")
     else:
         legacy_dir = unicodedata.normalize("NFC", config_dir)
         legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
@@ -2029,41 +2031,6 @@ def claude_global_config_path(
         return legacy_path
     suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
     return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
-
-
-def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
-    """
-    Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
-
-    ``path.join`` removes ``.`` and ``..`` lexically, without following
-    symlinks, before the filesystem resolves a relative result against
-    Claude's working directory.
-
-    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
-    :param directory: The joined directory value, e.g. ``"x/../cfg"``.
-    :param name: The config file name, e.g. ``".claude.json"``.
-    :returns: The file path, e.g. ``Path("/home/user/repo/cfg/.claude.json")``.
-    """
-    joined = os.path.normpath(os.path.join(directory, name))
-    return Path(joined) if os.path.isabs(joined) else cwd / joined
-
-
-def _account_home_dir() -> Path:
-    """
-    Return the account's home directory, as Claude's runtime does without ``HOME``.
-
-    Claude Code's runtime ignores an unset or empty ``HOME`` and reads the
-    password database, so the runner's own ``HOME`` is not a substitute.
-
-    :returns: The passwd home directory, e.g. ``Path("/home/user")``, or
-        :meth:`Path.home` where no password database exists.
-    """
-    try:
-        import pwd  # noqa: FlagLocalImports - POSIX-only module
-
-        return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError):
-        return Path.home()
 
 
 def ensure_claude_workspace_trusted(
@@ -3146,6 +3113,7 @@ def augment_claude_args(
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
+    defer_inherited_mcp_discovery: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3199,6 +3167,11 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :param defer_inherited_mcp_discovery: ``True`` when the caller resolves the
+        launch cwd and environment later and then calls
+        :func:`apply_claude_launch_mcp_policy`; otherwise strict MCP mode reads
+        inherited settings for *workspace* and this process's environment.
     :returns: Augmented argument list for the terminal resource.
     """
     hook_settings = build_hook_settings(
@@ -3215,10 +3188,14 @@ def augment_claude_args(
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
-    from omnigent.mcp_disabled_servers import apply_claude_settings
-
-    hook_settings = apply_claude_settings(
-        hook_settings, executor="claude-native", active_harnesses=active_harnesses
+    hook_settings = _apply_native_mcp_settings(
+        hook_settings,
+        active_harnesses=active_harnesses,
+        cwd=workspace,
+        env=None,
+        discover_inherited=not defer_inherited_mcp_discovery,
+        setting_sources=[] if skills_filter == "none" else _claude_setting_sources(claude_args),
+        claude_args=claude_args,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -3252,6 +3229,82 @@ def augment_claude_args(
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)
+
+
+def apply_claude_launch_mcp_policy(
+    bridge_dir: Path,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    active_harnesses: Collection[str] | None,
+    claude_args: Sequence[str] = (),
+) -> None:
+    """
+    Apply strict MCP discovery to the invocation settings for Claude's launch context.
+
+    Completes :func:`augment_claude_args` called with
+    ``defer_inherited_mcp_discovery=True``, reading the settings files the launched
+    CLI reads from *cwd* and *env*.
+
+    :param bridge_dir: Bridge directory holding the invocation settings.
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+    :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :param claude_args: Effective CLI arguments, including the selected settings scopes.
+    :raises McpStrictModeError: When strict mode cannot narrow the inherited settings.
+    """
+    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    updated = _apply_native_mcp_settings(
+        settings,
+        active_harnesses=active_harnesses,
+        cwd=cwd,
+        env=env,
+        discover_inherited=True,
+        setting_sources=_claude_setting_sources(claude_args),
+        claude_args=claude_args,
+    )
+    if updated is not settings:
+        _write_json_file(settings_path, updated)
+
+
+def _apply_native_mcp_settings(
+    settings: dict[str, object],
+    *,
+    active_harnesses: Collection[str] | None,
+    cwd: Path | None,
+    env: Mapping[str, str] | None,
+    discover_inherited: bool,
+    setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
+) -> dict[str, object]:
+    """The single claude-native MCP launch hook, shared by both settings passes."""
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    return apply_claude_settings(
+        settings,
+        executor="claude-native",
+        active_harnesses=active_harnesses,
+        cwd=cwd,
+        env=env,
+        discover_inherited=discover_inherited,
+        setting_sources=setting_sources,
+        claude_args=claude_args,
+    )
+
+
+def _claude_setting_sources(args: Sequence[str]) -> list[str] | None:
+    """Read the last explicit settings scope selection, including an empty one."""
+    selected = None
+    tokens = iter(args)
+    for token in tokens:
+        if token == "--":
+            break
+        if token == "--setting-sources":
+            selected = next(tokens, "")
+        elif token.startswith("--setting-sources="):
+            selected = token.partition("=")[2]
+    return selected.split(",") if selected else ([] if selected is not None else None)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
@@ -4224,8 +4277,8 @@ def _transcript_model_pricing(
 
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
-    :param provider_config: Parsed provider configuration for this transcript
-        scan.
+    :param provider_config: Runtime provider configuration, including any saved
+        inference binding, for this transcript scan.
     :param provider_config_fingerprint: Digest used to invalidate pricing when
         the provider configuration changes.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing
@@ -4235,11 +4288,19 @@ def _transcript_model_pricing(
     cached = _TRANSCRIPT_PRICING_CACHE.get(model)
     if cached is not None and cached[0] == provider_config_fingerprint:
         return cached[1]
+    from omnigent.inference_config import resolve_bound_provider
     from omnigent.llms.context_window import fetch_model_pricing_with_provider
 
-    # For claude-native transcript pricing, assume claude-native harness
+    try:
+        provider_entry = resolve_bound_provider(provider_config, "claude-native", allow_empty=True)
+    except Exception:  # noqa: BLE001 — pricing must not interrupt usage forwarding.
+        _logger.warning("Could not resolve transcript pricing provider; using legacy pricing")
+        provider_entry = None
     pricing = fetch_model_pricing_with_provider(
-        model, provider_config=provider_config, harness="claude-native"
+        model,
+        provider_config=provider_config,
+        harness="claude-native",
+        provider_entry=provider_entry,
     )
     if pricing is not None:
         _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)

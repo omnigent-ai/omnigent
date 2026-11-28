@@ -1,15 +1,27 @@
-"""Review and comment changes on the session's selected pull request.
+"""Review, comment, merge queue, stack and image calls on the session's selected pull request.
 
-These are the wrappers the workspace API's review methods call. Each checks its
-fields and the session's link to a GitHub pull request, then runs the GitHub code
-in :mod:`omnigent.runner.github_reviews`.
+These are the wrappers the workspace API's review, merge queue, stack and image methods
+call. Each checks its fields and the session's link to a GitHub pull request, then runs
+the GitHub code in :mod:`omnigent.runner.github_reviews`,
+:mod:`omnigent.runner.github_merge_queue`, :mod:`omnigent.runner.github_stack` or
+:mod:`omnigent.runner.github_images`.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from omnigent.runner import github_reviews, pr_resource
+from omnigent.runner import (
+    github_images,
+    github_lifecycle,
+    github_merge_queue,
+    github_native_stack,
+    github_resource,
+    github_reviews,
+    github_stack,
+    pr_resource,
+)
+from omnigent.runner.github_images import PullRequestImage
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
     COMMENT_REVIEW_EVENT,
@@ -23,6 +35,7 @@ from omnigent.runner.pull_request_errors import InvalidPullRequestInput
 from omnigent.runner.session_prs import PullRequestRef
 
 _UNSELECTED = "Select a pull request to change it"
+AUTO_MERGE_BATCH_LIMIT = 20
 
 
 def _target(session_id: str | None, pr_url: str | None) -> PullRequestRef:
@@ -286,6 +299,17 @@ def _comment_fields(kind: object, comment_id: object) -> dict[str, Any]:
     return {"kind": kind, "comment_id": comment_id}
 
 
+def _change_comment(
+    change: Any, root: str, reference: PullRequestRef, fields: dict[str, Any], **values: Any
+) -> dict[str, Any]:
+    """Run ``change``; a conversation comment's next reads skip gh's cache, even if it failed."""
+    try:
+        return change(root, reference, **fields, **values)
+    finally:
+        if fields["kind"] == "issue":
+            github_resource.conversation_changed(reference.url)
+
+
 def edit_comment(
     root: str,
     *,
@@ -299,12 +323,13 @@ def edit_comment(
     """Change your own comment's text, only while it still reads as the client last saw it."""
     fields = _comment_fields(kind, comment_id)
     text = _body(body)
-    return github_reviews.edit_comment(
+    return _change_comment(
+        github_reviews.edit_comment,
         root,
         _target(session_id, pr_url),
+        fields,
         body=text,
         expected_body_sha256=_sha256(expected_body_sha256),
-        **fields,
     )
 
 
@@ -313,7 +338,9 @@ def delete_comment(
 ) -> dict[str, Any]:
     """Delete your own comment."""
     fields = _comment_fields(kind, comment_id)
-    return github_reviews.delete_comment(root, _target(session_id, pr_url), **fields)
+    return _change_comment(
+        github_reviews.delete_comment, root, _target(session_id, pr_url), fields
+    )
 
 
 def add_reaction(
@@ -327,8 +354,12 @@ def add_reaction(
 ) -> dict[str, Any]:
     """Add the host account's reaction to a comment."""
     fields = _comment_fields(kind, comment_id)
-    return github_reviews.add_reaction(
-        root, _target(session_id, pr_url), content=str(content), **fields
+    return _change_comment(
+        github_reviews.add_reaction,
+        root,
+        _target(session_id, pr_url),
+        fields,
+        content=str(content),
     )
 
 
@@ -343,6 +374,98 @@ def remove_reaction(
 ) -> dict[str, Any]:
     """Remove the host account's reaction from a comment."""
     fields = _comment_fields(kind, comment_id)
-    return github_reviews.remove_reaction(
-        root, _target(session_id, pr_url), content=str(content), **fields
+    return _change_comment(
+        github_reviews.remove_reaction,
+        root,
+        _target(session_id, pr_url),
+        fields,
+        content=str(content),
     )
+
+
+def get_merge_queue(root: str, *, session_id: str | None, pr_url: str | None) -> dict[str, Any]:
+    """Whether the pull request's branch has a merge queue, and its place in it."""
+    return github_merge_queue.get_merge_queue(root, _target(session_id, pr_url))
+
+
+def enqueue_pull_request(
+    root: str, *, session_id: str | None, pr_url: str | None, expected_head_oid: object
+) -> dict[str, Any]:
+    """Add the pull request to its base branch's merge queue, at the head the user saw."""
+    head = _commit(expected_head_oid, "expected_head_oid")
+    return github_merge_queue.enqueue(root, _target(session_id, pr_url), expected_head_oid=head)
+
+
+def dequeue_pull_request(
+    root: str, *, session_id: str | None, pr_url: str | None
+) -> dict[str, Any]:
+    """Remove the pull request from its merge queue."""
+    return github_merge_queue.dequeue(root, _target(session_id, pr_url))
+
+
+def get_pull_request_stack(
+    root: str, *, session_id: str | None, pr_url: str | None
+) -> dict[str, Any]:
+    """The stack around the pull request, found through its branches."""
+    return github_stack.pull_request_stack(root, _target(session_id, pr_url))
+
+
+def get_pull_request_native_stack(
+    root: str, *, session_id: str | None, pr_url: str | None
+) -> dict[str, Any]:
+    """GitHub's own record of the stack the pull request is in, where its host has one."""
+    return github_native_stack.pull_request_native_stack(root, _target(session_id, pr_url))
+
+
+def set_pull_request_state(
+    root: str, *, session_id: str | None, pr_url: str | None, state: object
+) -> dict[str, Any]:
+    """Close or reopen the pull request."""
+    if state not in ("closed", "open"):
+        raise InvalidPullRequestInput("Expected state to be closed or open")
+    return github_lifecycle.set_state(root, _target(session_id, pr_url), state=str(state))
+
+
+def set_pull_request_draft(
+    root: str, *, session_id: str | None, pr_url: str | None, draft: object
+) -> dict[str, Any]:
+    """Make the pull request a draft, or mark it ready for review."""
+    if not isinstance(draft, bool):
+        raise InvalidPullRequestInput("Expected draft to be true or false")
+    return github_lifecycle.set_draft(root, _target(session_id, pr_url), draft=draft)
+
+
+def enable_auto_merge(
+    root: str, *, session_id: str | None, items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Turn on auto-merge for each pull request, in one batch.
+
+    Every pull request is checked against the session before any is sent.
+    """
+    if not 1 <= len(items) <= AUTO_MERGE_BATCH_LIMIT:
+        raise InvalidPullRequestInput(
+            f"Enable auto-merge for 1 to {AUTO_MERGE_BATCH_LIMIT} pull requests at once"
+        )
+    batch: list[github_lifecycle.AutoMergeItem] = []
+    for item in items:
+        method = item.get("merge_method")
+        if method not in github_lifecycle.MERGE_METHODS:
+            raise InvalidPullRequestInput("Expected merge_method to be merge, squash, or rebase")
+        reference = _target(session_id, item.get("pr_url"))
+        if any(queued.reference.url == reference.url for queued in batch):
+            raise InvalidPullRequestInput("Name each pull request once")
+        batch.append(
+            github_lifecycle.AutoMergeItem(
+                reference=reference,
+                merge_method=str(method),
+                expected_head_oid=_commit(item.get("expected_head_oid"), "expected_head_oid"),
+            )
+        )
+    return github_lifecycle.enable_auto_merge(root, batch)
+
+
+def read_pull_request_image(
+    root: str, *, session_id: str | None, pr_url: str | None, image_url: str
+) -> PullRequestImage:
+    """The attachment image at ``image_url`` on the selected pull request's host."""
+    return github_images.read_pull_request_image(root, _target(session_id, pr_url), image_url)

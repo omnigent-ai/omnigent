@@ -3,6 +3,7 @@ import {
   updateNestedSessionDraft,
   removeNestedSessionDraft,
 } from "@/lib/nestedSessionDrafts";
+import { GADGET_START_PARAM } from "@/gadgets/host/gadgetPages";
 import { useSiblingSessionDestinations } from "@/hooks/useSharing";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
@@ -28,7 +29,7 @@ import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/rout
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import { projectHomePath } from "@/projectHome/projectHomeNavigation";
-import { MobileHeaderControlPortal } from "./MobileHeaderControlsSlot";
+import { MobileHeaderControlPortal, SessionControlPortal } from "./MobileHeaderControlsSlot";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import {
   ComposerWorkspaceBar,
@@ -209,6 +210,13 @@ import {
   setPendingInitialPrompt,
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
+import {
+  beginSessionCreation,
+  noteSessionCreatedHere,
+  noteSessionCreationFailed,
+  noteFirstInputAccepted,
+} from "@/lib/sessionCreations";
+import { useGadgetRailRequest } from "@/lib/gadgetRailTabs";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
@@ -5010,6 +5018,33 @@ function NewChatLandingContent({
     selectedAgent?.harness,
     harnessWarningHost,
   );
+  // What Create session in a full screen gadget's menu sends: the composer's own text, which
+  // full screen hides, however it got there (typed, a prompt link, or the gadget). The menu
+  // shows it unless that same menu already shows the same text as one its gadget wrote.
+  const gadgetWrittenReview = useGadgetRailRequest((state) => state.createSessionReview);
+  const gadgetReviewShownFor = useGadgetRailRequest((state) => state.createSessionReviewShownFor);
+  const gadgetCreateDraft = message.trim();
+  const gadgetCreateDraftShown =
+    gadgetCreateDraft !== "" &&
+    !(
+      gadgetWrittenReview !== null &&
+      gadgetReviewShownFor === gadgetWrittenReview.gadgetId &&
+      gadgetWrittenReview.prompt.trim() === gadgetCreateDraft
+    );
+  // New session only warns about a harness the host can't run (the host re-checks at launch),
+  // but a full screen gadget's menu hides that warning: there Create session waits for one the
+  // host can run, and says why.
+  const gadgetCreateHarnessBlocker =
+    selectedAgentUnconfigured &&
+    harnessWarningHost != null &&
+    !harnessReadinessOnHost(selectedAgent?.harness, harnessWarningHost).selectable
+      ? harnessWarningMessage(
+          selectedAgent?.display_name,
+          harnessWarningHost.name,
+          harnessUnavailableReasonOnHost(selectedAgent?.harness, harnessWarningHost),
+          selectedAgent?.harness,
+        )
+      : null;
   // Smart Routing routes between native Claude Code and Codex, so both wrapper
   // agents must be registered and both CLIs ready on the target host — a router
   // with one arm is just that arm. The Claude wrapper is the placeholder the
@@ -6293,6 +6328,10 @@ function NewChatLandingContent({
       createToken: string;
     } | null = null;
     let createdSessionId: string | undefined;
+    // A page waiting on this create (a gadget's New session) learns of the session only once
+    // it took its first message; any other end of this call reports the attempt failed.
+    const creationAttempt = beginSessionCreation();
+    let creationNoted = false;
     let undeliveredPrompt: PendingInitialPrompt | null = null;
     // Single teardown for EVERY create-failure exit (the `catch` and the
     // `"error" in created` early return): drop the client-only conversation and,
@@ -6305,8 +6344,10 @@ function NewChatLandingContent({
       const wasViewing = removeLocalConversation(localConv.tempConvId);
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
       if (wasViewing && stillOnTempRoute) {
+        // Back where the create started, keeping a gadget's New session (and full screen):
+        // a failed create is not the viewer leaving the gadget behind.
         navigate(
-          returnToCanvas || siblingSourceId
+          returnToCanvas || siblingSourceId || searchParams.has(GADGET_START_PARAM)
             ? { pathname: "/", search: `?${searchParams.toString()}` }
             : "/",
         );
@@ -6581,6 +6622,12 @@ function NewChatLandingContent({
         if (!siblingSourceId && !sandboxSelected && selectedHostId && workspaceTrimmed) {
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, bundledGitOptions);
         }
+        // Only now does the session exist for this create: a runner that failed to launch
+        // leaves the draft with the viewer, and nothing counts it delivered.
+        noteSessionCreatedHere(data.id, initialPrompt, creationAttempt);
+        creationNoted = true;
+        // A create that carried the first message is its acceptance; otherwise the first send is.
+        if (serverOwnsInitialInput) noteFirstInputAccepted(data.id, initialPrompt);
         // Clear pending agent after successful creation.
         setPendingAgent(null);
       } else {
@@ -6805,6 +6852,9 @@ function NewChatLandingContent({
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
+        noteSessionCreatedHere(created.id, initialPrompt, creationAttempt);
+        creationNoted = true;
+        if (serverOwnsInitialInput) noteFirstInputAccepted(created.id, initialPrompt);
         if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
           markSandboxLaunch(created.id, {
@@ -7004,6 +7054,7 @@ function NewChatLandingContent({
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);
     } finally {
+      if (!creationNoted) noteSessionCreationFailed(creationAttempt);
       if (createAttemptRef.current === createAttempt) {
         createAttemptRef.current = null;
         setCreating(false);
@@ -7867,7 +7918,7 @@ function NewChatLandingContent({
                       )}
                     </div>
                     {/* Host chip */}
-                    <MobileHeaderControlPortal sessionId={null}>
+                    <MobileHeaderControlPortal sessionId={null} popoverSlot="host">
                       <DropdownMenu
                         onOpenChange={(open) => {
                           setHostMenuOpen(open);
@@ -8106,49 +8157,51 @@ function NewChatLandingContent({
                       </DropdownMenu>
                     </MobileHeaderControlPortal>
 
-                    {noExecutionTargetSelected ? (
-                      <ComposerPermissionPicker
-                        label="Permission mode"
-                        value="No host selected"
-                        harness={selectedNativeHarness}
-                        disabled
-                        iconOnly
-                        options={directModeOptions}
-                        onSelect={selectDirectMode}
-                        testIdPrefix="new-chat-landing"
-                      />
-                    ) : pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
-                      <NewChatPickerLoading
-                        label="Loading permissions"
-                        testId="new-chat-landing-permission-loading"
-                      />
-                    ) : visiblePermissionRow ? (
-                      <ComposerPermissionPicker
-                        label={visiblePermissionRow.label}
-                        value={visiblePermissionRow.value}
-                        harness={selectedNativeHarness}
-                        selectedValue={
-                          selectedNativeHarness === "claude-native"
-                            ? permissionMode
-                            : selectedNativeHarness === "codex-native"
-                              ? bypassSandbox
-                                ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
-                                : approvalMode
-                              : selectedNativeHarness === "cursor-native"
-                                ? cursorExecMode
-                                : selectedNativeHarness === "antigravity-native"
-                                  ? agySkipMode
-                                  : selectedNativeHarness === "devin-native"
-                                    ? devinPermissionMode
-                                    : undefined
-                        }
-                        loading={pickerLoading}
-                        interactiveWhileLoading={interactiveWhileLoading}
-                        options={directModeOptions}
-                        onSelect={selectDirectMode}
-                        testIdPrefix="new-chat-landing"
-                      />
-                    ) : null}
+                    <SessionControlPortal sessionId={null} slot="permission">
+                      {noExecutionTargetSelected ? (
+                        <ComposerPermissionPicker
+                          label="Permission mode"
+                          value="No host selected"
+                          harness={selectedNativeHarness}
+                          disabled
+                          iconOnly
+                          options={directModeOptions}
+                          onSelect={selectDirectMode}
+                          testIdPrefix="new-chat-landing"
+                        />
+                      ) : pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
+                        <NewChatPickerLoading
+                          label="Loading permissions"
+                          testId="new-chat-landing-permission-loading"
+                        />
+                      ) : visiblePermissionRow ? (
+                        <ComposerPermissionPicker
+                          label={visiblePermissionRow.label}
+                          value={visiblePermissionRow.value}
+                          harness={selectedNativeHarness}
+                          selectedValue={
+                            selectedNativeHarness === "claude-native"
+                              ? permissionMode
+                              : selectedNativeHarness === "codex-native"
+                                ? bypassSandbox
+                                  ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+                                  : approvalMode
+                                : selectedNativeHarness === "cursor-native"
+                                  ? cursorExecMode
+                                  : selectedNativeHarness === "antigravity-native"
+                                    ? agySkipMode
+                                    : selectedNativeHarness === "devin-native"
+                                      ? devinPermissionMode
+                                      : undefined
+                          }
+                          loading={pickerLoading}
+                          interactiveWhileLoading={interactiveWhileLoading}
+                          options={directModeOptions}
+                          onSelect={selectDirectMode}
+                          testIdPrefix="new-chat-landing"
+                        />
+                      ) : null}
+                    </SessionControlPortal>
                     {codexPlanModeSelectable && codexPlanMode && (
                       <span
                         data-testid="new-chat-landing-plan-mode"
@@ -8166,7 +8219,72 @@ function NewChatLandingContent({
                 ),
                 trailing: (
                   <>
-                    <MobileHeaderControlPortal sessionId={null}>
+                    {/* Create session, in the full screen gadget's menu: starts this session
+                    as the Start button does, while the gadget stays full screen. */}
+                    <SessionControlPortal sessionId={null} slot="create" inPlace={false}>
+                      <div className="flex flex-col gap-2">
+                        {createError && (
+                          <p role="alert" className="text-xs text-destructive">
+                            {createError}
+                          </p>
+                        )}
+                        {gadgetCreateDraftShown && (
+                          <div
+                            data-testid="gadget-create-session-draft"
+                            data-gadget-draft-review
+                            className="max-w-[min(36rem,calc(100vw-2rem))] rounded-md border bg-muted/50 p-2 text-sm"
+                          >
+                            <p className="mb-1 text-xs text-muted-foreground">
+                              Create session sends this to your agent.
+                            </p>
+                            <p className="max-h-48 overflow-y-auto break-words whitespace-pre-wrap">
+                              {message}
+                            </p>
+                          </div>
+                        )}
+                        {submitDisabledReason !== null && !creating && (
+                          <p className="text-xs text-muted-foreground">{submitDisabledReason}</p>
+                        )}
+                        {submitDisabledReason === null &&
+                          gadgetCreateHarnessBlocker !== null &&
+                          !creating && (
+                            <p
+                              className="text-xs text-muted-foreground"
+                              data-testid="gadget-create-session-harness"
+                            >
+                              {gadgetCreateHarnessBlocker} Pick another harness to start here.
+                            </p>
+                          )}
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="w-full"
+                          disabled={
+                            creating ||
+                            submitDisabledReason !== null ||
+                            gadgetCreateHarnessBlocker !== null
+                          }
+                          loading={creating}
+                          data-testid="gadget-create-session"
+                          onClick={() => void handleCreate()}
+                        >
+                          <PlusIcon className="size-4" aria-hidden />
+                          Create session
+                        </Button>
+                      </div>
+                    </SessionControlPortal>
+                    {/* The harness New session will start, on the full screen gadget's Open
+                    session button. */}
+                    {selectedAgent && (
+                      <SessionControlPortal sessionId={null} slot="icon" inPlace={false}>
+                        {smartRoutingHarnessSelected ? (
+                          <WandSparklesIcon aria-hidden="true" />
+                        ) : (
+                          <ComposerAgentIcon agent={selectedAgent} />
+                        )}
+                      </SessionControlPortal>
+                    )}
+                    <MobileHeaderControlPortal sessionId={null} popoverSlot="harness">
                       <div className="flex min-w-0 items-center rounded-lg">
                         {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}

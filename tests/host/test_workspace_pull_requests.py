@@ -23,7 +23,19 @@ from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
-from omnigent.runner import github_resource, github_reviews, pr_resource
+from omnigent.runner import (
+    github_images,
+    github_lifecycle,
+    github_lookup,
+    github_merge_queue,
+    github_native_stack,
+    github_resource,
+    github_reviews,
+    github_search,
+    github_stack,
+    pr_resource,
+)
+from omnigent.runner.github_images import ImageRefused, PullRequestImage
 from omnigent.runner.pull_request_errors import (
     CommentChangedError,
     PullRequestChangedError,
@@ -32,10 +44,16 @@ from omnigent.runner.pull_request_errors import (
 )
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
-from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS, _PULL_REQUEST_READS
+from tests._helpers.connect_stream import connect_frame, end_of_stream_code
+from tests.host.test_workspace_methods import (
+    _PULL_REQUEST_OWNER_METHODS,
+    _PULL_REQUEST_OWNER_STREAMS,
+    _PULL_REQUEST_READS,
+)
 
 _SESSION = "conv_prs"
 _PR = "https://github.com/example/app/pull/7"
+_OTHER_PR = "https://github.com/example/app/pull/8"
 _HEAD = "a" * 40
 _BASE = "b" * 40
 _PULL_REQUEST_METHODS = sorted(name for name, m in WORKSPACE_METHODS.items() if m.pull_request)
@@ -260,8 +278,13 @@ async def test_the_direct_socket_serves_no_pull_request_whatever_the_call_claims
             assert listed.status_code == 200, listed.text
             assert not set(_PULL_REQUEST_METHODS) & set(listed.json()["capabilities"])
             for method in _PULL_REQUEST_METHODS:
-                request = WORKSPACE_METHODS[method].request_type(pr_url=_PR)
+                request = _naming_the_pr(method)
                 binary = request.SerializeToString() + b"\x78\x01"
+                if WORKSPACE_METHODS[method].streaming:
+                    assert await _stream_error(http, f"{service}/{method}", binary, forged) == (
+                        "unimplemented"
+                    ), method
+                    continue
                 response = await http.post(
                     f"{service}/{method}",
                     content=binary,
@@ -275,6 +298,31 @@ async def test_the_direct_socket_serves_no_pull_request_whatever_the_call_claims
     assert provider_reads == []
 
 
+def _naming_the_pr(method: str) -> Any:
+    """A request of ``method`` that names ``_PR``, in ``pr_url`` or in a batch's list."""
+    request_type = WORKSPACE_METHODS[method].request_type
+    if "pr_url" in request_type.DESCRIPTOR.fields_by_name:
+        return request_type(pr_url=_PR)
+    if "pr_urls" in request_type.DESCRIPTOR.fields_by_name:
+        return request_type(pr_urls=[_PR])
+    if "pull_requests" in request_type.DESCRIPTOR.fields_by_name:
+        return request_type(pull_requests=[{"pr_url": _PR}])
+    # A branch list names none; it is served only with the server's call frame all the same.
+    return request_type(branch="feature/login")
+
+
+async def _stream_error(
+    http: httpx.AsyncClient, path: str, message: bytes, headers: dict[str, str]
+) -> str | None:
+    """A Connect streaming call's error code, from its end-of-stream message."""
+    response = await http.post(
+        path,
+        content=connect_frame(message),
+        headers={**headers, "Content-Type": "application/connect+proto"},
+    )
+    return end_of_stream_code(response.content)
+
+
 def _pr_target(**fields: Any) -> dict[str, Any]:
     return {"session_id": _SESSION, "pr_url": _PR, **fields}
 
@@ -283,7 +331,7 @@ def _pr_target(**fields: Any) -> dict[str, Any]:
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
 # Each owner method: a valid request, the pr_resource function it runs, and its arguments.
 _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
-    "ListLabels": (pb.ListLabelsRequest(pr_url=_PR), "pr_labels", _pr_target()),
+    "ListLabels": (pb.ListLabelsRequest(pr_url=_PR), "pr_labels", _pr_target(text="")),
     "ListReviewerCandidates": (
         pb.ListReviewerCandidatesRequest(pr_url=_PR),
         "pr_review_candidates",
@@ -350,7 +398,7 @@ _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "SetPullRequestAccount": (
         pb.SetPullRequestAccountRequest(pr_url=_PR, account="octocat"),
         "set_pr_preference",
-        _pr_target(account="octocat", remote=None),
+        _pr_target(account="octocat", remote=None, account_rights=False),
     ),
     "MergePullRequest": (
         pb.MergePullRequestRequest(pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD),
@@ -381,8 +429,9 @@ _DIGEST = "c" * 64
 _ANCHOR = pb.ReviewThreadAnchor(
     path="src/app.py", side="RIGHT", line=4, head_sha=_HEAD, base_sha=_BASE
 )
-# Each review method: a valid request, the github_reviews function it runs, and its arguments.
-_REVIEW_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+# Each review and lifecycle change of one pull request: a valid request, the github_reviews or
+# github_lifecycle function it runs, and its arguments.
+_GITHUB_CHANGE_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "GetPendingReview": (pb.GetPendingReviewRequest(pr_url=_PR), "get_pending_review", {}),
     "StartPendingReview": (
         pb.StartPendingReviewRequest(pr_url=_PR, commit_oid=_HEAD),
@@ -486,29 +535,109 @@ _REVIEW_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
         "remove_reaction",
         {"kind": "review", "comment_id": 5, "content": "HEART"},
     ),
+    "SetPullRequestState": (
+        pb.SetPullRequestStateRequest(pr_url=_PR, state="closed"),
+        "set_state",
+        {"state": "closed"},
+    ),
+    "SetPullRequestDraft": (
+        pb.SetPullRequestDraftRequest(pr_url=_PR, draft=True),
+        "set_draft",
+        {"draft": True},
+    ),
+}
+# The batch change, which names its pull requests in ``pull_requests``.
+_AUTO_MERGE = pb.EnableAutoMergeRequest(
+    pull_requests=[
+        pb.PullRequestAutoMerge(pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD),
+        pb.PullRequestAutoMerge(pr_url=_OTHER_PR, merge_method="rebase", expected_head_oid=_BASE),
+    ]
+)
+
+
+# Each merge queue method: a valid request, the github_merge_queue function, and its arguments.
+_QUEUE_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "GetMergeQueue": (pb.GetMergeQueueRequest(pr_url=_PR), "get_merge_queue", {}),
+    "EnqueuePullRequest": (
+        pb.EnqueuePullRequestRequest(pr_url=_PR, expected_head_oid=_HEAD),
+        "enqueue",
+        {"expected_head_oid": _HEAD},
+    ),
+    "DequeuePullRequest": (pb.DequeuePullRequestRequest(pr_url=_PR), "dequeue", {}),
+}
+# The stack reads: a valid request, the function it runs, and its arguments.
+_STACK_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "GetPullRequestStack": (pb.GetPullRequestStackRequest(pr_url=_PR), "pull_request_stack", {}),
+    "GetPullRequestNativeStack": (
+        pb.GetPullRequestNativeStackRequest(pr_url=_PR),
+        "pull_request_native_stack",
+        {},
+    ),
+}
+# The searches for the owner's reviewer picker and editor: a request, its function, arguments.
+_SEARCH_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "SearchReviewers": (
+        pb.SearchReviewersRequest(pr_url=_PR, text="al", page_size=5),
+        "search_reviewers",
+        {"text": "al", "page_size": 5},
+    ),
+    "SearchCompletions": (
+        pb.SearchCompletionsRequest(pr_url=_PR, kind=pb.COMPLETION_KIND_MENTION, text="al"),
+        "search_completions",
+        {"kind": "MENTION", "text": "al"},
+    ),
+}
+# The methods that act on GitHub for the session's selected pull request.
+_SELECTED_PR_CALLS = {**_GITHUB_CHANGE_CALLS, **_QUEUE_CALLS, **_STACK_CALLS, **_SEARCH_CALLS}
+# The methods that read pull requests by URL or branch alone: a request, its function, arguments.
+_FINDER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "LookupPullRequest": (
+        pb.LookupPullRequestRequest(pr_url=_OTHER_PR),
+        "lookup_pull_request",
+        {"pr_url": _OTHER_PR},
+    ),
+    "GetPullRequestListStats": (
+        pb.GetPullRequestListStatsRequest(pr_urls=[_PR, _OTHER_PR]),
+        "pull_request_list_stats",
+        {"pr_urls": [_PR, _OTHER_PR]},
+    ),
+    "ListBranchPullRequests": (
+        pb.ListBranchPullRequestsRequest(branch="feature/login"),
+        "branch_pull_requests",
+        {"branch": "feature/login"},
+    ),
 }
 
 
-def record_review_calls(
+def record_github_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Each GitHub review call a method made: the function, its root, PR and arguments."""
+    """Each GitHub call a method made: the function, its root, PR and arguments."""
     calls: list[tuple[str, str, str, dict[str, Any]]] = []
-    for function in {name for _request, name, _kwargs in _REVIEW_CALLS.values()}:
+    for table in (_GITHUB_CHANGE_CALLS, _QUEUE_CALLS, _STACK_CALLS, _SEARCH_CALLS):
+        for function in {name for _request, name, _kwargs in table.values()}:
+            if table is _QUEUE_CALLS:
+                module = github_merge_queue
+            elif table is _STACK_CALLS:
+                module = github_stack if hasattr(github_stack, function) else github_native_stack
+            elif table is _SEARCH_CALLS:
+                module = github_search
+            else:
+                module = github_reviews if hasattr(github_reviews, function) else github_lifecycle
 
-        def record(
-            root: str, reference: PullRequestRef, *, _function: str = function, **kwargs: Any
-        ) -> dict[str, Any]:
-            calls.append((_function, root, reference.url, kwargs))
-            return {"object": "test"}
+            def record(
+                root: str, reference: PullRequestRef, *, _function: str = function, **kwargs: Any
+            ) -> dict[str, Any]:
+                calls.append((_function, root, reference.url, kwargs))
+                return {"object": "test"}
 
-        monkeypatch.setattr(github_reviews, function, record)
+            monkeypatch.setattr(module, function, record)
     return calls
 
 
 @pytest.fixture
-def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
-    return record_review_calls(monkeypatch)
+def github_changes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
+    return record_github_changes(monkeypatch)
 
 
 def record_owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
@@ -542,8 +671,19 @@ def providers(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
 
 
 def test_every_owner_method_has_a_call_case() -> None:
-    assert not set(_OWNER_CALLS) & set(_REVIEW_CALLS)
-    assert set(_OWNER_CALLS) | set(_REVIEW_CALLS) == _PULL_REQUEST_OWNER_METHODS
+    assert not set(_OWNER_CALLS) & set(_SELECTED_PR_CALLS)
+    assert not set(_GITHUB_CHANGE_CALLS) & set(_QUEUE_CALLS)
+    assert not set(_GITHUB_CHANGE_CALLS) & set(_STACK_CALLS)
+    assert not set(_QUEUE_CALLS) & set(_STACK_CALLS)
+    assert not set(_SEARCH_CALLS) & (
+        set(_GITHUB_CHANGE_CALLS) | set(_QUEUE_CALLS) | set(_STACK_CALLS)
+    )
+    owner_unary = _PULL_REQUEST_OWNER_METHODS - _PULL_REQUEST_OWNER_STREAMS
+    assert not set(_FINDER_CALLS) & (set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS))
+    assert (
+        set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) | set(_FINDER_CALLS) | {"EnableAutoMerge"}
+        == owner_unary
+    )
 
 
 @pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
@@ -656,7 +796,7 @@ async def test_an_owner_method_naming_no_pr_changes_none_the_server_offers_by_de
     assert providers == []
 
 
-async def test_list_labels_refuses_a_search_it_cant_do(
+async def test_list_labels_searches_the_selected_prs_repository_by_text(
     tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
 ) -> None:
     request = pb.ListLabelsRequest(pr_url=_PR, text="bug")
@@ -664,8 +804,20 @@ async def test_list_labels_refuses_a_search_it_cant_do(
         _frame(tmp_path, "ListLabels", request.SerializeToString())
     )
 
+    assert (code, message) == (None, None)
+    assert owner_calls == [("pr_labels", str(tmp_path.resolve()), _pr_target(text="bug"))]
+
+
+async def test_list_labels_refuses_a_search_longer_than_the_cap(
+    tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    request = pb.ListLabelsRequest(pr_url=_PR, text="a" * 257)
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListLabels", request.SerializeToString())
+    )
+
     assert code == Code.INVALID_ARGUMENT.value
-    assert message == "Label search isn't available on this host"
+    assert message == "The label search is longer than 256 characters"
     assert owner_calls == []
 
 
@@ -680,28 +832,117 @@ async def _reason(frame: HostWorkspaceCallFrame) -> tuple[str | None, str | None
     raise AssertionError("the call never ended")
 
 
-@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
-async def test_a_review_method_runs_its_github_change_with_the_requests_fields(
-    tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+@pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))
+async def test_a_github_method_runs_its_github_change_with_the_requests_fields(
+    tmp_path: Path, method: str, github_changes: list[tuple[str, str, str, dict[str, Any]]]
 ) -> None:
-    request, function, kwargs = _REVIEW_CALLS[method]
+    request, function, kwargs = _SELECTED_PR_CALLS[method]
     messages, code, message = await _answer(
         _frame(tmp_path, method, request.SerializeToString(), vouch=_VOUCHED)
     )
 
     assert code is None, message
-    assert review_calls == [(function, str(tmp_path.resolve()), _PR, kwargs)]
+    assert github_changes == [(function, str(tmp_path.resolve()), _PR, kwargs)]
     payload = WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload
     assert dict(payload) == {"object": "test"}
+
+
+def record_auto_merges(monkeypatch: pytest.MonkeyPatch) -> list[list[tuple[str, str, str]]]:
+    """Each auto-merge batch the host sent: its pull requests, methods and heads."""
+    batches: list[list[tuple[str, str, str]]] = []
+
+    def enable(_root: str, items: list[github_lifecycle.AutoMergeItem]) -> dict[str, Any]:
+        batches.append(
+            [(item.reference.url, item.merge_method, item.expected_head_oid) for item in items]
+        )
+        return {"object": "test"}
+
+    monkeypatch.setattr(github_lifecycle, "enable_auto_merge", enable)
+    return batches
+
+
+@pytest.fixture
+def auto_merges(monkeypatch: pytest.MonkeyPatch) -> list[list[tuple[str, str, str]]]:
+    return record_auto_merges(monkeypatch)
+
+
+async def test_auto_merge_sends_every_pull_request_the_batch_names(
+    tmp_path: Path, auto_merges: list[list[tuple[str, str, str]]]
+) -> None:
+    messages, code, message = await _answer(
+        _frame(tmp_path, "EnableAutoMerge", _AUTO_MERGE.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert code is None, message
+    assert auto_merges == [[(_PR, "squash", _HEAD), (_OTHER_PR, "rebase", _BASE)]]
+    assert dict(pb.EnableAutoMergeResponse.FromString(messages[0]).payload) == {"object": "test"}
+
+
+async def test_auto_merge_sends_none_when_the_session_never_recorded_one_of_them(
+    tmp_path: Path, auto_merges: list[list[tuple[str, str, str]]]
+) -> None:
+    _record(_SESSION, _PR)
+
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "EnableAutoMerge", _AUTO_MERGE.SerializeToString())
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message == "This pull request is not associated with the session"
+    assert auto_merges == []
+
+
+@pytest.mark.parametrize(
+    "items, refusal",
+    [
+        ([], "Enable auto-merge for 1 to 20 pull requests at once"),
+        (
+            [pb.PullRequestAutoMerge(pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD)]
+            * 21,
+            "Enable auto-merge for 1 to 20 pull requests at once",
+        ),
+        (
+            [pb.PullRequestAutoMerge(merge_method="squash", expected_head_oid=_HEAD)],
+            "Name each pull request to merge automatically",
+        ),
+        (
+            [pb.PullRequestAutoMerge(pr_url=_PR, merge_method="fast-forward")],
+            "Expected merge_method to be merge, squash, or rebase",
+        ),
+        (
+            [pb.PullRequestAutoMerge(pr_url=_PR, merge_method="squash", expected_head_oid="x")],
+            "Expected expected_head_oid to be a full commit SHA",
+        ),
+        (
+            [pb.PullRequestAutoMerge(pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD)]
+            * 2,
+            "Name each pull request once",
+        ),
+    ],
+    ids=["none", "too-many", "unnamed", "bad-method", "bad-head", "repeated"],
+)
+async def test_a_malformed_auto_merge_batch_is_refused_with_nothing_sent(
+    tmp_path: Path,
+    auto_merges: list[list[tuple[str, str, str]]],
+    items: list[pb.PullRequestAutoMerge],
+    refusal: str,
+) -> None:
+    request = pb.EnableAutoMergeRequest(pull_requests=items)
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "EnableAutoMerge", request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert auto_merges == []
 
 
 async def test_a_draft_reply_goes_in_its_conversation_without_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    review_calls: list[tuple[str, str, str, dict[str, Any]]] = []
+    github_changes: list[tuple[str, str, str, dict[str, Any]]] = []
 
     def reply(root: str, reference: PullRequestRef, **kwargs: Any) -> dict[str, Any]:
-        review_calls.append(("add_pending_review_reply", root, reference.url, kwargs))
+        github_changes.append(("add_pending_review_reply", root, reference.url, kwargs))
         return {"object": "test"}
 
     monkeypatch.setattr(github_reviews, "add_pending_review_reply", reply)
@@ -717,7 +958,7 @@ async def test_a_draft_reply_goes_in_its_conversation_without_lines(
     )
 
     assert code is None, message
-    assert review_calls == [
+    assert github_changes == [
         (
             "add_pending_review_reply",
             str(tmp_path.resolve()),
@@ -732,23 +973,197 @@ async def test_a_draft_reply_goes_in_its_conversation_without_lines(
     ]
 
 
-@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
-async def test_a_review_method_refuses_a_pr_the_session_never_recorded(
-    tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+@pytest.mark.parametrize(
+    ("request_message", "refusal"),
+    [
+        (
+            pb.SearchReviewersRequest(pr_url=_PR, text="x" * 257),
+            "The search is longer than 256 characters",
+        ),
+        (
+            pb.SearchReviewersRequest(pr_url="https://github.com/" + "x" * 2048, text="al"),
+            "The pull request URL is longer than 2048 characters",
+        ),
+        (pb.SearchReviewersRequest(pr_url=_PR, page_size=21), "Ask for at most 20 reviewers"),
+        (pb.SearchReviewersRequest(pr_url=_PR, page_size=-1), "Ask for at most 20 reviewers"),
+        (
+            pb.SearchCompletionsRequest(
+                pr_url=_PR, kind=pb.COMPLETION_KIND_MENTION, text="x" * 257
+            ),
+            "The search is longer than 256 characters",
+        ),
+        (
+            pb.SearchCompletionsRequest(pr_url=_PR, text="al"),
+            "Choose what to complete: people or pull requests",
+        ),
+        (
+            pb.SearchCompletionsRequest(pr_url=_PR, kind=99, text="al"),
+            "Choose what to complete: people or pull requests",
+        ),
+    ],
+    ids=[
+        "long-reviewer-text",
+        "long-pr-url",
+        "too-many-reviewers",
+        "negative-page",
+        "long-completion-text",
+        "no-kind",
+        "unknown-kind",
+    ],
+)
+async def test_a_malformed_search_is_refused_with_nothing_read(
+    tmp_path: Path,
+    github_changes: list[tuple[str, str, str, dict[str, Any]]],
+    request_message: Any,
+    refusal: str,
 ) -> None:
-    request, _function, _kwargs = _REVIEW_CALLS[method]
+    method = type(request_message).__name__.removesuffix("Request")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, request_message.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert github_changes == []
+
+
+async def test_a_reference_completion_passes_its_kind_to_the_search(
+    tmp_path: Path, github_changes: list[tuple[str, str, str, dict[str, Any]]]
+) -> None:
+    request = pb.SearchCompletionsRequest(
+        pr_url=_PR, kind=pb.COMPLETION_KIND_REFERENCE, text="fix"
+    )
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "SearchCompletions", request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert code is None, message
+    assert [call[3] for call in github_changes] == [{"kind": "REFERENCE", "text": "fix"}]
+
+
+def record_finder_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Each finder's runner call: the function, its root and arguments."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    for function in {name for _request, name, _kwargs in _FINDER_CALLS.values()}:
+
+        def record(root: str, *, _function: str = function, **kwargs: Any) -> dict[str, Any]:
+            calls.append((_function, root, kwargs))
+            return {"object": "test"}
+
+        module = github_search if function == "branch_pull_requests" else github_lookup
+        monkeypatch.setattr(module, function, record)
+    return calls
+
+
+@pytest.fixture
+def finder_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    return record_finder_calls(monkeypatch)
+
+
+@pytest.mark.parametrize("vouch", [None, _VOUCHED], ids=["no-vouch", "vouched"])
+@pytest.mark.parametrize("method", sorted(_FINDER_CALLS))
+async def test_a_finder_reads_the_requests_urls_for_a_session_that_links_none(
+    tmp_path: Path,
+    method: str,
+    vouch: PullRequestVouch | None,
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+    provider_reads: list[str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It reads no PR of the session's: no record, vouch or selected PR is consulted."""
+    selected: list[Any] = []
+    monkeypatch.setattr(pr_resource, "_selected_pr", lambda *args: selected.append(args))
+    request, function, kwargs = _FINDER_CALLS[method]
+    messages, code, message = await _answer(
+        _frame(tmp_path, method, request.SerializeToString(), vouch=vouch)
+    )
+
+    assert code is None, message
+    assert finder_calls == [(function, str(tmp_path.resolve()), kwargs)]
+    payload = WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload
+    assert payload_dict(payload) == {"object": "test"}
+    assert selected == []
+    assert provider_reads == []
+
+
+@pytest.mark.parametrize(
+    ("request_message", "refusal"),
+    [
+        (pb.LookupPullRequestRequest(), "Expected a pull request URL"),
+        (
+            pb.LookupPullRequestRequest(pr_url="https://github.com/" + "x" * 2048),
+            "The pull request URL is longer than 2048 characters",
+        ),
+        (pb.GetPullRequestListStatsRequest(), "Ask for 1 to 50 pull requests"),
+        (
+            pb.GetPullRequestListStatsRequest(pr_urls=[_PR] * 51),
+            "Ask for 1 to 50 pull requests",
+        ),
+        (pb.GetPullRequestListStatsRequest(pr_urls=[_PR, ""]), "Expected a pull request URL"),
+    ],
+    ids=["lookup-none", "lookup-long", "stats-none", "stats-too-many", "stats-empty-url"],
+)
+async def test_a_finder_naming_no_usable_url_is_refused_with_nothing_read(
+    tmp_path: Path,
+    finder_calls: list[tuple[str, str, dict[str, Any]]],
+    request_message: Any,
+    refusal: str,
+) -> None:
+    method = type(request_message).__name__.removesuffix("Request")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, request_message.SerializeToString())
+    )
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert finder_calls == []
+
+
+async def test_a_branch_list_naming_no_branch_is_refused_with_nothing_read(
+    tmp_path: Path, finder_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    """The host refuses a malformed branch itself; the rules are in the input tests."""
+    request = pb.ListBranchPullRequestsRequest(branch="a..b")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListBranchPullRequests", request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert code == Code.INVALID_ARGUMENT.value
+    assert message is not None and message.startswith("branch name must not contain '..'")
+    assert finder_calls == []
+
+
+async def test_a_branch_list_github_cant_answer_is_a_precondition_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unlisted(_root: str, **_kwargs: Any) -> dict[str, Any]:
+        raise PullRequestError("GitHub couldn't list this branch's pull requests. Try again.")
+
+    monkeypatch.setattr(github_search, "branch_pull_requests", unlisted)
+    request = pb.ListBranchPullRequestsRequest(branch="main")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListBranchPullRequests", request.SerializeToString())
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message == "GitHub couldn't list this branch's pull requests. Try again."
+
+
+@pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))
+async def test_a_github_method_refuses_a_pr_the_session_never_recorded(
+    tmp_path: Path, method: str, github_changes: list[tuple[str, str, str, dict[str, Any]]]
+) -> None:
+    request, _function, _kwargs = _SELECTED_PR_CALLS[method]
     _messages, code, message = await _answer(_frame(tmp_path, method, request.SerializeToString()))
 
     assert code == Code.FAILED_PRECONDITION.value
     assert message == "This pull request is not associated with the session"
-    assert review_calls == []
+    assert github_changes == []
 
 
-@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
-async def test_a_review_method_naming_no_pr_changes_none_the_server_offers_by_default(
-    tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+@pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))
+async def test_a_github_method_naming_no_pr_changes_none_the_server_offers_by_default(
+    tmp_path: Path, method: str, github_changes: list[tuple[str, str, str, dict[str, Any]]]
 ) -> None:
-    request, _function, _kwargs = _REVIEW_CALLS[method]
+    request, _function, _kwargs = _SELECTED_PR_CALLS[method]
     unnamed = type(request)()
     unnamed.CopyFrom(request)
     unnamed.ClearField("pr_url")
@@ -760,7 +1175,7 @@ async def test_a_review_method_naming_no_pr_changes_none_the_server_offers_by_de
 
     assert code == Code.FAILED_PRECONDITION.value
     assert message is not None and message.startswith("Select a pull request to ")
-    assert review_calls == []
+    assert github_changes == []
 
 
 _MALFORMED_REVIEWS = {
@@ -797,7 +1212,7 @@ _MALFORMED_REVIEWS = {
 
 @pytest.mark.parametrize("case", sorted(_MALFORMED_REVIEWS))
 async def test_a_malformed_review_change_is_refused_as_invalid_input_before_github(
-    tmp_path: Path, case: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+    tmp_path: Path, case: str, github_changes: list[tuple[str, str, str, dict[str, Any]]]
 ) -> None:
     request = _MALFORMED_REVIEWS[case]
     method = request.DESCRIPTOR.name.removesuffix("Request")
@@ -806,7 +1221,7 @@ async def test_a_malformed_review_change_is_refused_as_invalid_input_before_gith
     )
 
     assert (code, reason) == (Code.INVALID_ARGUMENT.value, "invalid_input")
-    assert review_calls == []
+    assert github_changes == []
 
 
 @pytest.mark.parametrize(
@@ -834,7 +1249,7 @@ async def test_a_review_failure_reaches_the_server_with_its_code_and_reason(
         raise failure
 
     monkeypatch.setattr(github_reviews, "edit_comment", fail)
-    request, _function, _kwargs = _REVIEW_CALLS["EditComment"]
+    request, _function, _kwargs = _GITHUB_CHANGE_CALLS["EditComment"]
 
     assert await _reason(
         _frame(tmp_path, "EditComment", request.SerializeToString(), vouch=_VOUCHED)
@@ -862,6 +1277,107 @@ async def test_the_host_refuses_an_upload_the_server_would_have(
 
     assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
     assert owner_calls == []
+
+
+_IMAGE_URL = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa"
+# Over two 256 KiB parts, so the answer takes three.
+_IMAGE = PullRequestImage(content_type="image/png", data=_PNG + bytes(range(256)) * 2100)
+
+
+def _image_frame(root: Path, **fields: Any) -> HostWorkspaceCallFrame:
+    request = pb.ReadPullRequestImageRequest(**{"pr_url": _PR, "image_url": _IMAGE_URL, **fields})
+    return _frame(root, "ReadPullRequestImage", request.SerializeToString(), vouch=_VOUCHED)
+
+
+def record_image_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    """Each image the runner was asked for: its workspace, PR and URL; each answers _IMAGE."""
+    asked: list[tuple[str, str, str]] = []
+
+    def read(root: str, reference: PullRequestRef, image_url: str) -> PullRequestImage:
+        asked.append((root, reference.url, image_url))
+        return _IMAGE
+
+    monkeypatch.setattr(github_images, "read_pull_request_image", read)
+    return asked
+
+
+@pytest.fixture
+def image_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    return record_image_reads(monkeypatch)
+
+
+async def test_an_image_streams_its_type_and_size_then_its_bytes_in_parts(
+    tmp_path: Path, image_reads: list[tuple[str, str, str]]
+) -> None:
+    messages, code, message = await _answer(_image_frame(tmp_path))
+
+    assert code is None, message
+    assert image_reads == [(str(tmp_path.resolve()), _PR, _IMAGE_URL)]
+    replies = [pb.ReadPullRequestImageResponse.FromString(message) for message in messages]
+    assert replies[0].metadata == pb.PullRequestImageMetadata(
+        content_type="image/png", size=len(_IMAGE.data)
+    )
+    assert not any(reply.HasField("metadata") for reply in replies[1:])
+    part = 256 * 1024
+    assert [len(reply.data) for reply in replies[1:]] == [part, part, len(_IMAGE.data) - 2 * part]
+    assert b"".join(reply.data for reply in replies) == _IMAGE.data
+
+
+async def test_an_image_of_a_pr_the_session_never_recorded_isnt_read(
+    tmp_path: Path, image_reads: list[tuple[str, str, str]]
+) -> None:
+    request = pb.ReadPullRequestImageRequest(pr_url=_PR, image_url=_IMAGE_URL)
+    _messages, code, _message = await _answer(
+        _frame(tmp_path, "ReadPullRequestImage", request.SerializeToString())
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert image_reads == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "code"),
+    [
+        ("host_not_allowed", Code.FAILED_PRECONDITION),
+        ("too_large", Code.FAILED_PRECONDITION),
+        ("not_image", Code.FAILED_PRECONDITION),
+        ("fetch_failed", Code.UNAVAILABLE),
+    ],
+)
+async def test_an_image_refusal_reaches_the_server_with_its_code_and_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str, code: Code
+) -> None:
+    def refuse(_root: str, _reference: PullRequestRef, _image_url: str) -> PullRequestImage:
+        raise ImageRefused(reason)
+
+    monkeypatch.setattr(github_images, "read_pull_request_image", refuse)
+    messages, error_code, message = await _answer(_image_frame(tmp_path))
+
+    assert (messages, error_code) == ([], code.value)
+    assert message is not None
+    assert "https://" not in message
+    assert await _reason(_image_frame(tmp_path)) == (code.value, reason)
+
+
+@pytest.mark.parametrize(
+    ("fields", "refusal"),
+    [
+        ({"image_url": ""}, "Expected an image URL"),
+        (
+            {"image_url": "https://github.com/" + "a" * 2030},
+            "The image URL is longer than 2048 characters",
+        ),
+        ({"pr_url": _PR + "a" * 2048}, "The pull request URL is longer than 2048 characters"),
+    ],
+    ids=["no-url", "long-url", "long-pr-url"],
+)
+async def test_the_host_refuses_an_image_read_the_server_would_have(
+    tmp_path: Path, image_reads: list[tuple[str, str, str]], fields: dict[str, str], refusal: str
+) -> None:
+    _messages, code, message = await _answer(_image_frame(tmp_path, **fields))
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert image_reads == []
 
 
 @pytest.fixture
@@ -960,7 +1476,12 @@ async def test_merge_as_an_account_needs_one(
 
 # Each read: a request, the reader method it runs, and the arguments that method gets.
 _READ_CALLS: dict[str, tuple[Any, str, tuple[Any, ...], dict[str, Any]]] = {
-    "GetPullRequest": (pb.GetPullRequestRequest(pr_url=_PR), "github_info", (_SESSION, _PR), {}),
+    "GetPullRequest": (
+        pb.GetPullRequestRequest(pr_url=_PR),
+        "github_info",
+        (_SESSION, _PR),
+        {"account_rights": False},
+    ),
     "ListPullRequestFiles": (
         pb.ListPullRequestFilesRequest(pr_url=_PR, head_sha=_HEAD, base_sha=_BASE),
         "github_changes",
@@ -1141,7 +1662,9 @@ async def test_a_review_read_carries_the_accounts_rights_only_when_the_server_as
         assert comment["reactions"] == [{"content": "HEART", "count": 2}]
 
 
-@pytest.mark.parametrize("case", ["ListReviewThreads", "ListReviewThreadComments"])
+@pytest.mark.parametrize(
+    "case", ["GetPullRequest", "ListReviewThreads", "ListReviewThreadComments"]
+)
 async def test_the_servers_account_rights_reach_the_review_reader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
@@ -1161,3 +1684,15 @@ async def test_the_servers_account_rights_reach_the_review_reader(
 
     assert code is None, message
     assert calls == [(reader_method, args, {"account_rights": True})]
+
+
+async def test_the_servers_account_rights_reach_the_overview_an_account_change_answers_with(
+    tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    request, function, kwargs = _OWNER_CALLS["SetPullRequestAccount"]
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "SetPullRequestAccount", request.SerializeToString(), account_rights=True)
+    )
+
+    assert code is None, message
+    assert owner_calls == [(function, str(tmp_path.resolve()), {**kwargs, "account_rights": True})]

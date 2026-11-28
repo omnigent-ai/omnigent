@@ -65,6 +65,7 @@ class Feature(StrEnum):
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
     FLOATING_PANES = "floating_panes"
+    GADGETS = "gadgets"
     SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
     PULL_REQUESTS_V2 = "pull_requests_v2"
 
@@ -350,6 +351,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="runner",
         review_by_release="0.24.0",
         frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.GADGETS,
+        description="Gadgets: agent-built web apps beside sessions, their routes and agent tools",
+        owner="server",
+        review_by_release="0.27.0",
     ),
     FeatureDefinition(
         feature=Feature.QUICK_PICK_PALETTE,

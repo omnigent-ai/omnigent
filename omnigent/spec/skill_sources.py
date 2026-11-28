@@ -284,8 +284,10 @@ _FRAMEWORK_SKILL_GROUPS = {
     "workflow": "journal",
     "save-workflow": "journal",
     "import-memory": "memory",
+    "gadget": "gadgets",
 }
-# These also need the server's workflows feature; the others follow their tool group alone.
+# These also need the server's workflows feature; the others follow their tool group alone
+# (the runner turns ``gadgets`` off for a server without gadgets).
 WORKFLOW_FRAMEWORK_SKILLS = frozenset({"workflow", "save-workflow"})
 
 
@@ -369,7 +371,7 @@ def resolve_session_skills(
     merged.extend(
         skill
         for skill in framework_skills(spec, workflows_enabled=workflows_enabled)
-        if skill.name not in seen
+        if skill.user_invocable and skill.name not in seen
     )
     return merged
 
@@ -486,21 +488,8 @@ def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
     return hashlib.sha256(json.dumps([key, kind, source]).encode()).hexdigest()
 
 
-def _plugin_install_paths(
-    ctx: SkillSourceContext, enabled: set[str] | None = None
-) -> dict[str, Path]:
-    """Map installed plugin keys to trusted paths, optionally filtering by enablement."""
-    data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
-    if data is None:
-        return {}
-    plugins = data.get("plugins")
-    if not isinstance(plugins, dict):
-        return {}
-    # installPath values from installed_plugins.json are trusted only within
-    # the Claude plugins cache root; anything pointing elsewhere is logged and
-    # skipped so a tampered/odd manifest can't turn an arbitrary directory into
-    # a discovery root.
-    plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
+def _trusted_plugin_roots(plugins_root: Path) -> tuple[Path, ...]:
+    """The resolved plugins root and any usable user-linked shared cache target."""
     # Profile managers (e.g. ccs) symlink ``plugins/cache`` to a cache shared
     # across config dirs; its target is as trusted as the root that links it.
     plugin_roots = [plugins_root]
@@ -521,6 +510,22 @@ def _plugin_install_paths(
     except (OSError, RuntimeError) as exc:
         # A loop or dangling link raises here; the root alone keeps other plugins usable.
         _log.warning("Ignoring unresolvable plugins cache %s: %s", cache_link, exc)
+    return tuple(plugin_roots)
+
+
+def _plugin_install_paths(
+    ctx: SkillSourceContext, enabled: set[str] | None = None
+) -> dict[str, Path]:
+    """Map installed plugin keys to trusted paths, optionally filtering by enablement."""
+    data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
+    if data is None:
+        return {}
+    plugins = data.get("plugins")
+    if not isinstance(plugins, dict):
+        return {}
+    # Only user-owned plugin roots can become discovery roots.
+    plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
+    plugin_roots = _trusted_plugin_roots(plugins_root)
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
         if (enabled is not None and key not in enabled) or not isinstance(entries, list):
@@ -549,10 +554,8 @@ def _plugin_install_paths(
                 continue
             if not any(resolved.is_relative_to(root) for root in plugin_roots):
                 _log.warning(
-                    "Skipping entry for plugin %r: installPath %r is outside the trusted roots %s",
+                    "Skipping entry for plugin %r: installPath is outside the trusted roots",
                     key,
-                    path,
-                    ", ".join(str(root) for root in plugin_roots),
                 )
                 continue
             # Python 3.13+ returns a dead path for a symlink loop instead of

@@ -4,6 +4,7 @@
 
 import { useMemo } from "react";
 
+import { useChoosingComparisonOwner } from "@/hooks/useComparisonOwner";
 import {
   type WorkingCopyChanges,
   useWorkingCopyBaseCommands,
@@ -12,7 +13,7 @@ import {
 } from "@/hooks/useWorkingCopyChanges";
 import { type ComparisonChoice, comparisonChoiceOf } from "@/lib/comparisonChoice";
 import { localComparisonView, type LocalComparisonView } from "@/lib/localComparison";
-import { useWorkingCopyBaseIntent } from "@/lib/workingCopyBasePreference";
+import { useBaseIntent } from "@/lib/workingCopyBasePreference";
 import type { ComparisonAvailability } from "./useVisitComparison";
 import { useWorkingCopyBase } from "./workingCopyBase";
 
@@ -38,10 +39,11 @@ export function useLocalComparison(
   const changes = useWorkingCopyChanges(sessionId, { kind: active ? "surface" : "file" });
   const headBase = useWorkingCopyBase(sessionId);
   const commands = useWorkingCopyBaseCommands(sessionId, { headIsKnown: headBase !== null });
-  const intent = useWorkingCopyBaseIntent();
+  const choosingOwner = useChoosingComparisonOwner();
+  const intent = useBaseIntent(choosingOwner.repository, choosingOwner.workspaceKey);
   const { comparison, revisionSupport, custom, permitted, readable, refetch } = changes;
   const view = useMemo(() => {
-    const recoveries = workingCopyComparisonActions(sessionId);
+    const recoveries = workingCopyComparisonActions(sessionId, choosingOwner);
     return localComparisonView({
       comparison,
       headIsKnown: headBase !== null,
@@ -61,6 +63,7 @@ export function useLocalComparison(
     });
   }, [
     sessionId,
+    choosingOwner,
     comparison,
     headBase,
     revisionSupport,
@@ -73,7 +76,7 @@ export function useLocalComparison(
   ]);
   const settled = changes.workspace !== null;
   const choice = useMemo(() => {
-    const recoveries = workingCopyComparisonActions(sessionId);
+    const recoveries = workingCopyComparisonActions(sessionId, choosingOwner);
     const commandFor = (next: ComparisonChoice & { kind: "saved" }) =>
       commands.find((command) => command.id === `compare-${next.intent}`);
     return {
@@ -95,6 +98,6 @@ export function useLocalComparison(
         else commandFor(next)?.run();
       },
     };
-  }, [sessionId, intent, custom, settled, commands, revisionSupport]);
+  }, [sessionId, choosingOwner, intent, custom, settled, commands, revisionSupport]);
   return { changes, view, choice };
 }

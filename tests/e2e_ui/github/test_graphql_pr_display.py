@@ -59,11 +59,11 @@ if args[:2] == ["api", "graphql"]:
         unexpected_api()
     (root / "created").touch()
     print(json.dumps(pr))
-elif args[:4] == ["api", "--hostname", "github.com", "graphql"] and args[-8:] == [
+elif args[:4] == ["api", "--hostname", "github.com", "graphql"] and args[-6:] == [
     "-f", "owner=example", "-f", "name=project", "-F", "number=42",
-    "-F", "includeComments=false",
 ] and any(arg.startswith("query=query(") and "timelineItems(" in arg for arg in args):
     print(json.dumps({"data": {"repository": {"pullRequest": {
+        "comments": {"nodes": []},
         "timelineItems": {"nodes": [], "pageInfo": {"hasPreviousPage": False}},
     }}}}))
 elif args[:2] == ["pr", "view"]:
