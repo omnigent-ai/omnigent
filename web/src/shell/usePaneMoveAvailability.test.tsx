@@ -41,9 +41,31 @@ function Panes({ width, attached = true }: { width: () => number; attached?: boo
   );
 }
 
+let renders = 0;
+
+/** Panes whose element is a new one on every render, as an owner that remounts it would give. */
+function RemountingPanes({ width }: { width: () => number }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  renders += 1;
+  latest = usePaneMoveAvailability({
+    layout: SIDE_BY_SIDE,
+    zoomedKey: null,
+    paneKey: "a",
+    sizing: () => sizingAt(width),
+    rootRef,
+  });
+  return (
+    <div key={renders} ref={rootRef}>
+      <div data-terminal-pane="a" data-terminal-cols="80" />
+      <div data-terminal-pane="b" />
+    </div>
+  );
+}
+
 afterEach(() => {
   cleanup();
   latest = null;
+  renders = 0;
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -85,5 +107,32 @@ describe("usePaneMoveAvailability", () => {
     const observers = vi.spyOn(MutationObserver.prototype, "disconnect");
     view.unmount();
     expect(observers).toHaveBeenCalled();
+  });
+
+  it("settles when the panes' element is replaced on every render, and watches the new one", () => {
+    let width = 800;
+    const resize = installResizableWidth(width);
+    const observe = vi.spyOn(ResizeObserver.prototype, "observe");
+    const disconnect = vi.spyOn(ResizeObserver.prototype, "disconnect");
+    const view = render(<RemountingPanes width={() => width} />);
+    expect(latest).toEqual({ available: true });
+    expect(renders).toBeLessThan(5);
+
+    view.rerender(<RemountingPanes width={() => width} />);
+    const current = view.container.firstElementChild;
+    // The newest observer watches the element on screen; every one before it let go.
+    const watched = observe.mock.calls.map(([target]) => target);
+    expect(watched.at(-1)).toBe(current);
+    expect(watched.length).toBeGreaterThan(1);
+    const observers = observe.mock.contexts;
+    for (const stale of observers.slice(0, -1)) {
+      expect(disconnect.mock.contexts).toContain(stale);
+    }
+    expect(disconnect.mock.contexts).not.toContain(observers.at(-1));
+
+    width = 200;
+    resize(width);
+    expect(latest).toEqual({ available: false, reason: NO_ROOM_TO_MOVE_REASON });
+    expect(renders).toBeLessThan(10);
   });
 });

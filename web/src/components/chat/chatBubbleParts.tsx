@@ -74,6 +74,7 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import { cn } from "@/lib/utils";
 import {
   splitKnownSlashCommand,
@@ -751,7 +752,7 @@ export function WorkingIndicator() {
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5">
+          <div ref={throttleAnimations} className="flex items-center gap-1.5 py-0.5">
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm" duration={1.5}>
               {label}
@@ -1146,7 +1147,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const ts = formatBubbleTimestamp(bubble.createdAtS);
   const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
-    useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
+    useMessageActionVisibility(awaitingAgent, awaitingAgent);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(userMessageLinkId(bubble));
   // Collapse long prompts by default to avoid expensive Markdown parsing and
   // a large DOM for text the user hasn't asked to read yet.
@@ -1414,8 +1415,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         )}
         {visibilityToggle}
         <div className="flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0">
-          {/* Outside the hover-revealed actions: a mid-turn message can wait
-              minutes behind a long tool call and must not look delivered. */}
+          {/* A mid-turn message can wait minutes behind a long tool call and must
+              not look delivered, so its whole footer stays visible until read. */}
           {awaitingAgent && (
             <span
               className="min-w-0 truncate text-sm leading-4 text-muted-foreground"

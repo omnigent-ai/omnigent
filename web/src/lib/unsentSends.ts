@@ -1,6 +1,7 @@
 // Sends this tab hasn't seen answered, and queued messages, per session in sessionStorage.
 // The server can hold a POST for minutes (a sandbox launch or wake) without persisting
 // it, and the queue lives in memory, so a reload would otherwise lose the text.
+import { isPageHiding } from "./pageLifecycle";
 import { readComposerDraft, type StoredReplyDraft } from "./replyDraft";
 
 export interface UnsentSend {
@@ -13,18 +14,6 @@ export interface UnsentSend {
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
 const QUEUED_SENDS_KEY = "omnigent.queuedSends";
-
-// A page that is going away aborts its open sends, and their cleanup still runs
-// as it unloads; keep their records for the next page instead.
-let pageHiding = false;
-if (typeof window !== "undefined") {
-  window.addEventListener("pagehide", () => {
-    pageHiding = true;
-  });
-  window.addEventListener("pageshow", () => {
-    pageHiding = false;
-  });
-}
 
 function parseSend(entry: unknown): UnsentSend | null {
   const draft = readComposerDraft(entry);
@@ -87,7 +76,8 @@ export function rememberUnsentSend(conversationId: string, send: UnsentSend): vo
 
 /** Drop one message's record once this tab has seen that send settle. Other records stay. */
 export function forgetUnsentSend(conversationId: string, stableId: string): void {
-  if (pageHiding) return;
+  // A page going away aborts its open sends; their records stay for the next page.
+  if (isPageHiding()) return;
   const records = read(UNSENT_SENDS_KEY, parseUnsentList);
   const left = (records[conversationId] ?? []).filter((r) => r.stableId !== stableId);
   if (left.length === (records[conversationId] ?? []).length) return;
@@ -109,7 +99,7 @@ export function peekUnsentSend(conversationId: string): UnsentSend | null {
 
 /** Record the messages a session's queue holds, in order; an empty list clears it. */
 export function rememberQueuedSends(conversationId: string, sends: UnsentSend[]): void {
-  if (pageHiding) return;
+  if (isPageHiding()) return;
   const queues = Object.entries(read(QUEUED_SENDS_KEY, parseQueue));
   const others = queues.filter(([id]) => id !== conversationId);
   write(

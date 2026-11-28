@@ -403,7 +403,8 @@ def fetch_model_pricing_with_provider(
 
                     provider = default_provider_for_harness(provider_config, canonical_harness)
                 if provider is not None:
-                    family = provider.family(family_name)
+                    # Rates do not require resolving credentials or endpoint variables.
+                    family = provider.families.get(family_name)
                     if family is not None and family.pricing is not None:
                         return ModelPricing(
                             input_per_token=family.pricing.input_per_million / 1_000_000,

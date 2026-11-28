@@ -4002,6 +4002,8 @@ async def test_runner_os_env_cold_shell_preserves_file_helper(
     from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
+    # Unsupported kernels/launchers keep the established disposable shell path.
+    monkeypatch.setattr("omnigent.inner._bwrap_shell_request.request_launcher", lambda *_: None)
     shell_started = asyncio.Event()
     shell_blocked = asyncio.Event()
     shell_result = {
@@ -9199,6 +9201,58 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     # r1, so exactly one status call (not one per session). A count of 2
     # would mean the dedup regressed into a per-session fan-out.
     assert runner_status_calls == ["r1"]
+
+
+@pytest.mark.asyncio
+async def test_session_list_reports_session_times() -> None:
+    """
+    Each global ``sessions`` row carries the session's ``created_at`` and its
+    ``last_activity_at`` (the server's ``updated_at``), in Unix seconds, so an
+    agent can keep only the sessions active within a window. A row the server
+    sends without times keeps its old shape.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/sessions/conv_x/child_sessions":
+            return httpx.Response(200, json={"object": "list", "data": []})
+        if path == "/v1/sessions/conv_x":
+            return httpx.Response(200, json={"id": "conv_x", "parent_session_id": None})
+        if path == "/v1/sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "s1",
+                            "title": "rollout",
+                            "status": "idle",
+                            "created_at": 1_700_000_000,
+                            "updated_at": 1_700_086_400,
+                        },
+                        {"id": "s2", "title": "no times", "status": "idle"},
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected path {path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_list",
+                json.dumps({}),
+                conversation_id="conv_x",
+                server_client=client,
+            )
+        )
+
+    first, second = out["sessions"]
+    assert first["created_at"] == 1_700_000_000
+    assert first["last_activity_at"] == 1_700_086_400
+    assert "created_at" not in second
+    assert "last_activity_at" not in second
 
 
 @pytest.mark.asyncio

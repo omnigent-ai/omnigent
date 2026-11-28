@@ -21,6 +21,7 @@ import { StarterKit } from "@tiptap/starter-kit";
 import { PluginKey } from "@tiptap/pm/state";
 import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
+import { revealDecorationKey } from "./TipTapRevealDecoration";
 import {
   commentDecorationKey,
   createCommentDecorationExtension,
@@ -101,6 +102,7 @@ describe("createCommentDecorationExtension decorations", () => {
     expect(span!.classList.contains("md-comment")).toBe(true);
     expect(span!.classList.contains("md-comment-active")).toBe(false);
     expect(span!.textContent).toBe("quick");
+    expect(revealDecorationKey(commentDecorationKey.getState(editor.state)!)).toBe("");
   });
 
   // WHY: the active comment (matching activeSelection offsets) gets the -active class.
@@ -115,6 +117,8 @@ describe("createCommentDecorationExtension decorations", () => {
     editor = makeEditor(stateRef);
     const span = editor.view.dom.querySelector('[data-comment-id="c1"]')!;
     expect(span.classList.contains("md-comment-active")).toBe(true);
+    // The active comment carries the reveal spec so hidden node views can show it.
+    expect(revealDecorationKey(commentDecorationKey.getState(editor.state)!)).not.toBe("");
   });
 
   // WHY: comments whose anchor text isn't in the doc must be silently skipped.

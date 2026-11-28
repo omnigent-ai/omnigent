@@ -57,6 +57,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialPrompt,
     initialTrigger,
     initialTemplateId,
+    initialSchedule,
     sessionLink,
     editingTask,
     onCreated,
@@ -68,6 +69,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialPrompt?: string;
     initialTrigger?: string | null;
     initialTemplateId?: string;
+    initialSchedule?: string;
     sessionLink?: string;
     editingTask?: ScheduledTask | null;
   }) =>
@@ -78,6 +80,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-prompt={initialPrompt ?? ""}
         data-initial-trigger={initialTrigger ?? ""}
         data-initial-template={initialTemplateId ?? ""}
+        data-initial-schedule={initialSchedule ?? ""}
         data-session-link={sessionLink ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
@@ -1147,6 +1150,27 @@ describe("trigger templates", () => {
     selectView("Your automations");
     expect(screen.getByText("No automations yet")).toBeVisible();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+  });
+});
+
+describe("a link that opens New automation", () => {
+  it("opens it filled in once, and New afterwards starts empty", async () => {
+    setTasks([]);
+    renderPage(
+      `/tasks?new=1&name=${encodeURIComponent("Weekly digest")}&prompt=${encodeURIComponent(
+        "Summarize the board",
+      )}&schedule=${encodeURIComponent("FREQ=WEEKLY;BYDAY=MO")}`,
+    );
+
+    const dialog = await screen.findByTestId("manual-dialog-open");
+    expect(dialog).toHaveAttribute("data-initial-name", "Weekly digest");
+    expect(dialog).toHaveAttribute("data-initial-prompt", "Summarize the board");
+    expect(dialog).toHaveAttribute("data-initial-schedule", "FREQ=WEEKLY;BYDAY=MO");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-name", "");
   });
 });
 

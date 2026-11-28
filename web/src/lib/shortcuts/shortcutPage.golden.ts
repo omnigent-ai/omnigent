@@ -1,4 +1,4 @@
-// Golden Keyboard shortcuts rows for macOS and other platforms across all 2,048 runtime contexts,
+// Golden Keyboard shortcuts rows for macOS and other platforms across all 4,096 runtime contexts,
 // pinning the page's output independently of the registry that builds it.
 
 /** A recorded row: keys as space-separated caps on macOS, then on other platforms. */
@@ -30,7 +30,7 @@ function row(
 export const GOLDEN_GROUP_FLAGS = {
   General: ["native", "siblingSessions", "desktopCommands"],
   "In chats": ["submitWithModEnter", "preventsKeyboardSubmit", "alwaysSteer"],
-  Navigation: ["electron", "native"],
+  Navigation: ["electron", "native", "quickPick"],
   View: ["native", "browser", "contentSearch", "desktopCommands", "preventsKeyboardSubmit"],
   Panes: ["grids", "splitTerminal"],
   "Slash commands": [],
@@ -61,7 +61,7 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 20 */ row("Focus chat input", "⌃ ⇧ L", "Ctrl ⇧ L"),
   /* 21 */ row("Toggle voice dictation", "⌘ ⌥ V", "Ctrl Alt V"),
   /* 22 */ row("Stop response", "Esc", "Esc"),
-  /* 23 */ row("Jump to a sidebar session (1–10)", "⌘ ⌥ 1…0", "Ctrl Alt 1…0"),
+  /* 23 */ row("Jump to a sidebar session (1–9)", "⌘ ⌥ 1…9", "Ctrl Alt 1…9"),
   /* 24 */ row("Toggle Chat / Terminal view", "⌘ ⌥ \\", "Ctrl Alt \\"),
   /* 25 */ row("Toggle conversations sidebar", "⌘ ⌥ [", "Ctrl Alt ["),
   /* 26 */ row("Toggle workspace sidebar", "⌘ ⌥ ]", "Ctrl Alt ]"),
@@ -71,7 +71,7 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 30 */ row("Apply highlighted command", "Tab", "Tab"),
   /* 31 */ row("Dismiss menu", "Esc", "Esc"),
   /* 32 */ row("Start a new session", "⌘ N", "Ctrl N"),
-  /* 33 */ row("Jump to a sidebar session (1–10)", "⌘ 1…0", "Ctrl 1…0"),
+  /* 33 */ row("Jump to a sidebar session (1–9)", "⌘ 1…9", "Ctrl 1…9"),
   /* 34 */ row("Toggle conversations sidebar", "⌘ B", "Ctrl B"),
   /* 35 */ row("Toggle workspace sidebar", "⌘ ⇧ B", "Ctrl ⇧ B"),
   /* 36 */ row("Switch recent sessions", "⌃ Tab", "Ctrl Tab"),
@@ -104,6 +104,10 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 63 */ row("Exit full screen from a file", "Esc", "Esc"),
   /* 64 */ row("Queue message until the agent finishes", "⌘ ↵", "Ctrl ↵"),
   /* 65 */ row("Queue message until the agent finishes", "⌘ ⇧ ↵", "Ctrl ⇧ ↵"),
+  /* 66 */ row("Next session", "⌃ Tab", "Ctrl Tab"),
+  /* 67 */ row("Previous session", "⌃ ⇧ Tab", "Ctrl ⇧ Tab"),
+  /* 68 */ row("Next session", "⌃ ⌥ ⇧ ↓", "Ctrl Alt ⇧ ↓"),
+  /* 69 */ row("Previous session", "⌃ ⌥ ⇧ ↑", "Ctrl Alt ⇧ ↑"),
 ];
 
 /**
@@ -167,6 +171,10 @@ export const GOLDEN_GROUPS: Record<string, GoldenGroup | null> = {
   "Navigation: native": { title: "Navigation", rows: [33] },
   "Navigation: electron": { title: "Navigation", rows: [36, 37, 38, 23] },
   "Navigation: electron+native": { title: "Navigation", rows: [36, 37, 38, 33] },
+  "Navigation: quickPick": { title: "Navigation", rows: [23] },
+  "Navigation: native+quickPick": { title: "Navigation", rows: [33] },
+  "Navigation: electron+quickPick": { title: "Navigation", rows: [68, 69, 37, 38, 23] },
+  "Navigation: electron+native+quickPick": { title: "Navigation", rows: [66, 67, 37, 38, 33] },
   "View: -": { title: "View", rows: [24, 25, 26, 27, 28, 63] },
   "View: native": { title: "View", rows: [24, 34, 35, 27, 28, 63] },
   "View: browser": { title: "View", rows: [24, 25, 26, 27, 28, 63] },

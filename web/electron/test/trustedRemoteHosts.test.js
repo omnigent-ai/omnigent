@@ -3,6 +3,9 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  addTrustedRemoteHost,
+  removeTrustedRemoteHost,
+  serializeTrustedRemoteHosts,
   trustedRemoteTarget,
   normalizeTrustedHostId,
   readTrustedRemoteHosts,
@@ -51,6 +54,34 @@ describe("trusted remote hosts", () => {
     );
     assert.deepEqual(readTrustedRemoteHosts(undefined), []);
     assert.deepEqual(readTrustedRemoteHosts("https://sandbox.example.com"), []);
+  });
+
+  it("adds and removes entries in canonical, deduplicated form", () => {
+    const existing = [{ server_url: SERVER, host_id: "existing.host" }];
+    const added = addTrustedRemoteHost(existing, `${SERVER}/`, "ABC123");
+    assert.equal(added.added, true);
+    assert.deepEqual(added.entries, [...existing, { server_url: SERVER, host_id: "abc123" }]);
+    const duplicate = addTrustedRemoteHost(added.entries, SERVER, "abc123");
+    assert.equal(duplicate.added, false);
+    assert.deepEqual(duplicate.entries, added.entries);
+    const invalid = addTrustedRemoteHost(added.entries, "not a url", HOST);
+    assert.equal(invalid.added, false);
+    assert.deepEqual(invalid.entries, added.entries);
+    const removed = removeTrustedRemoteHost(added.entries, SERVER, "ABC123");
+    assert.equal(removed.removed, true);
+    assert.deepEqual(removed.entries, existing);
+    const preserved = readTrustedRemoteHosts(removed.entries);
+    assert.equal(
+      isTrustedRemoteContext(preserved, { ...context, sourceHostId: "existing.host" }, SERVER),
+      true,
+    );
+    assert.deepEqual(removeTrustedRemoteHost(removed.entries, SERVER, "existing.host").entries, []);
+    assert.equal(removeTrustedRemoteHost([], SERVER, HOST).removed, false);
+    assert.deepEqual(serializeTrustedRemoteHosts([{ server_url: SERVER, host_id: HOST }]), [
+      { server_url: SERVER, host_id: HOST },
+    ]);
+    assert.deepEqual(serializeTrustedRemoteHosts([entry]), [{ server_url: SERVER, host_id: HOST }]);
+    assert.deepEqual(serializeTrustedRemoteHosts([{ server_url: "not a url", host_id: HOST }]), []);
   });
 
   it("allows a session only on its trusted server and host", () => {

@@ -4,6 +4,7 @@
 
 import { AlertCircleIcon, Loader2Icon, RefreshCwIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useChoosingComparisonOwner } from "@/hooks/useComparisonOwner";
 import { workingCopyComparisonActions } from "@/hooks/useWorkingCopyChanges";
 import type { EffectiveComparison } from "@/lib/workingCopyComparison";
 import { cn } from "@/lib/utils";
@@ -18,7 +19,7 @@ export function WorkingCopyComparisonStatusRow({
   comparison: EffectiveComparison;
   className?: string;
 }) {
-  const actions = workingCopyComparisonActions(sessionId);
+  const actions = workingCopyComparisonActions(sessionId, useChoosingComparisonOwner());
   let message: string;
   let busy = false;
   let retry = false;
@@ -102,7 +103,7 @@ export function WorkingCopyComparisonPlaceholder({
   sessionId: string;
   comparison: EffectiveComparison;
 }) {
-  const actions = workingCopyComparisonActions(sessionId);
+  const actions = workingCopyComparisonActions(sessionId, useChoosingComparisonOwner());
   if (comparison.base === "pending") {
     return (
       <div

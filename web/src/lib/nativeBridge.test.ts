@@ -9,6 +9,7 @@ import {
   reportConversationShown,
   openDesktopSessionWindow,
   setDesktopCommandState,
+  shellRoutesDesktopCommands,
   startSystemDictation,
   supportsDesktopCommands,
   supportsDesktopSessionWindows,
@@ -38,6 +39,7 @@ import {
   supportsArcaConnect,
   supportsBrowser,
   supportsWidenWindowForRightSidebar,
+  trustedRemoteHostsBridge,
   switchServer,
   takeOnboardingRunner,
 } from "./nativeBridge";
@@ -392,6 +394,35 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("trustedRemoteHostsBridge", () => {
+  it("is null in a plain browser and on a shell too old for the bridge", () => {
+    setElectron(false);
+    expect(trustedRemoteHostsBridge()).toBeNull();
+    setElectron(true);
+    expect(trustedRemoteHostsBridge()).toBeNull();
+  });
+
+  it("exposes list, add, and remove when the shell offers them", async () => {
+    const list = vi.fn().mockResolvedValue({ ok: true, hosts: [] });
+    const add = vi.fn();
+    const remove = vi.fn();
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      getTrustedRemoteHosts: list,
+      addTrustedRemoteHost: add,
+      removeTrustedRemoteHost: remove,
+    };
+    const bridge = trustedRemoteHostsBridge();
+    expect(bridge).not.toBeNull();
+    await bridge!.list();
+    expect(list).toHaveBeenCalledOnce();
+    await bridge!.add("https://server.example.com/", "example-host");
+    expect(add).toHaveBeenCalledWith("https://server.example.com/", "example-host");
+    await bridge!.remove("https://server.example.com/", "example-host");
+    expect(remove).toHaveBeenCalledWith("https://server.example.com/", "example-host");
   });
 });
 
@@ -794,6 +825,24 @@ describe("desktop command bridge", () => {
     expect(supportsDesktopCommands()).toBe(false);
     installDesktop({ onDesktopCommand: () => () => {}, setDesktopCommandState: () => {} });
     expect(supportsDesktopCommands()).toBe(true);
+  });
+
+  it("routes commands only where the shell lists every one of them", () => {
+    const bridge = { onDesktopCommand: () => () => {}, setDesktopCommandState: () => {} };
+    // No shell, or a shell from before the command bridge.
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    installDesktop({ desktopCommands: ["go-back", "go-forward"] });
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    // A bridge from before the list, a malformed list, then a list missing one of them.
+    installDesktop(bridge);
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    installDesktop({ ...bridge, desktopCommands: "go-back" });
+    expect(shellRoutesDesktopCommands(["go-back"])).toBe(false);
+    installDesktop({ ...bridge, desktopCommands: ["close", "go-back"] });
+    expect(shellRoutesDesktopCommands(["go-back", "go-forward"])).toBe(false);
+    // A shell that lists them all.
+    installDesktop({ ...bridge, desktopCommands: ["close", "go-back", "go-forward"] });
+    expect(shellRoutesDesktopCommands(["go-back", "go-forward"])).toBe(true);
   });
 
   it("forwards known commands and drops ones this page doesn't know", () => {

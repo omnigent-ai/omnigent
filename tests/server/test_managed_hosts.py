@@ -4416,6 +4416,82 @@ async def test_run_managed_wake_forwards_recorded_repo(
     assert tracker.get("conv_1") is None
 
 
+@pytest.mark.parametrize(
+    ("resume_preserves_host", "hint"),
+    [
+        (False, "Sign the sandbox host in again, then retry."),
+        (False, None),
+        (True, "Sign the sandbox host in again, then retry."),
+    ],
+)
+async def test_wake_rendezvous_reports_sandbox_host_that_cannot_register(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, resume_preserves_host: bool, hint: str | None
+) -> None:
+    """A message waiting on a wake whose host cannot register is not told it is provisioning."""
+    from omnigent.errors import OmnigentError
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.helpers import _await_settled_managed_launch
+    from tests._helpers.polling import poll_until_async
+
+    host_store = HostStore(db_uri)
+    host_signs_in = threading.Event()
+    host_signs_in.set()
+
+    def _register(invocation: HostStartInvocation) -> None:
+        if host_signs_in.is_set():
+            host_store.upsert_on_connect(
+                host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            )
+
+    fake = _IsloFakeLauncher(
+        on_host_start=_register, can_resume=True, resume_preserves_host=resume_preserves_host
+    )
+    monkeypatch.setattr(fake, "host_online_failure_hint", lambda _sandbox_id: hint)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    # The sandbox keeps running, but its host has lost the login it registers with.
+    host_signs_in.clear()
+    host_store.set_offline(first.host_id)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 60)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 0.5)
+    tracker = ManagedLaunchTracker()
+    tracker.begin("conv-wake")
+    state = tracker.get("conv-wake")
+    assert state is not None
+    with pytest.raises(OmnigentError, match="still provisioning"):
+        await _await_settled_managed_launch(state)
+
+    conv = SimpleNamespace(inference_snapshot=None, labels={}, host_id=first.host_id)
+    wake = asyncio.create_task(
+        orchestration._run_managed_wake(
+            session_id="conv-wake",
+            conv=conv,
+            sandbox_config=config,
+            tracker=tracker,
+            conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
+            host_store=host_store,
+            host_registry=None,
+            tunnel_registry=None,
+        )
+    )
+    try:
+        await poll_until_async(
+            lambda: fake.resumed if resume_preserves_host else len(fake.host_starts) == 2
+        )
+        with pytest.raises(OmnigentError) as error:
+            await _await_settled_managed_launch(state)
+    finally:
+        wake.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wake
+    assert fake.resumed == ["sb-fake-1"]
+    assert state.host_online_failure_hint is None
+    unconnected = "The host in the session's managed sandbox has not connected to the server"
+    assert error.value.message == (
+        f"{unconnected} — {hint}" if hint else f"{unconnected} yet; try again shortly"
+    )
+
+
 async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri: str) -> None:
     """The wake gate requires matching provider, sandbox id, and ``can_resume``."""
     host_store = HostStore(db_uri)

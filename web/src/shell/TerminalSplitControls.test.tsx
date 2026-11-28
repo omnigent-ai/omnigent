@@ -205,6 +205,19 @@ it("closes the focused shell only after confirmation", async () => {
   expect(fixture.deleteTerminal).toHaveBeenCalledWith(BASH.id);
 });
 
+it("asks about one shell, and kills it once, when Close pane is clicked twice", async () => {
+  fixture.terminals = [AGENT, BASH];
+  saveSplit("conv_controls_double_close", BASH_KEY);
+  renderControls("conv_controls_double_close");
+
+  const close = screen.getByRole("button", { name: "Close pane" });
+  fireEvent.click(close);
+  fireEvent.click(close);
+  expect(await screen.findByText("Close shell?")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+  expect(fixture.deleteTerminal).toHaveBeenCalledExactlyOnceWith(BASH.id);
+});
+
 it("offers no close for the agent pane", () => {
   fixture.terminals = [AGENT, BASH];
   saveSplit("conv_controls_agent_focus", AGENT_KEY);

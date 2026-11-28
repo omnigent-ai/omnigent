@@ -28,11 +28,7 @@ import { TabsTrigger, tabsTriggerClassName } from "@/components/ui/tabs";
 import { useInertRef } from "@/hooks/useInertRef";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
-import {
-  type ShortcutId,
-  shortcutAriaKeys,
-  shortcutKeys,
-} from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { type ShortcutId, shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { TAB_BADGE_BASE } from "@/shell/railTabs";
 import { WorkspaceTabTooltip } from "@/shell/WorkspacePanel";
 import { closeTabLabel } from "@/shell/workspaceCommands/model";

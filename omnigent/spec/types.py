@@ -913,6 +913,8 @@ class ToolGroupsConfig:
     :param files: ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``,
         which share workspace files through the session's file store. Off by
         default.
+    :param gadgets: The ``sys_gadget_*`` tools (13), which build and run gadgets.
+        The runner also drops them unless the server enables the ``gadgets`` feature.
     """
 
     browser: bool = True
@@ -925,6 +927,7 @@ class ToolGroupsConfig:
     user_inbox: bool = True
     memory: bool = True
     files: bool = False
+    gadgets: bool = True
 
 
 @dataclass

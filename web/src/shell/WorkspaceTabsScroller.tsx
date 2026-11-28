@@ -63,6 +63,17 @@ export function scrollViewportToShow(
   }
 }
 
+// How far the strip's edges fade where more tabs are scrolled out of view.
+const EDGE_FADE_PX = 16;
+
+/** The mask that fades the edges with tabs beyond them, or none. */
+function edgeFadeMask(start: boolean, end: boolean): string {
+  if (!start && !end) return "";
+  const from = start ? `transparent, black ${EDGE_FADE_PX}px` : "black";
+  const to = end ? `black calc(100% - ${EDGE_FADE_PX}px), transparent` : "black";
+  return `linear-gradient(to right, ${from}, ${to})`;
+}
+
 /** Scrolls the strip to show the selected tab inside `content`, if any. */
 function revealActiveTab(content: HTMLElement | null): void {
   scrollTabIntoView(
@@ -71,8 +82,9 @@ function revealActiveTab(content: HTMLElement | null): void {
 }
 
 /**
- * Scroll open tabs horizontally with a hidden scrollbar. When their labels overflow the
- * strip, tabs switch to icons only (see {@link useCompactWorkspaceTabs}).
+ * Scroll open tabs horizontally with a hidden scrollbar; an edge fades while tabs lie past it.
+ * When their labels overflow the strip, tabs switch to icons only (see
+ * {@link useCompactWorkspaceTabs}).
  */
 export function WorkspaceTabsScroller({
   children,
@@ -142,9 +154,23 @@ export function WorkspaceTabsScroller({
     });
     observer.observe(viewport);
     observer.observe(content);
+    // Set on the element, not through state, so scrolling doesn't re-render the tabs.
+    const updateFade = () => {
+      const start = viewport.scrollLeft > 1;
+      const end = viewport.scrollLeft + viewport.clientWidth < viewport.scrollWidth - 1;
+      const mask = edgeFadeMask(start, end);
+      viewport.style.maskImage = mask;
+      viewport.style.setProperty("-webkit-mask-image", mask);
+    };
+    const fadeObserver = new ResizeObserver(updateFade);
+    fadeObserver.observe(viewport);
+    fadeObserver.observe(content);
+    viewport.addEventListener("scroll", updateFade, { passive: true });
     viewport.addEventListener("wheel", wheel, { passive: false });
     return () => {
       observer.disconnect();
+      fadeObserver.disconnect();
+      viewport.removeEventListener("scroll", updateFade);
       viewport.removeEventListener("wheel", wheel);
     };
   }, []);

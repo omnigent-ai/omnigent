@@ -320,8 +320,9 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
     Pins the native auto-create fallback: when no bundle dir resolves, the
     runner mints an EMPTY temp dir and seeds at most the framework-owned
     skills: ``build-omnigent``, which every agent gets unconditionally,
-    ``workflow`` and ``save-workflow`` for agents with the journal tools, and
-    ``import-memory`` for agents with the memory tools. It
+    ``workflow`` and ``save-workflow`` for agents with the journal tools,
+    ``import-memory`` for agents with the memory tools, and ``gadget`` for agents
+    with the gadget tools. It
     never copies from the parent — which is why those two call sites need
     no change. This fails loudly if that fallback ever starts sourcing a
     parent bundle.
@@ -338,7 +339,7 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
 
     skills_dir = isolated / "skills"
     seeded = {p.name for p in skills_dir.iterdir()} if skills_dir.is_dir() else set()
-    assert seeded <= {"build-omnigent", "workflow", "save-workflow", "import-memory"}
+    assert seeded <= {"build-omnigent", "workflow", "save-workflow", "import-memory", "gadget"}
     # No parent asset reached the isolated bundle by any route.
     assert not list(isolated.rglob("parent-only"))
     assert not list(isolated.rglob("config.yaml"))

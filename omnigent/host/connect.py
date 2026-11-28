@@ -4282,10 +4282,19 @@ class HostProcess:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
 
+        from omnigent.automations_availability import (
+            ACCEPTED_TOOL_GROUPS_HEADER,
+            NEGOTIATED_TOOL_GROUPS,
+        )
+
         path = quote(frame.session_id or "", safe="")
         return httpx.get(
             f"{self._server_url}/v1/sessions/{path}/agent/contents",
-            headers=self._build_connect_headers(),
+            # This host parses every tool group, so it reads the bundle as written.
+            headers={
+                **self._build_connect_headers(),
+                ACCEPTED_TOOL_GROUPS_HEADER: ",".join(sorted(NEGOTIATED_TOOL_GROUPS)),
+            },
             timeout=10.0,
             # httpx's default context reads SSL_CERT_FILE eagerly and fails on a
             # deleted bundle; verify like the host tunnel does instead.
@@ -4598,7 +4607,12 @@ class HostProcess:
                 limit=_coerce_int(params.get("limit", 500)),
             )
         if op == "github_info":
-            return r.github_info(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_info(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                # Only a server that hides them from all but the owner asks for them.
+                account_rights=params.get("account_rights") is True,
+            )
         if op == "github_review_threads":
             return r.github_review_threads(
                 session_id,
@@ -4606,6 +4620,8 @@ class HostProcess:
                 str(params.get("after", "")),
                 str(params.get("head_sha", "")),
                 str(params.get("base_sha", "")),
+                # Only a server that hides them from all but the owner asks for them.
+                account_rights=params.get("account_rights") is True,
             )
         if op == "github_review_thread_comments":
             return r.github_review_thread_comments(
@@ -4613,6 +4629,7 @@ class HostProcess:
                 str(params.get("pr_url", "")),
                 str(params.get("thread_id", "")),
                 str(params.get("after", "")),
+                account_rights=params.get("account_rights") is True,
             )
         if op == "github_changes":
             return r.github_changes(

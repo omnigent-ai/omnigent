@@ -71,6 +71,8 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.claude_paths import claude_account_home_dir as _account_home_dir
+from omnigent.claude_paths import claude_joined_path as _claude_joined_path
 from omnigent.harnesses.claude_native import (
     PEER_MESSAGE_WAKE_KIND,
     PEER_MESSAGE_WAKE_TEXT,
@@ -83,6 +85,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    hook_blocked_prompt,
 )
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
@@ -2010,7 +2013,7 @@ def claude_global_config_path(
     :returns: The config file path, e.g. ``Path("/home/user/.claude.json")``.
     """
     env = os.environ if env is None else env
-    base = cwd if cwd is not None else Path.cwd()
+    base = cwd
     # Claude builds these with ``path.join``: no ``~`` expansion, ``..`` removed
     # lexically, and relative results resolved against its cwd.
     home_value = env.get("HOME") or str(_account_home_dir())
@@ -2020,7 +2023,7 @@ def claude_global_config_path(
         legacy_dir = unicodedata.normalize("NFC", os.path.join(home_value, ".claude"))
         legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
     elif not config_dir:
-        legacy_path = base / ".config.json"
+        legacy_path = _claude_joined_path(base, "", ".config.json")
     else:
         legacy_dir = unicodedata.normalize("NFC", config_dir)
         legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
@@ -2028,41 +2031,6 @@ def claude_global_config_path(
         return legacy_path
     suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
     return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
-
-
-def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
-    """
-    Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
-
-    ``path.join`` removes ``.`` and ``..`` lexically, without following
-    symlinks, before the filesystem resolves a relative result against
-    Claude's working directory.
-
-    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
-    :param directory: The joined directory value, e.g. ``"x/../cfg"``.
-    :param name: The config file name, e.g. ``".claude.json"``.
-    :returns: The file path, e.g. ``Path("/home/user/repo/cfg/.claude.json")``.
-    """
-    joined = os.path.normpath(os.path.join(directory, name))
-    return Path(joined) if os.path.isabs(joined) else cwd / joined
-
-
-def _account_home_dir() -> Path:
-    """
-    Return the account's home directory, as Claude's runtime does without ``HOME``.
-
-    Claude Code's runtime ignores an unset or empty ``HOME`` and reads the
-    password database, so the runner's own ``HOME`` is not a substitute.
-
-    :returns: The passwd home directory, e.g. ``Path("/home/user")``, or
-        :meth:`Path.home` where no password database exists.
-    """
-    try:
-        import pwd  # noqa: FlagLocalImports - POSIX-only module
-
-        return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError):
-        return Path.home()
 
 
 def ensure_claude_workspace_trusted(
@@ -3145,6 +3113,7 @@ def augment_claude_args(
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
+    defer_inherited_mcp_discovery: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3198,6 +3167,11 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :param defer_inherited_mcp_discovery: ``True`` when the caller resolves the
+        launch cwd and environment later and then calls
+        :func:`apply_claude_launch_mcp_policy`; otherwise strict MCP mode reads
+        inherited settings for *workspace* and this process's environment.
     :returns: Augmented argument list for the terminal resource.
     """
     hook_settings = build_hook_settings(
@@ -3214,10 +3188,14 @@ def augment_claude_args(
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
-    from omnigent.mcp_disabled_servers import apply_claude_settings
-
-    hook_settings = apply_claude_settings(
-        hook_settings, executor="claude-native", active_harnesses=active_harnesses
+    hook_settings = _apply_native_mcp_settings(
+        hook_settings,
+        active_harnesses=active_harnesses,
+        cwd=workspace,
+        env=None,
+        discover_inherited=not defer_inherited_mcp_discovery,
+        setting_sources=[] if skills_filter == "none" else _claude_setting_sources(claude_args),
+        claude_args=claude_args,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -3251,6 +3229,82 @@ def augment_claude_args(
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)
+
+
+def apply_claude_launch_mcp_policy(
+    bridge_dir: Path,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    active_harnesses: Collection[str] | None,
+    claude_args: Sequence[str] = (),
+) -> None:
+    """
+    Apply strict MCP discovery to the invocation settings for Claude's launch context.
+
+    Completes :func:`augment_claude_args` called with
+    ``defer_inherited_mcp_discovery=True``, reading the settings files the launched
+    CLI reads from *cwd* and *env*.
+
+    :param bridge_dir: Bridge directory holding the invocation settings.
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+    :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :param claude_args: Effective CLI arguments, including the selected settings scopes.
+    :raises McpStrictModeError: When strict mode cannot narrow the inherited settings.
+    """
+    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    updated = _apply_native_mcp_settings(
+        settings,
+        active_harnesses=active_harnesses,
+        cwd=cwd,
+        env=env,
+        discover_inherited=True,
+        setting_sources=_claude_setting_sources(claude_args),
+        claude_args=claude_args,
+    )
+    if updated is not settings:
+        _write_json_file(settings_path, updated)
+
+
+def _apply_native_mcp_settings(
+    settings: dict[str, object],
+    *,
+    active_harnesses: Collection[str] | None,
+    cwd: Path | None,
+    env: Mapping[str, str] | None,
+    discover_inherited: bool,
+    setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
+) -> dict[str, object]:
+    """The single claude-native MCP launch hook, shared by both settings passes."""
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    return apply_claude_settings(
+        settings,
+        executor="claude-native",
+        active_harnesses=active_harnesses,
+        cwd=cwd,
+        env=env,
+        discover_inherited=discover_inherited,
+        setting_sources=setting_sources,
+        claude_args=claude_args,
+    )
+
+
+def _claude_setting_sources(args: Sequence[str]) -> list[str] | None:
+    """Read the last explicit settings scope selection, including an empty one."""
+    selected = None
+    tokens = iter(args)
+    for token in tokens:
+        if token == "--":
+            break
+        if token == "--setting-sources":
+            selected = next(tokens, "")
+        elif token.startswith("--setting-sources="):
+            selected = token.partition("=")[2]
+    return selected.split(",") if selected else ([] if selected is not None else None)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
@@ -4223,8 +4277,8 @@ def _transcript_model_pricing(
 
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
-    :param provider_config: Parsed provider configuration for this transcript
-        scan.
+    :param provider_config: Runtime provider configuration, including any saved
+        inference binding, for this transcript scan.
     :param provider_config_fingerprint: Digest used to invalidate pricing when
         the provider configuration changes.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing
@@ -4234,11 +4288,19 @@ def _transcript_model_pricing(
     cached = _TRANSCRIPT_PRICING_CACHE.get(model)
     if cached is not None and cached[0] == provider_config_fingerprint:
         return cached[1]
+    from omnigent.inference_config import resolve_bound_provider
     from omnigent.llms.context_window import fetch_model_pricing_with_provider
 
-    # For claude-native transcript pricing, assume claude-native harness
+    try:
+        provider_entry = resolve_bound_provider(provider_config, "claude-native", allow_empty=True)
+    except Exception:  # noqa: BLE001 — pricing must not interrupt usage forwarding.
+        _logger.warning("Could not resolve transcript pricing provider; using legacy pricing")
+        provider_entry = None
     pricing = fetch_model_pricing_with_provider(
-        model, provider_config=provider_config, harness="claude-native"
+        model,
+        provider_config=provider_config,
+        harness="claude-native",
+        provider_entry=provider_entry,
     )
     if pricing is not None:
         _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)
@@ -5881,6 +5943,56 @@ def _permission_mode_from_pane(pane: str) -> str | None:
     return None
 
 
+# Claude Code's spinner row while it retries a request, its error cut to the pane
+# width with "…". Transcript text is indented, so it never starts at column 0.
+_API_RETRY_ROW_RE = re.compile(
+    r"^✻ (?P<error>\S.*?) · Retrying in [^·]+"
+    r" · attempt (?P<attempt>\d+)/(?P<max_retries>\d+)\s*$"
+)
+_API_RETRY_STATUS_RE = re.compile(r"^(?P<status>[1-5]\d\d)\b")
+
+
+@dataclass(frozen=True)
+class ApiRetry:
+    """
+    Claude Code's visible retry of a failed API request.
+
+    :param status: HTTP status leading the error text, e.g. ``403``, or
+        ``None`` when the row shows no status (Claude's generic "API error").
+    :param error: The error text as rendered, possibly cut with ``"…"``.
+    :param attempt: The attempt the row reports, e.g. ``3``.
+    :param max_retries: Claude Code's retry limit, e.g. ``10``.
+    """
+
+    status: int | None
+    error: str
+    attempt: int
+    max_retries: int
+
+
+def _api_retry_from_pane(pane: str) -> ApiRetry | None:
+    """
+    Read Claude Code's API retry row off a captured pane.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The retry the pane shows, or ``None`` when no request is
+        being retried.
+    """
+    for line in reversed(pane.splitlines()):
+        row = _API_RETRY_ROW_RE.match(line)
+        if row is None:
+            continue
+        error = row.group("error")
+        status = _API_RETRY_STATUS_RE.match(error)
+        return ApiRetry(
+            status=int(status.group("status")) if status else None,
+            error=error,
+            attempt=int(row.group("attempt")),
+            max_retries=int(row.group("max_retries")),
+        )
+    return None
+
+
 # ── /btw side-chat overlay ─────────────────────────────────────────
 # Claude Code's ``/btw`` ("by the way") opens an in-TUI overlay that
 # answers a side question without ever persisting it — not to the
@@ -5950,10 +6062,12 @@ class PaneSignals:
         ``"auto"``, or ``None`` when no mode footer is visible.
     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
         when none is shown / it is still generating.
+    :param api_retry: The API request retry Claude Code shows, or ``None``.
     """
 
     permission_mode: str | None = None
     btw_overlay: BtwOverlay | None = None
+    api_retry: ApiRetry | None = None
 
 
 def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
@@ -9958,8 +10072,8 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     Read every poll-time footer signal from ONE Claude pane capture.
 
     Non-blocking, best-effort, read-only. Captures the pane a single time
-    and parses both the permission-mode footer and any settled ``/btw``
-    overlay from it, so the forwarder spawns one ``capture-pane``
+    and parses the permission-mode footer, any settled ``/btw`` overlay and
+    any API retry row from it, so the forwarder spawns one ``capture-pane``
     subprocess per poll rather than one per signal. Returns an empty
     :class:`PaneSignals` when the terminal isn't up.
 
@@ -9978,6 +10092,7 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     return PaneSignals(
         permission_mode=_permission_mode_from_pane(pane),
         btw_overlay=_btw_overlay_from_pane(pane),
+        api_retry=_api_retry_from_pane(pane),
     )
 
 
@@ -10350,6 +10465,11 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    if (blocked := hook_blocked_prompt(entry)) is not None:
+        # A blocked prompt neither starts nor ends a turn.
+        return current_response_id, _blocked_agent_message_items(
+            entry, *blocked, line_number=line_number, record_offset=record_offset
+        )
     # Only ``user``/``assistant`` records are conversation turns. Other typed
     # records can carry a ``message`` too, e.g. ``api-request-blob`` copies of
     # API requests that include injected ``<system-reminder>`` context.
@@ -10461,6 +10581,127 @@ def _attachment_transcript_items_from_entry(
         ),
     )
     return None, [item]
+
+
+# Claude Code writes this frame line at column zero and indents the report.
+_SUBAGENT_HANDBACK_HEADER_RE = re.compile(r"^\[Subagent hand-back\] ", re.MULTILINE)
+_AGENT_MESSAGE_SENDER_RE = re.compile(
+    r'\A<(?:agent-message\s[^>]*\bfrom|teammate-message\s[^>]*\bteammate_id)="([^"]+)"'
+)
+_AGENT_MESSAGE_TAG_RES = {
+    name: re.compile(rf"<(/?){name}[\s>]") for name in ("agent-message", "teammate-message")
+}
+AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE = "native_agent_message_blocked_by_hook"
+
+
+def _leading_agent_message(text: str, *, outermost: bool) -> tuple[str, str, str] | None:
+    """
+    Split a leading delivery from another agent into its sender, text, and what follows.
+
+    :param text: Text that starts with a delivery envelope.
+    :param outermost: End at the last closing tag instead of the matching one.
+    :returns: The sender, the delivered text, and the text after the delivery, or
+        ``None`` when ``text`` does not start with a complete delivery.
+    """
+    opening = _AGENT_MESSAGE_SENDER_RE.match(text)
+    tag_end = text.find(">", opening.end()) if opening is not None else -1
+    if opening is None or tag_end < 0:
+        return None
+    name = "agent-message" if text.startswith("<agent-message") else "teammate-message"
+    if outermost:
+        content, found, rest = text[tag_end + 1 :].rpartition(f"</{name}>")
+        return (opening.group(1), content, rest) if found else None
+    depth = 1
+    for tag in _AGENT_MESSAGE_TAG_RES[name].finditer(text, tag_end + 1):
+        depth += -1 if tag.group(1) else 1
+        if depth == 0:
+            return opening.group(1), text[tag_end + 1 : tag.start()], text[tag.end() :]
+    return None
+
+
+def _agent_message_deliveries(prompt: str) -> list[tuple[str, str]]:
+    """
+    Split a prompt of deliveries from other agents into each sender and its text.
+
+    Each delivery ends at its matching closing tag, so balanced markup quoted inside
+    it neither ends it nor names a sender. With unbalanced quoted markup, the prompt
+    is one delivery that ends at the last closing tag.
+
+    :param prompt: Prompt text, e.g. ``'<agent-message from="worker">Done</agent-message>'``.
+    :returns: Each sender and its delivered text; empty for any other prompt.
+    """
+    body, wrapped = _strip_teammate_message_prefix(prompt)
+
+    def is_end(remainder: str) -> bool:
+        remainder = remainder.strip()
+        return not remainder or (wrapped and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE))
+
+    deliveries: list[tuple[str, str]] = []
+    rest = body
+    while (delivery := _leading_agent_message(rest, outermost=False)) is not None:
+        sender, text, rest = delivery
+        deliveries.append((sender, text))
+        rest = rest.lstrip()
+        if is_end(rest):
+            return deliveries
+    outer = _leading_agent_message(body, outermost=True)
+    return [(outer[0], outer[1])] if outer is not None and is_end(outer[2]) else []
+
+
+def _blocked_agent_message_items(
+    entry: _JsonObject,
+    reason: str,
+    prompt: str,
+    *,
+    line_number: int,
+    record_offset: int | None,
+) -> list[ClaudeTranscriptItem]:
+    """
+    Report another agent's message that a ``UserPromptSubmit`` hook blocked.
+
+    Claude Code records the block only as a ``system`` notice, and tells a
+    handing-back subagent its report was delivered, so nothing else shows the
+    loss. The blocked text is not repeated: the hook flagged it.
+
+    :param entry: Claude ``system`` record of the blocked prompt.
+    :param reason: The hook's reason, e.g. ``"Secret detected"``.
+    :param prompt: The original prompt, e.g. ``'<agent-message from="worker">…'``.
+    :param line_number: One-based transcript line number.
+    :param record_offset: Byte offset where the transcript record
+        starts, or ``None`` for legacy line-cursor reads.
+    :returns: One error item per blocked delivery; none for any other prompt.
+    """
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    items: list[ClaudeTranscriptItem] = []
+    for index, (sender, text) in enumerate(_agent_message_deliveries(prompt)):
+        if _SUBAGENT_HANDBACK_HEADER_RE.search(text) is not None:
+            title = "A hook blocked a subagent's report"
+            message = (
+                f'A UserPromptSubmit hook blocked the report from subagent "{sender}", so the '
+                "agent never received it, although Claude Code reported it as delivered."
+            )
+        else:
+            title = "A hook blocked a message from another agent"
+            message = (
+                f'A UserPromptSubmit hook blocked a message from agent "{sender}", so the '
+                "agent never received it."
+            )
+        if reason.strip():
+            message = f"{message}\n\nHook reason: {reason.strip()}"
+        items.append(
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, index, "error"),
+                item_type="error",
+                data={
+                    "source": "harness",
+                    "code": AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE,
+                    "title": title,
+                    "message": message,
+                },
+                response_id=_response_id_from_source(source_key),
+            )
+        )
+    return items
 
 
 # Slash-command marker handling. Claude Code's embedded TUI emits
@@ -10981,17 +11222,20 @@ def _peer_message_wake_marker(
     )
 
 
+def _strip_teammate_message_prefix(text: str) -> tuple[str, bool]:
+    """Drop Claude's peer-delivery preamble and report whether one was present."""
+    stripped = text.lstrip()
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            return stripped[len(prefix) :].lstrip(), True
+    return stripped, False
+
+
 def _is_agent_notification_text(text: str) -> bool:
     """Recognize possible agent context; text alone does not prove its origin."""
     if _is_trusted_agent_notification_text(text):
         return True
-    stripped = text.lstrip()
-    wrapped = False
-    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix) :].lstrip()
-            wrapped = True
-            break
+    stripped, wrapped = _strip_teammate_message_prefix(text)
     if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
         return False
     while match := _TEAMMATE_MESSAGE_RE.match(stripped):

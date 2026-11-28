@@ -5,18 +5,56 @@ import type { ReactNode } from "react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+// Counts renders of ⌘K's Mark all as read and Resume sandbox, which render nothing themselves.
+const paletteCommandMounts = vi.hoisted(() => ({ markAllRead: 0, resumeSandbox: 0 }));
+vi.mock("@/shell/markAllReadPaletteCommand", async (importOriginal) => {
+  const original = await importOriginal<typeof MarkAllReadPaletteCommandModule>();
+  return {
+    ...original,
+    MarkAllReadPaletteCommand: () => {
+      paletteCommandMounts.markAllRead += 1;
+      return original.MarkAllReadPaletteCommand();
+    },
+  };
+});
+vi.mock("@/shell/resumeSandboxCommand", async (importOriginal) => {
+  const original = await importOriginal<typeof ResumeSandboxCommandModule>();
+  return {
+    ...original,
+    ResumeSandboxPaletteCommand: () => {
+      paletteCommandMounts.resumeSandbox += 1;
+      return original.ResumeSandboxPaletteCommand();
+    },
+  };
+});
+
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import type * as MarkAllReadPaletteCommandModule from "@/shell/markAllReadPaletteCommand";
+import type * as ResumeSandboxCommandModule from "@/shell/resumeSandboxCommand";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
+import { getGadgetShelf, getSessionGadgets, listGadgets } from "@/gadgets/api/gadgetApi";
+import {
+  GADGET_FULL_SCREEN_PARAM,
+  gadgetCoversConversation,
+  resetGadgetRailRequests,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
+import { MOBILE_BREAKPOINT_PX } from "@/hooks/useIsMobileViewport";
+import { gadgetFixture } from "@/gadgets/ui/testUtils";
+import { IN_APP_GADGET_OPEN } from "@/gadgets/ui/gadgetNavigation";
+import { resetGadgetTabOrders } from "@/gadgets/ui/GadgetRailTabs";
 
 import { lazy, useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -147,6 +185,17 @@ vi.mock("@/hooks/useAgents", () => ({
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
 
+// Gadgets render only in the gadget full screen contract below, where the feature is on. The
+// gadget itself (frame, SDK) has its own tests; here it names itself.
+vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof GadgetApiModule>()),
+  getSessionGadgets: vi.fn(),
+  getGadgetShelf: vi.fn(),
+  listGadgets: vi.fn(),
+}));
+vi.mock("@/gadgets/ui/GadgetView", () => ({
+  GadgetView: ({ gadget }: { gadget: { name: string } }) => <p>shows {gadget.name}</p>,
+}));
 vi.mock("./Sidebar", () => ({
   isMobileViewport: () => !window.matchMedia("(min-width: 1181px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
@@ -288,6 +337,27 @@ vi.mock("./FilesPanelDrawer", () => ({
     />
   ),
 }));
+// What the runner says about a shell being closed; none answers 404, as an older server does.
+// `held` keeps every answer back until it settles.
+const shellRunner = vi.hoisted(() => ({
+  reading: null as Record<string, unknown> | null,
+  asked: [] as string[],
+  held: null as Promise<void> | null,
+}));
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return {
+    ...actual,
+    authenticatedFetch: async (url: string, init?: RequestInit) => {
+      const shell = /\/resources\/terminals\/([^/]+)\/shell$/.exec(url);
+      if (!shell) return actual.authenticatedFetch(url, init);
+      shellRunner.asked.push(decodeURIComponent(shell[1]));
+      await shellRunner.held;
+      const reading = shellRunner.reading;
+      return new Response(JSON.stringify(reading ?? {}), { status: reading ? 200 : 404 });
+    },
+  };
+});
 vi.mock("./TerminalsPanel", () => ({
   TerminalsPanel: ({
     open,
@@ -351,6 +421,7 @@ const forkSessionMock = vi.mocked(forkSession);
 const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
+import { setSplitBesideChat, setSplitOnScreen } from "./chatPaneToolbarHost";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { bindConversationForTest, useChatStore } from "@/store/chatStore";
@@ -833,6 +904,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  shellRunner.reading = null;
+  shellRunner.asked = [];
+  shellRunner.held = null;
   toast.dismiss();
   cleanup();
   vi.useRealTimers();
@@ -1201,6 +1275,64 @@ describe("AppShell header", () => {
         );
       },
     );
+
+    it("drops the row while a split floats beside the chat as its own cards, and brings it back", async () => {
+      windowWidth(1440);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      act(() => setSplitOnScreen("conv_terminal", true));
+      expect(strip()).toBeNull();
+      expect(column()).toHaveAttribute("data-main-view", "terminal");
+      act(() => setSplitOnScreen("conv_terminal", false));
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+    });
+
+    it("gives the chat back its card and row when its split leaves the screen but stays saved", async () => {
+      windowWidth(1440);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      act(() => {
+        setSplitBesideChat("conv_terminal", true);
+        setSplitOnScreen("conv_terminal", true);
+      });
+      expect(strip()).toBeNull();
+
+      // The panes view hides, as when the agent's terminal goes, and its split stays saved.
+      act(() => setSplitOnScreen("conv_terminal", false));
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      act(() => setSplitBesideChat("conv_terminal", false));
+    });
+
+    // 1000px floats the cards but is below the desktop layout, so there is no panes view.
+    it("keeps the chat's card and row when a split is published but the panes view isn't shown", async () => {
+      windowWidth(1000);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      act(() => setSplitOnScreen("conv_terminal", true));
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      act(() => setSplitOnScreen("conv_terminal", false));
+    });
 
     it.each([
       ["without floating panes", undefined, 1440, { "omnigent.ui": "terminal" }],
@@ -2171,7 +2303,7 @@ describe("Chat-mode terminal panel layout", () => {
     expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
   });
 
-  it("confirms before closing a shell tab, then kills the terminal", () => {
+  it("confirms before closing a shell tab, then kills the terminal", async () => {
     // Closing a tab kills the underlying terminal (destructive), so the "x"
     // opens a confirm modal first; confirming issues the delete (which the SSE
     // `resource.deleted` + cache prune turn into the tab disappearing). Closing
@@ -2198,7 +2330,7 @@ describe("Chat-mode terminal panel layout", () => {
 
     // Clicking the tab's "x" does NOT kill immediately — it asks first.
     fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("Close shell?");
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Close shell?");
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
 
     // Confirming kills the terminal by its resource id.
@@ -2206,7 +2338,75 @@ describe("Chat-mode terminal panel layout", () => {
     expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
   });
 
-  it("does not kill the terminal when the close confirmation is cancelled", () => {
+  /** An owner's session with one shell tab, selected, as the close cases below need. */
+  const renderOneShellTab = () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_abc");
+  };
+
+  it("closes a shell tab the runner reads idle without asking", async () => {
+    shellRunner.reading = { state: "idle" };
+    renderOneShellTab();
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+    await waitFor(() => expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(shellRunner.asked).toEqual(["terminal_main"]);
+  });
+
+  it("asks before closing a busy shell tab, naming its job", async () => {
+    shellRunner.reading = { state: "busy", foreground: "vim", background_jobs: 0 };
+    renderOneShellTab();
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("vim is running in main · u-1");
+    expect(deleteTerminalMutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
+  });
+
+  it("closes both shell tabs when the second is closed while the first is still checking", async () => {
+    let answer = () => {};
+    shellRunner.held = new Promise((resolve) => {
+      answer = resolve;
+    });
+    shellRunner.reading = { state: "idle" };
+    writeSessionWorkspaceState("conv_abc", { open: true, selectedTerminalKey: "terminal:t_one" });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "t_one", name: "one", session: "u-1", running: true },
+        { id: "t_two", name: "two", session: "u-2", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByRole("button", { name: "Close one · u-1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close two · u-2" }));
+    act(() => answer());
+    await waitFor(() => expect(deleteTerminalMutate).toHaveBeenCalledTimes(2));
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("t_one");
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("t_two");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("does not kill the terminal when the close confirmation is cancelled", async () => {
     writeSessionWorkspaceState("conv_abc", {
       open: true,
       selectedTerminalKey: "terminal:terminal_main",
@@ -2225,7 +2425,7 @@ describe("Chat-mode terminal panel layout", () => {
     renderShell("/c/conv_abc");
 
     fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
 
     // No delete, and the shell's xterm is still mounted.
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
@@ -2260,7 +2460,7 @@ describe("Chat-mode terminal panel layout", () => {
     };
     // Cancelling the single confirmation kills nothing.
     await closeOthersOf("c · u-1");
-    expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Close 2 shells?");
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
 
@@ -2278,7 +2478,7 @@ describe("Chat-mode terminal panel layout", () => {
       return Promise.resolve();
     });
     await closeOthersOf("c · u-1");
-    fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Close shells" }));
     expect(deleteTerminalMutate.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
     await waitFor(() =>
       expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_c"),
@@ -2369,7 +2569,7 @@ describe("Chat-mode terminal panel layout", () => {
 
     fireEvent.contextMenu(screen.getByTitle("c · u-1"));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
-    fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Close shells" }));
 
     // Both kills are in flight, so both tabs read as closing and take no second close.
     for (const label of ["a · u-1", "b · u-1"]) {
@@ -2405,7 +2605,7 @@ describe("Chat-mode terminal panel layout", () => {
     renderShell("/c/conv_abc", undefined, { rerenderable: true });
 
     fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
-    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Close shell" }));
     // Its tab was the last open one, so the rail hides.
     expect(await screen.findByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
 
@@ -2714,6 +2914,169 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
       "md:absolute",
     );
+  });
+});
+
+/** Pins intended behavior: in-app gadget opens preserve sidebar state; fresh links collapse it. */
+describe("gadget full screen contract", () => {
+  const BOARD = gadgetFixture({ id: "board", name: "Board" });
+  const GADGETS_ON = serverInfo({ features: { gadgets: true } });
+
+  beforeEach(() => {
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    vi.mocked(getSessionGadgets).mockResolvedValue([BOARD]);
+    vi.mocked(getGadgetShelf).mockResolvedValue({ pinned: [], hasOwned: true });
+    vi.mocked(listGadgets).mockResolvedValue([BOARD]);
+  });
+  afterEach(() => {
+    resetGadgetRailRequests();
+    resetGadgetTabOrders();
+    vi.mocked(getSessionGadgets).mockReset();
+  });
+
+  /** Opens the gadget from inside the app, as the gadget link page does for an in-app open. */
+  function OpenGadget({ state }: { state?: unknown }) {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate("/c/conv_abc?gadget=board", { state })}>
+        open gadget
+      </button>
+    );
+  }
+
+  function renderSession(entry: string, content: ReactNode = null) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={GADGETS_ON}>
+        {shellTree(
+          qc,
+          entry,
+          <Route
+            path="c/:conversationId"
+            element={
+              <>
+                {content}
+                <LocationDisplay />
+              </>
+            }
+          />,
+        )}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  const rail = () => screen.getByRole("complementary", { name: "Workspace" });
+  const sidebar = () => screen.getByTestId("sidebar");
+  async function expectGadgetFullScreen() {
+    await waitFor(() => expect(rail()).toHaveClass("md:absolute"));
+    expect(within(rail()).getByText("shows Board")).toBeInTheDocument();
+  }
+
+  it.each([
+    ["with the sidebar open", true],
+    ["with the sidebar collapsed", false],
+  ])(
+    "leaves the sidebar as it was for a gadget opened from inside Omnigent, %s",
+    async (_case, open) => {
+      renderSession("/c/conv_abc", <OpenGadget state={IN_APP_GADGET_OPEN} />);
+      if (open) fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+      expect(sidebar()).toHaveAttribute("data-open", String(open));
+
+      fireEvent.click(screen.getByRole("button", { name: "open gadget" }));
+
+      await expectGadgetFullScreen();
+      expect(sidebar()).toHaveAttribute("data-open", String(open));
+      // Open session leaves full screen for the session, and the sidebar stays as it is.
+      fireEvent.click(within(rail()).getByRole("button", { name: "Open session" }));
+      await waitFor(() => expect(rail()).not.toHaveClass("md:absolute"));
+      expect(sidebar()).toHaveAttribute("data-open", String(open));
+    },
+  );
+
+  it("leaves the sidebar as it was for an in-app navigation that carries no state", async () => {
+    // A host's router may drop link state; an in-app entry still has its own key.
+    renderSession("/c/conv_abc", <OpenGadget />);
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+
+    fireEvent.click(screen.getByRole("button", { name: "open gadget" }));
+
+    await expectGadgetFullScreen();
+    expect(sidebar()).toHaveAttribute("data-open", "true");
+  });
+
+  /** What the session page asks: whether a gadget covers conv_abc, so it leaves it unread. */
+  function CoverProbe() {
+    const { search } = useLocation();
+    const urlGadget = new URLSearchParams(search).get(GADGET_FULL_SCREEN_PARAM);
+    const covers = useGadgetRailRequest((state) =>
+      gadgetCoversConversation(state, "conv_abc", urlGadget),
+    );
+    return <span data-testid="covers-chat">{String(covers)}</span>;
+  }
+  const covers = () => screen.getByTestId("covers-chat").textContent;
+
+  it("keeps the session unread from the start of a gadget link until Open session", async () => {
+    // The session's gadgets are still loading when the page first shows.
+    let listed: (gadgets: (typeof BOARD)[]) => void = () => {};
+    vi.mocked(getSessionGadgets).mockReturnValue(
+      new Promise((resolve) => {
+        listed = resolve;
+      }),
+    );
+    renderSession("/c/conv_abc?gadget=board", <CoverProbe />);
+    expect(covers()).toBe("true");
+
+    await act(async () => listed([BOARD]));
+    await expectGadgetFullScreen();
+    expect(covers()).toBe("true");
+
+    fireEvent.click(within(rail()).getByRole("button", { name: "Open session" }));
+    await waitFor(() => expect(covers()).toBe("false"));
+  });
+
+  it("reads the session when the gadget its link names isn't linked there", async () => {
+    let listed: (gadgets: (typeof BOARD)[]) => void = () => {};
+    vi.mocked(getSessionGadgets).mockReturnValue(
+      new Promise((resolve) => {
+        listed = resolve;
+      }),
+    );
+    renderSession("/c/conv_abc?gadget=elsewhere", <CoverProbe />);
+    expect(covers()).toBe("true");
+
+    await act(async () => listed([BOARD]));
+    await waitFor(() => expect(covers()).toBe("false"));
+    // Nothing was asked of the rail for it, so no later visit can open it for nothing.
+    expect(useGadgetRailRequest.getState().requested).toBeNull();
+  });
+
+  describe("opened from a fresh link", () => {
+    beforeEach(() => {
+      // A desktop window, where the sidebar starts open.
+      const baseMatchMedia = window.matchMedia;
+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+        ...baseMatchMedia(query),
+        matches: query === `(min-width: ${MOBILE_BREAKPOINT_PX}px)`,
+      }));
+      onTestFinished(() => matchMedia.mockRestore());
+    });
+
+    it("fills the screen with the sidebar collapsed for a page load of the gadget's URL", async () => {
+      renderSession("/c/conv_abc?gadget=board");
+
+      await expectGadgetFullScreen();
+      expect(sidebar()).toHaveAttribute("data-open", "false");
+    });
+
+    it("fills the screen with the sidebar collapsed when the gadget link page hands a fresh load on", async () => {
+      renderSession("/c/conv_abc", <OpenGadget state={{ keepSidebar: false }} />);
+      expect(sidebar()).toHaveAttribute("data-open", "true");
+
+      fireEvent.click(screen.getByRole("button", { name: "open gadget" }));
+
+      await expectGadgetFullScreen();
+      expect(sidebar()).toHaveAttribute("data-open", "false");
+    });
   });
 });
 
@@ -7633,5 +7996,17 @@ describe("AppShell desktop Close", () => {
     expect(screen.queryByText("home")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("Mark all as read and Resume sandbox in ⌘K", () => {
+  it.each([false, true])("mount only with quick_pick_palette on (%s)", async (quickPick) => {
+    paletteCommandMounts.markAllRead = 0;
+    paletteCommandMounts.resumeSandbox = 0;
+    mockConversations([{ id: "conv_mark_all", permission_level: null }]);
+    renderShell("/c/conv_mark_all", serverInfo({ features: { quick_pick_palette: quickPick } }));
+    await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+    expect(paletteCommandMounts.markAllRead > 0).toBe(quickPick);
+    expect(paletteCommandMounts.resumeSandbox > 0).toBe(quickPick);
   });
 });

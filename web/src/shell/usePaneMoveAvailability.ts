@@ -45,12 +45,16 @@ export function usePaneMoveAvailability({
   const [measured, setMeasured] = useState(measure);
   const movable = paneMoveLayout(layout, zoomedKey);
   const shape = movable === null ? null : JSON.stringify(movable);
-  // The ref's element as of the last commit; setting the same one again renders nothing.
-  const [root, setRoot] = useState<HTMLElement | null>(null);
+  // What is watched, and for which split: kept in a ref, so reading the ref's element after a
+  // commit never renders again by itself.
+  const watched = useRef<{ root: HTMLElement | null; key: string; stop: () => void } | null>(null);
   // After every commit, since nothing tells the hook when the ref's element changes.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useLayoutEffect(() => setRoot(rootRef.current));
   useLayoutEffect(() => {
+    const root = shape === null ? null : rootRef.current;
+    const key = `${shape}\0${paneKey}`;
+    if (watched.current && watched.current.root === root && watched.current.key === key) return;
+    watched.current?.stop();
+    watched.current = { root, key, stop: () => {} };
     if (shape === null) return;
     const update = () =>
       setMeasured((previous) => {
@@ -65,11 +69,18 @@ export function usePaneMoveAvailability({
     // are what session panes measure by, so fitting one measures again.
     const fits = new MutationObserver(update);
     fits.observe(root, { subtree: true, attributeFilter: FIT_ATTRIBUTES });
-    return () => {
+    watched.current.stop = () => {
       resizes.disconnect();
       fits.disconnect();
     };
-  }, [shape, paneKey, root]);
+  });
+  useLayoutEffect(
+    () => () => {
+      watched.current?.stop();
+      watched.current = null;
+    },
+    [],
+  );
   // Not offered at all, as for a lone or maximized pane, at once; room is what's measured.
   if (movable === null) return null;
   return measured;

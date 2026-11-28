@@ -17,6 +17,7 @@ import {
   IndentDecreaseIcon,
   IndentIncreaseIcon,
   MessageSquareCodeIcon,
+  SquareDashedIcon,
   TextCursorInputIcon,
   TextSelectIcon,
   Trash2Icon,
@@ -25,7 +26,7 @@ import {
   WholeWordIcon,
   type LucideIcon,
 } from "lucide-react";
-import { shortcutBinding } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutBinding } from "@/lib/shortcuts/registry";
 
 /** A shortcut registry id that names a file editor command. */
 export type FileEditorCommandId =
@@ -47,6 +48,10 @@ export type FileEditorCommandId =
   | "file.selectNextOccurrence"
   | "file.selectAllOccurrences"
   | "file.expandLineSelection"
+  | "file.columnSelectUp"
+  | "file.columnSelectDown"
+  | "file.columnSelectLeft"
+  | "file.columnSelectRight"
   | "file.goToBracket"
   | "file.fold"
   | "file.unfold"
@@ -169,6 +174,30 @@ export const FILE_EDITOR_COMMANDS: readonly FileEditorCommand[] = [
     id: "file.expandLineSelection",
     icon: TextSelectIcon,
     keywords: ["select line"],
+    edits: false,
+  },
+  {
+    id: "file.columnSelectUp",
+    icon: SquareDashedIcon,
+    keywords: ["column selection", "box selection", "rectangular selection", "multiple cursors"],
+    edits: false,
+  },
+  {
+    id: "file.columnSelectDown",
+    icon: SquareDashedIcon,
+    keywords: ["column selection", "box selection", "rectangular selection", "multiple cursors"],
+    edits: false,
+  },
+  {
+    id: "file.columnSelectLeft",
+    icon: SquareDashedIcon,
+    keywords: ["column selection", "box selection", "rectangular selection", "multiple cursors"],
+    edits: false,
+  },
+  {
+    id: "file.columnSelectRight",
+    icon: SquareDashedIcon,
+    keywords: ["column selection", "box selection", "rectangular selection", "multiple cursors"],
     edits: false,
   },
   {

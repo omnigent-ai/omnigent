@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import os
 import shlex
 import shutil
@@ -27,6 +28,7 @@ from omnigent.inner.os_env import (
     CallerProcessOSEnvironment,
     _child_shell_env,
     _handle_helper_request,
+    _HelperProcessClient,
     _project_root,
     _read_impl,
     _shell_impl,
@@ -876,6 +878,73 @@ class _UnreadReply:
         self._stdout.close()
 
 
+@pytest.mark.parametrize("failure_at", ["write", "flush"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"op": "read", "path": "notes.txt"}, id="read"),
+        pytest.param({"op": "write", "path": "notes.txt", "content": "next"}, id="write"),
+        pytest.param(
+            {"op": "edit", "path": "notes.txt", "oldText": "before", "newText": "after"},
+            id="edit",
+        ),
+        pytest.param({"op": "delete", "path": "notes.txt"}, id="delete"),
+        pytest.param({"op": "shell", "command": "true", "timeout": 1}, id="shell"),
+    ],
+)
+def test_helper_send_failure_does_not_prove_the_request_was_undelivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+    failure_at: str,
+) -> None:
+    helper = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_inactive_policy())
+    delivered: list[dict[str, object]] = []
+    processes: list[Mock] = []
+
+    def start() -> None:
+        if helper._proc is not None:
+            return
+        first = not processes
+        process = Mock()
+
+        def write(line: str) -> int:
+            delivered.append(json.loads(line))
+            if first and failure_at == "write":
+                raise BrokenPipeError("request accepted before the write failed")
+            return len(line)
+
+        process.stdin.write.side_effect = write
+        if first and failure_at == "flush":
+            process.stdin.flush.side_effect = BrokenPipeError(
+                "request accepted before flush failed"
+            )
+        process.stdout.readline.return_value = '{"content": "observed"}\n'
+        processes.append(process)
+        helper._proc = process
+
+    def stop() -> None:
+        helper._proc = None
+
+    monkeypatch.setattr(helper, "_ensure_started_locked", start)
+    monkeypatch.setattr(helper, "_stop_locked", stop)
+    try:
+        result = helper.request(payload)
+        if payload["op"] == "read":
+            assert result == {"content": "observed"}
+            assert delivered == [payload, payload]
+            assert len(processes) == 2
+        else:
+            assert "may already have run" in result.get("error", ""), result
+            assert "not sent again" in result["error"]
+            assert delivered == [payload]
+            assert len(processes) == 1 and helper._proc is None
+            assert helper.request({"op": "read", "path": "notes.txt"}) == {"content": "observed"}
+            assert delivered == [payload, {"op": "read", "path": "notes.txt"}]
+    finally:
+        helper.close()
+
+
 def _fail_next_request(
     os_env: CallerProcessOSEnvironment, *, delivered: bool
 ) -> subprocess.Popen[str]:
@@ -1034,15 +1103,17 @@ def test_read_is_answered_by_a_new_helper_when_the_first_dies_before_replying(
 
 
 @pytest.mark.parametrize("backend", _HELPER_BACKENDS)
-def test_request_that_never_reached_its_helper_runs_once_on_a_new_one(
-    tmp_path: Path, backend: str
-) -> None:
-    """Any op is safe to send again when the helper never received it."""
+def test_mutation_send_failure_requires_an_explicit_retry(tmp_path: Path, backend: str) -> None:
+    """A failed send leaves delivery uncertain even when this fault sent no bytes."""
     workspace = tmp_path.resolve()
     os_env = _helper_env(workspace, backend)
     try:
         assert asyncio.run(os_env.shell("true")).get("exit_code") == 0
         first_helper = _fail_next_request(os_env, delivered=False)
+        result = asyncio.run(os_env.shell("echo once >> marker.txt"))
+        assert "may already have run" in result.get("error", ""), result
+        assert not (workspace / "marker.txt").exists()
+        assert os_env._helper._proc is None
         result = asyncio.run(os_env.shell("echo once >> marker.txt"))
         assert result.get("exit_code") == 0, result
         assert (workspace / "marker.txt").read_text() == "once\n"

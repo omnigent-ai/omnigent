@@ -109,12 +109,43 @@ export interface HtmlPreviewFrameProps {
   onLoad: () => void;
 }
 
+/** Props of a host-provided gadget frame (see `OmnigentHostConfig.gadgetFrame`). */
+export interface GadgetFrameHostProps {
+  /** The gadget's document: a CSP meta tag, the SDK bootstrap script, then the gadget's HTML. */
+  htmlContent: string;
+  /** The same policy as the meta tag, for hosts that also send it as a response header. */
+  contentSecurityPolicy: string;
+  /** Accessible title of the frame. */
+  title: string;
+  /**
+   * The ID this mount's SDK names in every message it posts, as in its first greeting. A host
+   * that checks which frame a message came from can use it as its frame's ID.
+   */
+  frameId: string;
+  /**
+   * Call with each message the gadget document posts to its parent window. Pass only messages
+   * whose source is that document's window; the SDK greets its host this way.
+   */
+  onMessage: (data: unknown) => void;
+  /**
+   * Call with the gadget document's window once it has loaded, and again after each later load;
+   * the SDK's connect message and port are posted to that window.
+   */
+  onLoad: (frameWindow: Window) => void;
+}
+
 export interface OmnigentHostConfig {
   /**
    * Install before the app mounts and keep the component identity stable for that
    * mount. Omitted by older hosts, which retain the sandboxed srcdoc preview.
    */
   htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
+  /**
+   * Runs a gadget's published HTML, for hosts that serve gadgets from an isolated origin.
+   * Without it the web app runs the HTML in a sandboxed `srcdoc` iframe with an opaque origin.
+   * Install before the app mounts and keep the component identity stable for that mount.
+   */
+  gadgetFrame?: ComponentType<GadgetFrameHostProps>;
   /**
    * Stable server/workspace identity for browser storage and goal ownership.
    * Embedded hosts must change this when switching backends.
@@ -206,6 +237,10 @@ let embedScopeRoot: HTMLElement | null = null;
 
 export function getOmnigentHtmlPreviewFrame(): OmnigentHostConfig["htmlPreviewFrame"] {
   return hostConfig.htmlPreviewFrame;
+}
+
+export function getOmnigentGadgetFrame(): OmnigentHostConfig["gadgetFrame"] {
+  return hostConfig.gadgetFrame;
 }
 
 export function getOmnigentServerIdentity(): string | null {

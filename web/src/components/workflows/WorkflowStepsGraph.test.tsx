@@ -161,8 +161,10 @@ describe("WorkflowStepsGraph", () => {
     expect(within(overlay).getAllByTestId("workflow-step-node")).toHaveLength(2);
     // The workflow itself has no run, so its full-screen view has no legend.
     expect(within(overlay).queryByText("Not started")).toBeNull();
+    expect(document.documentElement).toHaveAttribute("data-fullscreen-overlay-open");
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+    expect(document.documentElement).not.toHaveAttribute("data-fullscreen-overlay-open");
   });
 
   it("shows a step's full name and goal on hover, wrapped inside its card, with no menu", async () => {

@@ -1,7 +1,7 @@
 // Shared workspace command labels, availability and ordering, for menus and the palette.
 
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import type { ShortcutId } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
 import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { AVAILABLE, type CommandAvailability, unavailableBecause } from "@/store/paletteCommands";
 

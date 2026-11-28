@@ -1087,10 +1087,12 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
     await scheduler.poll_once()
     await _drain(scheduler)
     if deleted:
-        assert store.get(task.id) is None
-        assert store.list_runs(task.id)[0] == []
+        await poll_until_async(
+            lambda: store.get(task.id) is None and store.list_runs(task.id)[0] == []
+        )
     else:
-        assert store.list_runs(task.id)[0][0].status == "failed"
+        # The last sweep can time out while its transition still commits in a thread.
+        await poll_until_async(lambda: store.list_runs(task.id)[0][0].status == "failed")
     assert recover.await_count == 3
     assert recover.await_args.args == (run,)
     fire.assert_not_awaited()
@@ -2527,8 +2529,7 @@ def test_unusable_poll_interval_waits_poll_seconds(store, caplog, reading) -> No
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
 async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, execution_target):
-    eligible = session_mode == "continue" or execution_target == "connected_host"
-    store.configure_dispatch(not eligible)
+    store.configure_dispatch(False)
     task = _task(
         store,
         rrule="FREQ=MINUTELY;INTERVAL=10",
@@ -2536,7 +2537,7 @@ async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, e
         execution_target=execution_target,
     )
     store.configure_dispatch(True)
-    clock = FakeClock(task.created_at if eligible else task.next_run_at)
+    clock = FakeClock(task.created_at)
 
     async def fire(task, lease):
         await lease.finish("running")
@@ -2548,29 +2549,24 @@ async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, e
     await scheduler.poll_once()
     await _drain(scheduler)
     saved = store.get(task.id)
-    if eligible:
-        assert task.next_run_at is None
-        executor.assert_not_awaited()
-        assert saved.state == "active"
-        assert 0 < saved.next_run_at - clock.now() <= 600
-        initialized_at = saved.next_run_at
-        clock.advance(initialized_at - clock.now())
-        await scheduler.poll_once()
-        await _drain(scheduler)
-        executor.assert_awaited_once()
-        assert store.get(task.id).next_run_at == initialized_at + 600
-        # A recreated scheduler dispatches the next persisted occurrence once.
-        scheduler = PersistentTaskScheduler(
-            store, executor, AsyncMock(return_value=None), now=clock.now
-        )
-        clock.advance(600)
-        await scheduler.poll_once()
-        await _drain(scheduler)
-        assert executor.await_count == 2
-    else:
-        executor.assert_not_awaited()
-        assert saved.state == "paused"
-        assert saved.next_run_at is None
+    assert task.next_run_at is None
+    executor.assert_not_awaited()
+    assert saved.state == "active"
+    assert 0 < saved.next_run_at - clock.now() <= 600
+    initialized_at = saved.next_run_at
+    clock.advance(initialized_at - clock.now())
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    executor.assert_awaited_once()
+    assert store.get(task.id).next_run_at == initialized_at + 600
+    # A recreated scheduler dispatches the next persisted occurrence once.
+    scheduler = PersistentTaskScheduler(
+        store, executor, AsyncMock(return_value=None), now=clock.now
+    )
+    clock.advance(600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert executor.await_count == 2
 
 
 _TRIGGER_PROMPT = "This automation watches Slack and starts one Omnigent session per message."

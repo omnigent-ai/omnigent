@@ -90,6 +90,7 @@ export function workingCopyBaseCommands({
   headIsKnown = true,
   owner,
   queryClient,
+  writeIntent = writeWorkingCopyBaseIntent,
 }: {
   sessionId: string;
   intent: WorkingCopyBaseIntent;
@@ -105,6 +106,8 @@ export function workingCopyBaseCommands({
   headIsKnown?: boolean;
   owner: WorkingCopyComparisonOwner;
   queryClient: QueryClient;
+  /** Saves a chosen base: the device's preference, or a repository folder's own. */
+  writeIntent?: (intent: WorkingCopyBaseIntent) => void;
 }): WorkingCopyBaseCommand[] {
   const choices = BASE_CHOICES.map(
     ({ id, intent: choice, label, name }): WorkingCopyBaseCommand => ({
@@ -119,7 +122,7 @@ export function workingCopyBaseCommands({
             ? UNKNOWN_BASELINE_TITLE
             : null,
       run: () => {
-        writeWorkingCopyBaseIntent(choice);
+        writeIntent(choice);
         owner.chose(sessionId);
       },
     }),

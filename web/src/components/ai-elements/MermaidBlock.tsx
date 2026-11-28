@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { useMarkFullscreenOverlayOpen } from "@/hooks/useMarkFullscreenOverlayOpen";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import type { ComponentProps, ReactNode, RefObject } from "react";
@@ -32,6 +33,7 @@ export function isMermaidPre(children: ReactNode): boolean {
 function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
   const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
   const close = useCallback(() => setSvgMarkup(null), []);
+  useMarkFullscreenOverlayOpen(svgMarkup != null);
 
   const openFullscreen = useCallback(() => {
     // The rendered diagram is Mermaid's own <svg id="mermaid-…"> — scope to it so
@@ -109,6 +111,26 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
 // Mermaid's own <svg id="mermaid-…">, or the card that explains why it couldn't draw.
 const DRAWN_DIAGRAM = 'svg[id^="mermaid-"], [data-testid="mermaid-error"]';
 
+/** Calls `onDrawn` once `ref` holds a drawn diagram or its error card. */
+export function useMermaidDrawn(
+  ref: RefObject<HTMLElement | null>,
+  onDrawn: (() => void) | undefined,
+) {
+  useEffect(() => {
+    const root = ref.current;
+    if (!root || !onDrawn) return;
+    if (root.querySelector(DRAWN_DIAGRAM)) {
+      onDrawn();
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      if (root.querySelector(DRAWN_DIAGRAM)) onDrawn();
+    });
+    observer.observe(root, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [ref, onDrawn]);
+}
+
 // The .chat-mermaid rule reserves a slot beside Streamdown's download/copy toolbar.
 export function MermaidBlock({
   block,
@@ -120,19 +142,7 @@ export function MermaidBlock({
   onDrawn?: () => void;
 }) {
   const blockRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const root = blockRef.current;
-    if (!root || !onDrawn) return;
-    if (root.querySelector(DRAWN_DIAGRAM)) {
-      onDrawn();
-      return;
-    }
-    const observer = new MutationObserver(() => {
-      if (root.querySelector(DRAWN_DIAGRAM)) onDrawn();
-    });
-    observer.observe(root, { childList: true, subtree: true });
-    return () => observer.disconnect();
-  }, [onDrawn]);
+  useMermaidDrawn(blockRef, onDrawn);
   return (
     <div ref={blockRef} className={cn("chat-mermaid relative", className)}>
       {block}

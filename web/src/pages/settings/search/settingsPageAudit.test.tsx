@@ -411,6 +411,7 @@ const GENERAL_WEB_HIDES = {
   "floating-composer-shortcut": DESKTOP_ONLY,
   "widen-window-for-right-sidebar": DESKTOP_ONLY,
   "browser-agent-tools": DESKTOP_ONLY,
+  "trusted-remote-hosts": DESKTOP_ONLY,
   "admin-view": ADMIN_VIEW_NOT_LOADED,
   "project-kanban-board": PROJECT_KANBAN_OFF,
   "proactive-agent": PROACTIVE_AGENT_OFF,
@@ -533,6 +534,35 @@ function harnessPageScenario(harness: NativeHarnessId): SettingsAuditScenario {
 }
 
 const SCENARIOS: readonly SettingsAuditScenario[] = [
+  {
+    section: "general",
+    scenario: "desktop trusted hosts",
+    ready: [TITLES_LOADED, "https://server.example.com/"],
+    hides: {
+      ...Object.fromEntries(
+        Object.entries(GENERAL_WEB_HIDES).filter(
+          ([id]) =>
+            !["trusted-remote-hosts", "browser-agent-tools", "open-links-in-app"].includes(id),
+        ),
+      ),
+      "open-in-desktop-app": "Already running in the desktop app.",
+    },
+    states: { "session-title-instructions": ["loaded"] },
+    setup: () => {
+      vi.stubGlobal("omnigentDesktop", {
+        kind: "electron",
+        browserOpenOrNavigate: vi.fn(),
+        getDesktopFeatures: async () => ({ trustedRemoteLocalhostPreview: true }),
+        getTrustedRemoteHosts: async () => ({
+          ok: true,
+          serverUrl: "https://server.example.com/",
+          hosts: [{ server_url: "https://server.example.com/", host_id: "example-host" }],
+        }),
+        addTrustedRemoteHost: vi.fn(),
+        removeTrustedRemoteHost: vi.fn(),
+      });
+    },
+  },
   {
     section: "harnesses",
     scenario: "web",

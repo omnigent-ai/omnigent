@@ -1,7 +1,7 @@
 // A file in a workspace Files tab: text in the CodeMirror editor, which saves as it goes,
 // and Markdown (rich preview and edit), images, PDFs, 3D models and binaries in the app's viewer.
 
-import { FileDiffIcon, XIcon } from "lucide-react";
+import { FileDiffIcon } from "lucide-react";
 import {
   type ComponentProps,
   type ReactNode,
@@ -21,14 +21,16 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileContent } from "@/hooks/useFileContent";
+import { useStickyScroll } from "@/lib/fileViewPreferences";
 import { fileContentText } from "@/lib/workspaceSidebarSource";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { cn } from "@/lib/utils";
 import { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
 import {
+  type SaveStatus,
   detectLang,
   isBinaryPath,
   isImageFile,
@@ -39,8 +41,12 @@ import { workspaceFolderName } from "@/shell/breadcrumbPaths";
 import { FileBreadcrumbs } from "@/shell/FileBreadcrumbs";
 import { FileViewer } from "@/shell/FileViewer";
 import { type FilePosition, useWorkspacePaths } from "@/shell/FileViewerContext";
+import { SaveStatusChip } from "@/shell/SaveStatusChip";
 
 import { WORKSPACE_SIDEBAR_LAYOUT, WORKSPACE_TOOLBAR_CLASS } from "../WorkspaceSidebarLayout";
+import { FileActionsMenu } from "./FileActionsMenu";
+
+export const SHOW_CHANGES_LABEL = "Show changes";
 
 /** Asks the user about unsaved edits before the tab moves on: leave, or keep editing. */
 export type FilesPageLeaveGuard = () => Promise<"leave" | "cancel">;
@@ -52,8 +58,8 @@ export interface FilesPageViewerProps {
   position?: FilePosition;
   /** The tab is selected and the sidebar is open, so the file stays current. */
   active: boolean;
-  /** Shown first in the toolbar, such as the tree's toggle. */
-  toolbarLeading?: ReactNode;
+  /** Shown last in the toolbar, over the tree it toggles. */
+  toolbarTrailing?: ReactNode;
   onClose: () => void;
   /** Shows the file's changes, in the Changes review. */
   onShowChanges?: () => void;
@@ -83,7 +89,7 @@ export function FilesPageViewer({
   path,
   position,
   active,
-  toolbarLeading,
+  toolbarTrailing,
   onClose,
   onShowChanges,
   onOpenFile,
@@ -106,7 +112,7 @@ export function FilesPageViewer({
   );
   const file = useFileContent(conversationId, path, { visible: active });
   const contentType = file.data?.content_type;
-  // Markdown, media and binaries show in the app's viewer, under the same toolbar as text.
+  // Markdown, media and binaries show in the app's viewer, which then draws the toolbar row.
   const rich =
     file.data != null && (commentId !== undefined || showsInFileViewer(path, contentType));
   const viewerProps: AppViewerProps = {
@@ -116,58 +122,119 @@ export function FilesPageViewer({
     position,
     open: active,
     frameless: true,
+    besideSidebar: true,
+    toolbarTrailing,
+    onShowChanges,
     onClose,
     registerLeaveGuard,
     permissionLevel,
     pathHeader: breadcrumbs,
   };
-  // Another linked comment opens its thread afresh.
-  const appViewer = <ComparisonFileViewer key={commentId} {...viewerProps} />;
   const text = file.data && !rich ? fileContentText(file.data) : null;
+  const [searchOpen, setSearchOpen] = useState(false);
+  // Each Find in file bumps it, so a repeat refocuses a find bar that is already open.
+  const [searchFocusNonce, setSearchFocusNonce] = useState(0);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  // A rich file, or bytes that aren't text under a name that doesn't say so, has one toolbar
+  // row: the app viewer's. Another linked comment opens its thread afresh.
+  if (file.data && text === null) return <ComparisonFileViewer key={commentId} {...viewerProps} />;
+  // A failed refresh keeps the last content, so an open editor and its edits stay.
+  if (file.isError && !file.data) {
+    return (
+      <UnreadableFile
+        viewer={viewerProps}
+        message={file.error.message}
+        breadcrumbs={breadcrumbs}
+        toggle={toolbarTrailing}
+      />
+    );
+  }
+  return (
+    <FilesPage
+      breadcrumbs={breadcrumbs}
+      toggle={toolbarTrailing}
+      trailing={
+        <>
+          {text !== null ? <SaveStatusChip status={saveStatus} /> : null}
+          {onShowChanges && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={SHOW_CHANGES_LABEL}
+                    onClick={onShowChanges}
+                  >
+                    <FileDiffIcon aria-hidden="true" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{SHOW_CHANGES_LABEL}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+          {text !== null ? (
+            <TooltipProvider>
+              <FileActionsMenu
+                conversationId={conversationId}
+                path={path}
+                onFind={() => {
+                  setSearchOpen(true);
+                  setSearchFocusNonce((nonce) => nonce + 1);
+                }}
+              />
+            </TooltipProvider>
+          ) : null}
+        </>
+      }
+    >
+      {!file.data || text === null ? (
+        <div className="flex flex-1 items-center justify-center">
+          <Spinner aria-label={`Loading ${path}`} />
+        </div>
+      ) : (
+        <TextFile
+          conversationId={conversationId}
+          path={path}
+          content={text}
+          truncated={file.data.truncated === true}
+          settled={!file.isFetching}
+          position={position}
+          registerLeaveGuard={registerLeaveGuard}
+          searchOpen={searchOpen}
+          searchFocusNonce={searchFocusNonce}
+          onSearchOpenChange={setSearchOpen}
+          onSaveStatusChange={setSaveStatus}
+        />
+      )}
+    </FilesPage>
+  );
+}
+
+/** The page's toolbar row, spanning the tree, over the file beside it. */
+function FilesPage({
+  breadcrumbs,
+  trailing,
+  toggle,
+  children,
+}: {
+  breadcrumbs: ReactNode;
+  /** The file's controls, at the right. */
+  trailing: ReactNode;
+  /** Last in the row, over the tree it toggles. */
+  toggle: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <div className={cn("flex min-h-0 flex-col bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)}>
       <div className={cn(WORKSPACE_TOOLBAR_CLASS, WORKSPACE_SIDEBAR_LAYOUT.toolbar)}>
-        {toolbarLeading}
-        {/* The app's viewer shows the breadcrumbs in its own header. */}
-        <div className="flex min-w-0 flex-1">{rich ? null : breadcrumbs}</div>
-        {onShowChanges && (
-          <Button type="button" variant="ghost" size="sm" onClick={onShowChanges}>
-            <FileDiffIcon aria-hidden="true" />
-            Changes
-          </Button>
-        )}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Close file"
-          onClick={onClose}
-        >
-          <XIcon aria-hidden="true" />
-        </Button>
+        <div className="flex min-w-0 flex-1">{breadcrumbs}</div>
+        {trailing}
+        {toggle}
       </div>
       <div className={cn("flex min-h-0 flex-1 flex-col", WORKSPACE_SIDEBAR_LAYOUT.content)}>
-        {/* A failed refresh keeps the last content, so an open editor and its edits stay. */}
-        {file.isError && !file.data ? (
-          <UnreadableFile viewer={viewerProps} message={file.error.message} />
-        ) : !file.data ? (
-          <div className="flex flex-1 items-center justify-center">
-            <Spinner aria-label={`Loading ${path}`} />
-          </div>
-        ) : text === null ? (
-          // A rich file, or bytes that aren't text under a name that doesn't say so.
-          appViewer
-        ) : (
-          <TextFile
-            conversationId={conversationId}
-            path={path}
-            content={text}
-            truncated={file.data.truncated === true}
-            settled={!file.isFetching}
-            position={position}
-            registerLeaveGuard={registerLeaveGuard}
-          />
-        )}
+        {children}
       </div>
     </div>
   );
@@ -182,15 +249,28 @@ function ComparisonFileViewer(props: AppViewerProps) {
 }
 
 /** A file that couldn't be read: the comparison's diff when it deleted the file, else why. */
-function UnreadableFile({ viewer, message }: { viewer: AppViewerProps; message: string }) {
+function UnreadableFile({
+  viewer,
+  message,
+  breadcrumbs,
+  toggle,
+}: {
+  viewer: AppViewerProps;
+  message: string;
+  /** The page's own toolbar row, which the app's viewer would otherwise draw. */
+  breadcrumbs: ReactNode;
+  toggle: ReactNode;
+}) {
   const comparisonDiff = useComparisonFileDiff(viewer.conversationId, viewer.path);
   if (comparisonDiff.base === "comparison" && comparisonDiff.deleted) {
     return <FileViewer {...viewer} comparisonDiff={comparisonDiff} />;
   }
   return (
-    <p role="alert" className="p-3 text-ui text-destructive">
-      Couldn’t open {viewer.path}: {message}
-    </p>
+    <FilesPage breadcrumbs={breadcrumbs} trailing={null} toggle={toggle}>
+      <p role="alert" className="p-3 text-ui text-destructive">
+        Couldn’t open {viewer.path}: {message}
+      </p>
+    </FilesPage>
   );
 }
 
@@ -202,6 +282,10 @@ function TextFile({
   settled,
   position,
   registerLeaveGuard,
+  searchOpen,
+  searchFocusNonce,
+  onSearchOpenChange,
+  onSaveStatusChange,
 }: {
   conversationId: string;
   path: string;
@@ -210,9 +294,14 @@ function TextFile({
   settled: boolean;
   position?: FilePosition;
   registerLeaveGuard?: (guard: FilesPageLeaveGuard) => () => void;
+  /** The editor's find bar is open, as from the toolbar's Find in file. */
+  searchOpen: boolean;
+  searchFocusNonce: number;
+  onSearchOpenChange: (open: boolean) => void;
+  onSaveStatusChange: (status: SaveStatus) => void;
 }) {
-  const [searchOpen, setSearchOpen] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const stickyScroll = useStickyScroll();
   const leave = useUnsavedChangesQuestion();
   useEffect(() => {
     if (!dirty || !registerLeaveGuard) return undefined;
@@ -228,10 +317,13 @@ function TextFile({
         isSettled={settled}
         position={position}
         wrapLines={false}
+        stickyScroll={stickyScroll}
         searchOpen={searchOpen}
-        onSearchOpened={() => setSearchOpen(true)}
-        onSearchHandled={() => setSearchOpen(false)}
+        searchFocusNonce={searchFocusNonce}
+        onSearchOpened={() => onSearchOpenChange(true)}
+        onSearchHandled={() => onSearchOpenChange(false)}
         onDirtyChange={setDirty}
+        onSaveStatusChange={onSaveStatusChange}
       />
       {leave.dialog}
     </>

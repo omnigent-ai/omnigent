@@ -113,6 +113,7 @@ type ChatComposerInputProps =
       draftKey?: undefined;
       activeInputId?: undefined;
       onActiveInputChange?: undefined;
+      onRenderedEngineChange?: undefined;
     }
   | {
       /** The engine to switch to; the composer hands off once that is safe. */
@@ -126,6 +127,8 @@ type ChatComposerInputProps =
       activeInputId?: string | null;
       /** The active input, on its new engine, after a switch. */
       onActiveInputChange?: (target: ComposerTextTarget) => void;
+      /** The engine rendered, told at mount and in the commit of each switch. */
+      onRenderedEngineChange?: (engine: ComposerInputEngine) => void;
     };
 
 type ChatComposerProps = ChatComposerBaseProps & ChatComposerInputProps;
@@ -174,6 +177,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     draftKey,
     activeInputId,
     onActiveInputChange,
+    onRenderedEngineChange,
     keyboard,
     slots,
     actions,
@@ -197,7 +201,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
   const renderedEngine = useComposerEngineHandoff(
     engine === "codemirror" && chunkReady ? "codemirror" : "textarea",
     rootRef,
-    { dictating, draftKey, activeInputId, onActiveInputChange },
+    { dictating, draftKey, activeInputId, onActiveInputChange, onRenderedEngineChange },
   );
   const [focusWithin, setFocusWithin] = useState(false);
   const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");
@@ -512,6 +516,7 @@ export function ComposerEngineInput({
     className,
     mentionTokens,
     commandToken,
+    replyQuotes,
     autoFocus,
     ...rest
   } = input;
@@ -538,6 +543,7 @@ export function ComposerEngineInput({
         heightMode={heightMode}
         mentionTokens={mentionTokens}
         commandToken={commandToken}
+        replyQuotes={replyQuotes}
         autoFocus={autoFocusOnMount}
         onKeyDown={handleKeyDown}
       />

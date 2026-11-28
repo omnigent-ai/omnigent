@@ -64,14 +64,19 @@ function addPresent(present: Set<string>, treePath: string) {
   }
 }
 
+/** Whether the tree may show a path, by its path below the tree's root and its kind. */
+export type TreePathShows = (path: string, type: "file" | "directory") => boolean;
+
 /**
  * The operations that bring a tree holding `present` up to date with
  * `listings`. Parents apply before their subfolders, and a folder removed by
- * its parent's listing takes its own listing with it.
+ * its parent's listing takes its own listing with it. A path `shows` turns down
+ * goes at once, so a filter hides what the tree already holds without a new listing.
  */
 export function syncFolderListings(
   present: ReadonlySet<string>,
   listings: readonly FolderListing[],
+  shows?: TreePathShows,
 ): FolderTreeSync {
   const next = new Set(present);
   const operations: FileTreeBatchOperation[] = [];
@@ -79,6 +84,27 @@ export function syncFolderListings(
   const removedFolders: string[] = [];
   const isRemoved = (path: string) =>
     removedFolders.some((gone) => path === gone || isInside(path, gone));
+  const remove = (path: string) => {
+    const isFolder = path.endsWith("/");
+    operations.push({ type: "remove", path, recursive: isFolder });
+    next.delete(path);
+    if (!isFolder) return;
+    const gone = path.slice(0, -1);
+    removedFolders.push(gone);
+    for (const inside of [...next]) if (isInside(inside, gone)) next.delete(inside);
+  };
+
+  if (shows) {
+    // Shallowest first, so a hidden folder takes everything below it in one removal.
+    const held = [...next].sort((left, right) => left.length - right.length);
+    for (const path of held) {
+      if (!next.has(path)) continue;
+      const isFolder = path.endsWith("/");
+      if (!shows(isFolder ? path.slice(0, -1) : path, isFolder ? "directory" : "file")) {
+        remove(path);
+      }
+    }
+  }
 
   const ordered = [...listings].sort((left, right) => depth(left.folder) - depth(right.folder));
   // A folder's own listing outranks a chain hint about it, however fresh either is.
@@ -97,15 +123,7 @@ export function syncFolderListings(
     const children = new Set(listed.entries);
 
     for (const path of [...next]) {
-      if (parentOf(path) !== folder || children.has(path)) continue;
-      const isFolder = path.endsWith("/");
-      operations.push({ type: "remove", path, recursive: isFolder });
-      next.delete(path);
-      if (isFolder) {
-        const gone = path.slice(0, -1);
-        removedFolders.push(gone);
-        for (const inside of [...next]) if (isInside(inside, gone)) next.delete(inside);
-      }
+      if (next.has(path) && parentOf(path) === folder && !children.has(path)) remove(path);
     }
     for (const path of listed.entries) {
       if (next.has(path)) continue;

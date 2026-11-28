@@ -11,7 +11,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
-from typing import cast
+from typing import Protocol, cast
 
 from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.engine import CursorResult
@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import (
     account_authority_scope,
+    account_registration,
     current_account_user,
     lock_account,
     require_active_account,
@@ -55,6 +56,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Account, AccountToken
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.gadgets.access import workspace_registration
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.stores.permission_store.sqlalchemy_store import (
     delete_deleted_account_grants,
@@ -66,6 +68,24 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+class DeletedAccountResources(Protocol):
+    """An account's resources kept outside this database (its gadgets).
+
+    They belong to one registration of the username (see :func:`account_registration`),
+    which a password change keeps and a new registration replaces, so nothing outside the
+    database has to change when credentials rotate, and a username registered again never
+    reaches what the deleted registration left behind.
+    """
+
+    def delete_owned(self, user_id: str, registration: str | None) -> bool:
+        """Delete some of what the deleted registration *registration* of *user_id* owns
+        there, in bounded work; ``True`` once nothing is left. Later calls go on."""
+
+    def resume(self) -> None:
+        """Go on, in bounded work, with cleanups earlier calls left unfinished."""
+
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
@@ -246,6 +266,14 @@ class SqlAlchemyAccountStore:
             immediate=True,
         )
         self._supports_for_update = self._engine.dialect.name != "sqlite"
+        self._gadgets: DeletedAccountResources | None = None
+
+    def attach_gadgets(self, gadgets: DeletedAccountResources) -> None:
+        """Delete a deleted account's gadgets too, which live outside this database.
+
+        :param gadgets: Usually :class:`omnigent.gadgets.accounts.DeletedAccountGadgets`.
+        """
+        self._gadgets = gadgets
 
     # ── User credentials (extends rows in the `users` table) ──────
 
@@ -286,6 +314,11 @@ class SqlAlchemyAccountStore:
         )
         self._delete_deleted_workflows(user_id)
         self._delete_deleted_inbox_items(user_id)
+        try:
+            # Best effort: the new registration never reaches the deleted one's gadgets.
+            self._delete_deleted_gadgets(user_id)
+        except Exception:
+            _logger.exception("Gadget cleanup deferred for a deleted account")
 
         def write(session: Session) -> Account:
             existing = lock_account(session, user_id)
@@ -314,7 +347,10 @@ class SqlAlchemyAccountStore:
             row = existing or SqlUser(id=user_id)
             row.is_admin = is_admin
             row.password_hash = password_hash
-            row.created_at = now
+            # The creation second names this registration (account_registration), so it must
+            # differ from the deleted one's even when the name is registered again at once.
+            previous = existing.created_at if existing is not None else None
+            row.created_at = now if previous is None else max(now, previous + 1)
             row.last_login_at = None
             row.deleted_at = None
             row.account_generation = uuid.uuid4().hex
@@ -519,7 +555,8 @@ class SqlAlchemyAccountStore:
         one transaction, a partial failure rolls back the whole delete
         rather than leaving authority behind. After it commits, the
         scheduled task grants the user held, those on their tasks, saved
-        workflows and Inbox items are deleted in bounded batches.
+        workflows and Inbox items are deleted in bounded batches, and then their
+        gadgets when :meth:`attach_gadgets` was called.
         Re-registration finishes any interrupted workflow or Inbox cleanup
         before reusing the username.
 
@@ -593,7 +630,31 @@ class SqlAlchemyAccountStore:
                 self._delete_deleted_inbox_items(user_id)
             except Exception:
                 _logger.exception("Inbox cleanup deferred for a deleted account")
+            try:
+                self._delete_deleted_gadgets(user_id)
+            except Exception:
+                _logger.exception("Gadget cleanup deferred for a deleted account")
         return deleted
+
+    def _delete_deleted_gadgets(self, user_id: str) -> None:
+        """Delete a tombstoned account's gadgets and shelf, which live in the gadget store.
+
+        Deletes only the tombstoned registration's gadgets, so a cleanup that resumes after
+        the username was registered again never deletes the new account's.
+        """
+        if self._gadgets is None:
+            return
+        with self._session("select_user_by_id") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            tombstoned = row is not None and row.deleted_at is not None
+            registration = account_registration(row.created_at) if row is not None else None
+        if tombstoned:
+            # Noted with the workspace, so a cleanup another workspace's request resumes
+            # still deletes only this one's gadgets.
+            self._gadgets.delete_owned(user_id, workspace_registration(registration))
+        else:
+            # Each registration also moves other deleted accounts' cleanups along.
+            self._gadgets.resume()
 
     def _owned_workflow_ids(
         self, session: Session, user_id: str, *, limit: int, lock: bool = False

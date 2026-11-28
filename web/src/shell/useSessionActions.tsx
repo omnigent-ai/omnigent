@@ -31,6 +31,8 @@ import { useNavigate } from "@/lib/routing";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { isOpenSession } from "./openSession";
+import type { SessionLeaveCause } from "./sessionCommands/archiveNavigation";
 
 export interface SessionActions {
   setShareOpen: (open: boolean) => void;
@@ -54,9 +56,12 @@ export interface SessionActions {
  * :param viewerId: The signed-in user's id, which Leave revokes.
  * :param serverInfo: Server capabilities, for the automation delete notice.
  * :param onLeave: Called right before the session is deleted, archived, or
- *     left, e.g. to navigate off a view that shows it.
+ *     left, with which one, e.g. to navigate off a view that shows it.
  * :param componentIdPrefix: Analytics prefix for the confirm buttons, e.g.
  *     ``"sidebar.conversation"``.
+ * :param reportsAfterUnmount: Whether a Leave or Stop still reports how it went once the
+ *     caller has unmounted, as ⌘K's action host needs: it can be replaced before they settle.
+ *     A Leave then reads the open session from ``OpenSessionPublisher``, so mount it too.
  */
 export function useSessionActions({
   conversation,
@@ -65,13 +70,15 @@ export function useSessionActions({
   serverInfo,
   onLeave,
   componentIdPrefix,
+  reportsAfterUnmount = false,
 }: {
   conversation: Conversation;
   label: string;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
-  onLeave?: () => void;
+  onLeave?: (cause: SessionLeaveCause) => void;
   componentIdPrefix: string;
+  reportsAfterUnmount?: boolean;
 }): SessionActions {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -111,7 +118,7 @@ export function useSessionActions({
       return;
     }
     // Leave a view showing the session now, so it doesn't sit on an id that's about to 404.
-    onLeave?.();
+    onLeave?.("delete");
     del.mutate({ id: conversation.id, deleteBranch: gitBranch !== null && deleteBranch });
   }
 
@@ -121,6 +128,9 @@ export function useSessionActions({
       showToast("Couldn't delete the automation, so the session was kept");
       return;
     }
+    // A caller replaced while the automation deleted can't see the route, so the open session
+    // is read live: leave it only if it's still the one shown.
+    if (reportsAfterUnmount && isOpenSession(conversation.id)) onLeave?.("delete");
     del.mutate({ id: conversation.id, deleteBranch: deleteLocalBranch });
   }
 
@@ -145,7 +155,7 @@ export function useSessionActions({
     // frame. Leaving the archived session's view therefore has to happen HERE,
     // synchronously — not in an onSuccess callback that fires a round-trip
     // later with a stale view. Mirrors confirmDelete.
-    onLeave?.();
+    onLeave?.("archive");
     archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Offer an Undo (and point at where the session went) — fire NOW, not in a
     // mutate onSuccess: per-call mutate callbacks don't fire once their observer
@@ -168,16 +178,29 @@ export function useSessionActions({
     // nothing left to show progress against. A failure surfaces as a toast
     // (the row is still there to retry from).
     setLeaveOpen(false);
-    leave.mutate(
-      { id: conversation.id, viewerId },
-      {
+    const reportFailure = (err: unknown) => {
+      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+      showToast(`Couldn't leave the session${detail}`);
+    };
+    if (!reportsAfterUnmount) {
+      leave.mutate(
+        { id: conversation.id, viewerId },
         // The session 404s for this user now, so don't leave them staring at it.
-        onSuccess: () => onLeave?.(),
-        onError: (err) => {
-          const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
-          showToast(`Couldn't leave the session${detail}`);
-        },
+        { onSuccess: () => onLeave?.("leave"), onError: reportFailure },
+      );
+      return;
+    }
+    // The promise settles even once the caller has unmounted, which a per-call
+    // mutate callback wouldn't.
+    // A row's callback can't see a switch that unmounts it, so the open session is read live.
+    const leftFromItsView = isOpenSession(conversation.id);
+    leave.mutateAsync({ id: conversation.id, viewerId }).then(
+      // The session 404s for this user now, so don't leave them staring at it, unless they've
+      // already opened another one.
+      () => {
+        if (!leftFromItsView || isOpenSession(conversation.id)) onLeave?.("leave");
       },
+      reportFailure,
     );
   }
 
@@ -363,12 +386,16 @@ export function useSessionActions({
                   // for the whole kill blocks the rest of the page. A failure
                   // surfaces as a toast since the dialog is already gone.
                   setStopOpen(false);
-                  stopSession.mutate(conversation.id, {
-                    onError: (err) => {
-                      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
-                      showToast(`Couldn't stop the session${detail}`);
-                    },
-                  });
+                  const reportFailure = (err: unknown) => {
+                    const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                    showToast(`Couldn't stop the session${detail}`);
+                  };
+                  // As for Leave, the promise reports even once the caller has unmounted.
+                  if (reportsAfterUnmount) {
+                    stopSession.mutateAsync(conversation.id).catch(reportFailure);
+                  } else {
+                    stopSession.mutate(conversation.id, { onError: reportFailure });
+                  }
                 }}
                 componentId={`${componentIdPrefix}.stop`}
               >

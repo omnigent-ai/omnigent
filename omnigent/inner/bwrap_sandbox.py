@@ -68,7 +68,7 @@ import shutil
 import stat
 import sys
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
@@ -80,6 +80,8 @@ from ._seccomp import (
     SeccompRule,
     apply_baseline_denylist,
     apply_seccomp_filter,
+    baseline_denylist_rules,
+    export_seccomp_filter,
     scmp_act_errno,
 )
 from .datamodel import HostWritePathSpec, OSEnvSandboxSpec, OSEnvSpec
@@ -249,6 +251,22 @@ def _should_bind_host_proc() -> bool:
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BwrapRequestFds:
+    """Caller-owned info pipe and two distinct empty program files for one request."""
+
+    info_fd: int
+    baseline_fd: int
+    hardening_fd: int
+
+    def __post_init__(self) -> None:
+        descriptors = (self.info_fd, self.baseline_fd, self.hardening_fd)
+        if len(set(descriptors)) != 3 or any(
+            not 0 <= descriptor <= 2_147_483_647 for descriptor in descriptors
+        ):
+            raise ValueError("Request launcher requires three distinct C file descriptors")
 
 
 class BwrapSandboxBackend(SandboxBackend):
@@ -440,6 +458,8 @@ class BwrapSandboxBackend(SandboxBackend):
         cwd: Path,
         chdir: Path | None = None,
         target: str | None = None,
+        *,
+        _request_fds: BwrapRequestFds | None = None,
     ) -> list[str]:
         """
         Build the ``bwrap`` argv that wraps *argv* with the hermetic
@@ -473,6 +493,9 @@ class BwrapSandboxBackend(SandboxBackend):
             the same treatment ``argv[0]`` (the Python interpreter)
             already receives.  ``None`` when the target is already
             reachable via the standard mounts.
+        :param _request_fds: Internal request-init mode. The caller owns
+            the info pipe and two empty, rewound program files, and must
+            retain the init and launcher lifetimes before admitting work.
         :returns: A complete ``bwrap`` argv ready for
             ``subprocess.Popen`` — never an empty list.
 
@@ -485,6 +508,25 @@ class BwrapSandboxBackend(SandboxBackend):
         ``SandboxPolicy.spawn_env_allowlist`` prune in
         :func:`omnigent.inner.sandbox.run_launcher`.
         """
+        if _request_fds is not None:
+            if not policy.active or policy.backend_type != self.type_name:
+                raise ValueError("Request init requires an active linux_bwrap policy")
+            program_fds = (_request_fds.baseline_fd, _request_fds.hardening_fd)
+            program_files = [os.fstat(descriptor) for descriptor in program_fds]
+            if len({(file.st_dev, file.st_ino) for file in program_files}) != 2:
+                raise ValueError("Request filters require distinct program files")
+            if any(
+                not stat.S_ISREG(file.st_mode)
+                or file.st_size != 0
+                or os.lseek(descriptor, 0, os.SEEK_CUR) != 0
+                for descriptor, file in zip(program_fds, program_files, strict=True)
+            ):
+                raise ValueError("Request filters require empty, rewound regular files")
+            export_seccomp_filter(baseline_denylist_rules(), _request_fds.baseline_fd)
+            os.lseek(_request_fds.baseline_fd, 0, os.SEEK_SET)
+            export_seccomp_filter(_bwrap_extra_seccomp_rules(), _request_fds.hardening_fd)
+            os.lseek(_request_fds.hardening_fd, 0, os.SEEK_SET)
+
         policy = self.prepare_launcher_policy(policy)
         if policy.tcp_egress and policy.tcp_egress_socket_path is None:
             raise ValueError("tcp_egress requires its parent broker before sandbox launch")
@@ -633,6 +675,17 @@ class BwrapSandboxBackend(SandboxBackend):
             or policy.tcp_egress_socket_path is not None
         ):
             bwrap_args.append("--unshare-net")
+
+        if _request_fds is not None:
+            bwrap_args += [
+                "--as-pid-1",
+                "--info-fd",
+                str(_request_fds.info_fd),
+                "--add-seccomp-fd",
+                str(_request_fds.baseline_fd),
+                "--add-seccomp-fd",
+                str(_request_fds.hardening_fd),
+            ]
 
         # Namespacing + lifecycle hardening.
         # - ``--unshare-pid``: the helper sees only its own process tree.

@@ -11,6 +11,10 @@ disable-project-excludes-heuristics = true
 
 python-version = "3.12"
 
+# Check as CI does, on Linux, so Linux-only modules such as the bwrap request helpers
+# check the same on a Mac.
+python-platform = "linux"
+
 search-path = ["."]
 
 disable-search-path-heuristics = true
