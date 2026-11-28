@@ -3,7 +3,7 @@
 Verifies the migrations create the task tables and the ``scheduled_task_shares``
 table with the expected shape, that none carries a database-level foreign key
 (schema Rule R032 — the ``agent_id`` / ``conversation_id`` / ``scheduled_task_id``
-relationships are application-owned), that ``scheduled_tasks.rrule`` is NOT NULL
+relationships are application-owned), that ``scheduled_tasks.rrule`` is nullable for event triggers
 and the ``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade
 drops the task tables cleanly. Dispatch coverage includes occurrence deduplication,
 legacy writers, history preservation, and guarded rollback.
@@ -30,6 +30,7 @@ from omnigent.db.db_models import (
     ConversationBase,
     OmnigentBase,
     SqlScheduledTask,
+    SqlScheduledTaskEventReceipt,
     SqlScheduledTaskRun,
     SqlScheduledTaskShare,
 )
@@ -49,6 +50,8 @@ _MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
 _MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
 _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
+_TRIGGER_CONFIG_PREVIOUS = "47d3e8fc3e25"
+_TRIGGER_CONFIG_REVISION = "bdd2c8a6005c"
 _KIND_PREVIOUS = "b4e2d7a91c35"
 _KIND_REVISION = "27d16059fab9"
 _SHARES_PREVIOUS = "a7d4c2e9f610"
@@ -81,6 +84,7 @@ def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine
         engine = sa.create_engine(uri)
         SqlScheduledTask.__table__.create(engine)
         SqlScheduledTaskRun.__table__.create(engine)
+        SqlScheduledTaskEventReceipt.__table__.create(engine)
         SqlScheduledTaskShare.__table__.create(engine)
     else:
         engine = get_or_create_engine(uri)
@@ -112,6 +116,10 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["source_session_id"]["nullable"] is True
     assert columns["workflow_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
+    assert columns["trigger_config"]["nullable"] is True
+    assert columns["trigger_provider"]["nullable"] is True
+    assert columns["pending_event_run_id"]["nullable"] is True
+    assert columns["rrule"]["nullable"] is True
     assert columns["kind"]["nullable"] is False
     assert columns["smart_routing"]["nullable"] is True
     cols = set(columns)
@@ -145,6 +153,9 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_mode",
         "session_id",
         "source_session_id",
+        "trigger_config",
+        "trigger_provider",
+        "pending_event_run_id",
         "workflow_id",
         "kind",
         "smart_routing",
@@ -175,6 +186,7 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "trigger_key",
         "host_id",
         "lease_expires_at",
+        "event",
     }
 
 
@@ -311,6 +323,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
     ]
     assert scheduled_tasks_idx_cols["ix_scheduled_tasks_due"] == [
         "state",
+        "next_run_at",
+        "workspace_id",
+        "id",
+    ]
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_trigger"] == [
+        "state",
+        "trigger_provider",
         "next_run_at",
         "workspace_id",
         "id",
@@ -517,21 +536,6 @@ def test_rrule_accepts_recurring_row(db_engine: Engine) -> None:
                 "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', 'u', 'ag', 'UTC', 1)"
             )
         )
-
-
-def test_rrule_is_not_null(db_engine: Engine) -> None:
-    """A row omitting ``rrule`` fails the NOT NULL constraint."""
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "INSERT INTO scheduled_tasks "
-                    "(id, name, prompt, user_id, agent_id, timezone, "
-                    " created_at) "
-                    "VALUES (X'000000000000000000000000000000e0', 'n', 'p', "
-                    "'u', 'ag', 'UTC', 1)"
-                )
-            )
 
 
 def test_state_stored_as_smallint(db_engine: Engine) -> None:
@@ -1360,3 +1364,342 @@ def test_timer_kind_downgrade_finds_timers_through_the_kind_index(
             ).all()
         )
     assert "ix_scheduled_tasks_kind_scope" in plan and "SEARCH" in plan, plan
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_event_receipts_table(db_engine: Engine) -> None:
+    """One receipt per task occurrence, led by the workspace, with an age index."""
+    insp = sa.inspect(db_engine)
+    columns = {c["name"]: c for c in insp.get_columns("scheduled_task_event_receipts")}
+    assert set(columns) == {
+        "workspace_id",
+        "id",
+        "scheduled_task_id",
+        "trigger_key",
+        "run_id",
+        "created_at",
+    }
+    assert [name for name, c in columns.items() if c["nullable"]] == []
+    # A new table: writers supply the workspace, so the database has no default.
+    assert columns["workspace_id"]["default"] is None
+    assert insp.get_pk_constraint("scheduled_task_event_receipts")["constrained_columns"] == [
+        "workspace_id",
+        "id",
+    ]
+    assert insp.get_foreign_keys("scheduled_task_event_receipts") == []
+    unique = {
+        key["name"]: key["column_names"]
+        for key in insp.get_unique_constraints("scheduled_task_event_receipts")
+    }
+    assert unique["uq_scheduled_task_event_receipts_occurrence"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "trigger_key",
+    ]
+    indexes = {
+        i["name"]: list(i["column_names"])
+        for i in insp.get_indexes("scheduled_task_event_receipts")
+    }
+    assert indexes["ix_scheduled_task_event_receipts_age"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "created_at",
+        "id",
+    ]
+
+
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+@pytest.mark.parametrize("invalid_column", ["trigger_key", "workspace_id", "created_at"])
+def test_receipt_keys_are_bounded_on_sqlite(db_engine: Engine, invalid_column: str) -> None:
+    """Receipt values retain bounded string and integer storage on SQLite."""
+    receipts = sa.Table("scheduled_task_event_receipts", sa.MetaData(), autoload_with=db_engine)
+    values = {
+        "workspace_id": 0,
+        "scheduled_task_id": b"t" * 16,
+        "run_id": b"r" * 16,
+        "created_at": 1,
+    }
+    with db_engine.begin() as conn:
+        # 256 four-byte characters fit exactly.
+        conn.execute(
+            receipts.insert().values(id=b"a" * 16, trigger_key="\U0001f600" * 256, **values)
+        )
+        assert conn.execute(sa.select(receipts.c.workspace_id, receipts.c.created_at)).one() == (
+            0,
+            1,
+        )
+    invalid = {"id": b"b" * 16, "trigger_key": "safe", **values}
+    invalid[invalid_column] = (
+        "\U0001f600" * 257 if invalid_column == "trigger_key" else "x" * 16_384
+    )
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(receipts.insert().values(**invalid))
+
+
+def test_downgrade_guard_seeks_to_its_cursor_on_sqlite(db_engine: Engine) -> None:
+    """Each later page of the guard is a seek, so the whole check reads each task once."""
+    migration = import_module(
+        "omnigent.db.migrations.versions.bdd2c8a6005c_add_scheduled_task_trigger_config"
+    )
+    tasks = sa.table(
+        "scheduled_tasks", sa.column("workspace_id"), sa.column("id"), sa.column("rrule")
+    )
+    page = migration._guard_page(tasks, (0, b"a" * 16), "sqlite")
+    compiled = page.compile(dialect=db_engine.dialect, compile_kwargs={"literal_binds": False})
+    with db_engine.connect() as conn:
+        plan = conn.exec_driver_sql(
+            f"EXPLAIN QUERY PLAN {compiled}", tuple(compiled.params.values())
+        ).all()
+    detail = " ".join(str(row[-1]) for row in plan)
+    assert "SEARCH" in detail and "SCAN" not in detail, detail
+    # Inspect WHERE itself: ORDER BY also contains the letters "OR".
+    from sqlalchemy.dialects import mysql
+
+    predicate = str(
+        migration._guard_page(tasks, (0, b"a" * 16), "mysql").whereclause.compile(
+            dialect=mysql.dialect(),
+        )
+    )
+    assert "scheduled_tasks.workspace_id > %s" in predicate
+    assert "scheduled_tasks.workspace_id = %s" in predicate
+    assert "scheduled_tasks.id > %s" in predicate
+    assert " OR " in predicate and " AND " in predicate
+    stored_tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    values = {
+        "name": "n",
+        "prompt": b"p",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with db_engine.begin() as conn:
+        conn.execute(
+            stored_tasks.insert(),
+            [
+                {"workspace_id": 0, "id": b"a" * 16, "rrule": "FREQ=DAILY", **values},
+                {"workspace_id": 0, "id": b"b" * 16, "rrule": "FREQ=DAILY", **values},
+                {"workspace_id": 1, "id": bytes(16), "rrule": None, **values},
+            ],
+        )
+        assert conn.execute(migration._guard_page(tasks, (0, b"a" * 16), "mysql")).all() == [
+            (0, b"b" * 16, "FREQ=DAILY"),
+            (1, bytes(16), None),
+        ]
+
+
+@pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
+def test_trigger_provider_is_bounded_on_sqlite(db_engine: Engine) -> None:
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    values = {
+        "name": "n",
+        "prompt": b"p",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(id=b"a" * 16, trigger_provider="\U0001f600" * 32, **values)
+        )
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(
+                tasks.insert().values(id=b"b" * 16, trigger_provider="\U0001f600" * 33, **values)
+            )
+
+
+def test_trigger_config_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("sqlite://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(
+            config, f"{_TRIGGER_CONFIG_REVISION}:{_TRIGGER_CONFIG_PREVIOUS}", sql=True
+        )
+    assert "DROP TABLE" not in config.output_buffer.getvalue()
+
+
+def test_json_columns_are_bounded_varbinary_on_mysql() -> None:
+    """MySQL declares both JSON columns VARBINARY(16383), through migration and metadata."""
+    from sqlalchemy.dialects import mysql
+    from sqlalchemy.schema import CreateTable
+
+    for table, column in (
+        (SqlScheduledTask.__table__, "trigger_config"),
+        (SqlScheduledTaskRun.__table__, "event"),
+    ):
+        assert table.c[column].type.max_stored_bytes == 16_383
+        ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
+        assert f"{column} VARBINARY(16383)" in ddl
+    config = _build_alembic_config("mysql://")
+    config.output_buffer = StringIO()
+    command.upgrade(config, f"{_TRIGGER_CONFIG_PREVIOUS}:{_TRIGGER_CONFIG_REVISION}", sql=True)
+    sql = config.output_buffer.getvalue()
+    assert "ADD COLUMN trigger_config VARBINARY(16383)" in sql
+    assert "ADD COLUMN event VARBINARY(16383)" in sql
+    assert "BLOB" not in sql
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_TRIGGER_CONFIG_PREVIOUS], indirect=True)
+def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
+    dispatch_migration_engine: Engine,
+) -> None:
+    """Existing tasks keep their rule; downgrade waits until no task lacks one."""
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    before_runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, rrule="FREQ=DAILY", **values))
+        conn.execute(
+            before_runs.insert().values(
+                id=b"k" * 16, scheduled_task_id=b"a" * 16, status=4, scheduled_at=1
+            )
+        )
+    command.upgrade(config, _TRIGGER_CONFIG_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+    receipts = sa.Table("scheduled_task_event_receipts", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.rrule, tasks.c.trigger_config)).one() == (
+            "FREQ=DAILY",
+            None,
+        )
+        assert (
+            conn.execute(sa.select(runs.c.status).where(runs.c.id == b"k" * 16)).scalar_one() == 4
+        )
+        # The ORM type compresses on write; a raw insert only needs a non-NULL value.
+        conn.execute(
+            tasks.insert().values(id=b"b" * 16, rrule=None, trigger_config=b"{}", **values)
+        )
+        assert (
+            conn.execute(sa.select(tasks.c.rrule).where(tasks.c.id == b"b" * 16)).scalar_one()
+            is None
+        )
+        conn.execute(
+            runs.insert().values(
+                id=b"r" * 16, scheduled_task_id=b"b" * 16, status=1, scheduled_at=1, event=b"{}"
+            )
+        )
+        receipt = {
+            "workspace_id": 0,
+            "scheduled_task_id": b"b" * 16,
+            "trigger_key": "event:x:1",
+            "run_id": b"r" * 16,
+            "created_at": 1,
+        }
+        conn.execute(receipts.insert().values(id=b"c" * 16, **receipt))
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(receipts.insert().values(id=b"d" * 16, **receipt))
+    with engine.begin() as conn:
+        # The same occurrence is its own receipt for another task or workspace.
+        conn.execute(
+            receipts.insert().values(id=b"e" * 16, **{**receipt, "scheduled_task_id": b"a" * 16})
+        )
+        conn.execute(receipts.insert().values(id=b"f" * 16, **{**receipt, "workspace_id": 7}))
+        conn.execute(
+            receipts.insert().values(id=b"g" * 16, **{**receipt, "trigger_key": "event:X:1"})
+        )
+        assert (
+            conn.execute(
+                sa.select(sa.func.count())
+                .select_from(receipts)
+                .where(
+                    receipts.c.workspace_id == 0,
+                    receipts.c.scheduled_task_id == b"b" * 16,
+                )
+            ).scalar_one()
+            == 2
+        )
+    with pytest.raises(RuntimeError, match="NULL rrule"):
+        command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
+    with engine.begin() as conn:
+        conn.execute(tasks.delete().where(tasks.c.id == b"b" * 16))
+        # A task with no rule beyond the guard's first page of 500 is still found.
+        conn.execute(
+            tasks.insert(),
+            [
+                {"id": index.to_bytes(16, "big"), "rrule": "FREQ=DAILY", **values}
+                for index in range(1, 501)
+            ]
+            + [{"id": (10**6).to_bytes(16, "big"), "rrule": None, **values}],
+        )
+        # Retained deleted tasks also prevent restoring the NOT NULL constraint.
+        conn.execute(tasks.update().where(tasks.c.rrule.is_(None)).values(state=3))
+    boundaries: dict[sa.Connection, int] = {}
+    pages: list[tuple[sa.Connection, int]] = []
+    ddl_statements: list[str] = []
+
+    def boundary(connection: sa.Connection) -> None:
+        boundaries[connection] = boundaries.get(connection, 0) + 1
+
+    def observe(connection, _cursor, statement, _parameters, _context, _many) -> None:
+        if _context.isddl:
+            ddl_statements.append(statement)
+        if (
+            "scheduled_tasks.rrule" in statement
+            and "ORDER BY scheduled_tasks.workspace_id, scheduled_tasks.id" in statement
+        ):
+            pages.append((connection, boundaries.get(connection, 0)))
+
+    sa.event.listen(sa.engine.Engine, "commit", boundary)
+    sa.event.listen(sa.engine.Engine, "rollback", boundary)
+    sa.event.listen(sa.engine.Engine, "before_cursor_execute", observe)
+    try:
+        with pytest.raises(RuntimeError, match="NULL rrule"):
+            command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
+        assert len(pages) == 2
+        assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
+        with engine.begin() as conn:
+            conn.execute(tasks.update().where(tasks.c.rrule.is_(None)).values(rrule="FREQ=DAILY"))
+            conn.execute(tasks.insert().values(workspace_id=7, id=bytes(16), rrule=None, **values))
+        pages.clear()
+        with pytest.raises(RuntimeError, match="NULL rrule"):
+            command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
+        assert len(pages) == 2
+        assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
+        assert not ddl_statements, "The guard changed the schema before finding a ruleless task"
+        with engine.begin() as conn:
+            conn.execute(tasks.delete().where(tasks.c.rrule.is_(None)))
+        pages.clear()
+        command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
+        assert len(pages) == 2
+        assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
+    finally:
+        sa.event.remove(sa.engine.Engine, "commit", boundary)
+        sa.event.remove(sa.engine.Engine, "rollback", boundary)
+        sa.event.remove(sa.engine.Engine, "before_cursor_execute", observe)
+    inspector = sa.inspect(engine)
+    task_columns = {c["name"]: c for c in inspector.get_columns("scheduled_tasks")}
+    assert "trigger_config" not in task_columns
+    assert task_columns["rrule"]["nullable"] is False
+    assert "event" not in {c["name"] for c in inspector.get_columns("scheduled_task_runs")}
+    assert "trigger_provider" not in task_columns
+    assert "ix_scheduled_tasks_trigger" not in {
+        i["name"] for i in inspector.get_indexes("scheduled_tasks")
+    }
+    assert "scheduled_task_event_receipts" not in inspector.get_table_names()
+    # The rebuilt tables keep every valid task, including deleted tasks, and both runs.
+    with engine.connect() as conn:
+        assert conn.execute(
+            sa.select(before.c.id, before.c.rrule).order_by(before.c.id)
+        ).all() == [(index.to_bytes(16, "big"), "FREQ=DAILY") for index in range(1, 501)] + [
+            ((10**6).to_bytes(16, "big"), "FREQ=DAILY"),
+            (b"a" * 16, "FREQ=DAILY"),
+        ]
+        assert (
+            conn.execute(
+                sa.select(before.c.state).where(before.c.id == (10**6).to_bytes(16, "big"))
+            ).scalar_one()
+            == 3
+        )
+        old_runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
+        assert sorted(conn.execute(sa.select(old_runs.c.id)).scalars()) == [b"k" * 16, b"r" * 16]
