@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.native.native_coding_agents import CODEX_NATIVE_CODING_AGENT
 from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
@@ -15,8 +16,122 @@ from omnigent.server.routes._sessions.orchestration import (
     _settle_undelivered_native_input,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_text", [False, True])
+@pytest.mark.parametrize("failed_append", [False, True])
+async def test_codex_receipts_preserve_reordered_inputs_and_their_attachments(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, same_text: bool, failed_append: bool
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        title="Test", labels={"omnigent.wrapper": CODEX_NATIVE_CODING_AGENT.wrapper_label}
+    )
+    first_text, second_text = "first", "first" if same_text else "second"
+    contents = [
+        [{"type": "input_text", "text": text}, {"type": "input_file", "file_id": f"file_{index}"}]
+        for index, text in enumerate((first_text, second_text))
+    ]
+    pending = [
+        pending_inputs.record(
+            conv.id,
+            content,
+            stable_id=letter * 32,
+            created_by=f"{letter}@example.com",
+            background_titles_enabled=False,
+        )
+        for letter, content in zip(("a", "b"), contents, strict=True)
+    ]
+
+    bodies = [
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": f"resp_{letter}",
+                "source_id": f"native:{letter}:0",
+                "native_input_id": "omnigent:stable:" + letter * 32,
+            },
+        )
+        for letter, text in zip(("a", "b"), (first_text, second_text), strict=True)
+    ]
+    append = store.append
+    if failed_append:
+        monkeypatch.setattr(store, "append", Mock(side_effect=RuntimeError("store unavailable")))
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await _persist_external_conversation_item(conv.id, conv, bodies[1], store)
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == pending
+        monkeypatch.setattr(store, "append", append)
+
+    second_id = await _persist_external_conversation_item(conv.id, conv, bodies[1], store)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == pending[:1]
+    second = store.get_item(conv.id, second_id)
+    assert second is not None and second.created_by == "b@example.com"
+    assert second.data.content == [contents[1][1], contents[1][0]]
+    # A durable forwarder retry cannot settle even an identical newer pending input.
+    assert await _persist_external_conversation_item(conv.id, conv, bodies[1], store) == second_id
+    first_id = await _persist_external_conversation_item(conv.id, conv, bodies[0], store)
+    first = store.get_item(conv.id, first_id)
+    assert first is not None and first.created_by == "a@example.com"
+    assert first.data.content == [contents[0][1], contents[0][0]]
+    assert pending_inputs.snapshot_for(conv.id) == []
+    assert [item.type for item in store.list_items(conv.id).data] == ["message", "message"]
+
+
+@pytest.mark.asyncio
+async def test_codex_named_receipt_survives_restart_and_never_borrows_a_new_input(
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        title="Test",
+        labels={
+            "omnigent.wrapper": CODEX_NATIVE_CODING_AGENT.wrapper_label,
+            STARTUP_LABEL: "ready",
+        },
+    )
+    content = [{"type": "input_text", "text": "saved message"}]
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=PENDING_INPUT_RESPONSE_ID,
+                data=MessageData(role="user", content=content, user_authored=True),
+                stable_id="a" * 32,
+                status="incomplete",
+                created_by="alice@example.com",
+            )
+        ],
+    )
+    pending_inputs.record(conv.id, content, stable_id="a" * 32)
+    pending_inputs.reset_for_tests()
+    newer = pending_inputs.record(conv.id, content, stable_id="b" * 32)
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": content},
+            "source_id": "native:restored:0",
+            "response_id": "resp_restored",
+            "native_input_id": "omnigent:stable:" + "a" * 32,
+        },
+    )
+    await _persist_external_conversation_item(conv.id, conv, body, store)
+    assert store.list_pending_inputs(conv.id) == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [newer]
+    # A late receipt with no surviving queue entry cannot fall back to text/FIFO.
+    body.data["source_id"] = "native:late:0"
+    body.data["native_input_id"] = "omnigent:stable:" + "c" * 32
+    await _persist_external_conversation_item(conv.id, conv, body, store)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [newer]
+    assert all(item.type == "message" for item in store.list_items(conv.id).data)
+    pending_inputs.resolve(conv.id, newer)
 
 
 @pytest.mark.asyncio

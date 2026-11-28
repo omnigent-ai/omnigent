@@ -225,6 +225,33 @@ def test_record_then_snapshot_preserves_order_and_content() -> None:
     assert snap[1]["content"] == [_text_block("second")]
 
 
+@pytest.mark.parametrize("identity_kind", ["stable", "attempt"])
+def test_native_receipt_resolves_only_its_input_and_can_restore_a_failed_append(
+    identity_kind: str,
+) -> None:
+    first = pending_inputs.record("conv", [_text_block("same")])
+    second = pending_inputs.record("conv", [_text_block("same")], stable_id="b" * 32)
+    attrs = pending_inputs.delivery_attributes_for("conv", second)
+    client_id = (
+        "omnigent:stable:" + "b" * 32
+        if identity_kind == "stable"
+        else "omnigent:attempt:" + str(attrs["delivery_attempt_id"])
+    )
+    assert pending_inputs.resolve_native_client_id("other", client_id) is None
+    assert pending_inputs.resolve_native_client_id("conv", "omnigent:stable:" + "c" * 32) is None
+    held = pending_inputs.resolve_native_client_id("conv", client_id, hold=True)
+    assert held is not None and held.pending_id == second
+    assert pending_inputs.resolve_native_client_id("conv", client_id) is None
+    pending_inputs.restore("conv", held)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv")] == [
+        first,
+        second,
+    ]
+    drained = pending_inputs.resolve_native_client_id("conv", client_id)
+    assert drained is not None and drained.pending_id == second
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv")] == [first]
+
+
 @pytest.mark.parametrize("content_source", ["enqueue", "snapshot", "held_drain"])
 def test_snapshot_returns_deep_copies(content_source: str) -> None:
     """
