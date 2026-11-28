@@ -16,6 +16,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
 )
+from tests.budgets import budget
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_item_request,
     _start_recording_server,
@@ -23,12 +24,12 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("slow_observer_stderr", [False, True])
+@pytest.mark.parametrize("slow_file", [None, "observer_stderr", "active_session"])
 async def test_forwarder_survives_unhandled_loop_exceptions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    slow_observer_stderr: bool,
+    slow_file: str | None,
 ) -> None:
     """
     A non-HTTP loop exception is logged and the next poll continues.
@@ -95,13 +96,27 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
 
     def slow_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
         if path == bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE:
-            if slow_observer_stderr and not observer_finished.is_set():
+            if slow_file == "observer_stderr" and not observer_finished.is_set():
                 loop.call_soon_threadsafe(observer_entered.set)
                 release_observer.wait(timeout=5.0)
                 observer_finished.set()
         return original_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", slow_stat)
+    original_read_text = Path.read_text
+
+    def slow_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == bridge_dir / "bridge.json" and slow_file == "active_session":
+            if not observer_finished.is_set():
+                loop.call_soon_threadsafe(observer_entered.set)
+                release_observer.wait(timeout=budget(10))
+                observer_finished.set()
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", slow_read_text)
+    # Diagnostics read the same metadata on their own worker; isolate the live poll.
+    if slow_file == "active_session":
+        monkeypatch.setattr(forwarder, "harness_stderr_capture_enabled", lambda: False)
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -116,8 +131,8 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         )
     )
     try:
-        if slow_observer_stderr:
-            await asyncio.wait_for(observer_entered.wait(), timeout=10.0)
+        if slow_file is not None:
+            await asyncio.wait_for(observer_entered.wait(), timeout=budget(20))
             assert not observer_finished.is_set(), "observer file I/O blocked the event loop"
             release_observer.set()
         request = await _get_recorded_item_request(server)
