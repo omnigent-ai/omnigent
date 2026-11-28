@@ -677,6 +677,51 @@ def test_launch_argv_and_config_pin_name_the_same_model(
         assert pinned == model
 
 
+@pytest.mark.parametrize(
+    ("source_model", "pinned_model", "expected_model"),
+    [
+        ("system.ai.claude-opus-5-5", None, None),
+        ("gpt-5.5", None, "gpt-5.5"),
+        ("system.ai.claude-opus-5-5", "system.ai.claude-sonnet-5", "system.ai.claude-sonnet-5"),
+    ],
+    ids=["claude-dropped", "gpt-kept", "claude-pin-kept"],
+)
+async def test_start_drops_claude_config_model_unless_pinned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    source_model: str,
+    pinned_model: str | None,
+    expected_model: str | None,
+) -> None:
+    """An unpinned launch never runs a copied Claude ``model``; an explicit pin is kept."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = (
+        f'model = "{source_model}"\nmodel_provider = "gateway"\n'
+        '[model_providers.gateway]\nname = "Gateway"\nwire_api = "responses"\n'
+    )
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.pinned_model = pinned_model
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"):
+        await server.start()
+        await server.close()
+
+    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert config.get("model") == expected_model
+    assert config["model_provider"] == "gateway"
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+    warned = "Ignoring configured Codex model" in caplog.text
+    assert warned is (expected_model is None)
+
+
 async def test_start_pins_reasoning_effort_in_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

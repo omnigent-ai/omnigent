@@ -645,10 +645,20 @@ async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:
         await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)
 
 
+@pytest.mark.parametrize(
+    ("configured_model", "probe_model"),
+    [("gateway-model", "gateway-model"), ("system.ai.claude-opus-5-5", None)],
+    ids=["model-kept", "claude-dropped"],
+)
 @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
 def test_codex_probe_home_preserves_configured_catalog(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+    configured_model: str,
+    probe_model: str | None,
 ) -> None:
+    """The probe keeps the configured catalog and default, except a Claude one."""
     from omnigent.harnesses.codex_native import app_server
 
     source = tmp_path / "source"
@@ -657,7 +667,7 @@ def test_codex_probe_home_preserves_configured_catalog(
     catalog.write_text('{"models": []}')
     catalog_setting = catalog.name if relative else str(catalog)
     (source / "config.toml").write_text(
-        f'model = "gateway-model"\nmodel_catalog_json = {json.dumps(catalog_setting)}\n'
+        f'model = "{configured_model}"\nmodel_catalog_json = {json.dumps(catalog_setting)}\n'
         'model_provider = "gateway"\n'
         '[model_providers.gateway]\nname = "Gateway"\n'
         '[mcp_servers.unrelated]\ncommand = "must-not-start"\n'
@@ -668,7 +678,7 @@ def test_codex_probe_home_preserves_configured_catalog(
     home = app_server._probe_codex_home([])
     config = tomllib.loads((home / "config.toml").read_text())
     assert config["model_catalog_json"] == str(catalog)
-    assert config["model"] == "gateway-model"
+    assert config.get("model") == probe_model
     assert config["model_provider"] == "gateway"
     assert "mcp_servers" not in config
 
