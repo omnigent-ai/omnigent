@@ -139,6 +139,7 @@ async def run() -> None:
         pool=pool,
         setup=setup,
         server_url=settings.server_url,
+        agent_sessions=settings.agent_sessions,
     )
 
     app = AsyncApp(token=settings.slack_bot_token)
@@ -210,6 +211,13 @@ def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:
         if not body.get("team_id") and not event.get("team"):
             return
         await service.handle_message(body=body, event=event, client=client, context=context)
+
+    # Slack sends this only to an app subscribed to it (the agent manifest).
+    @app.event("agent_session_stopped")
+    async def handle_agent_session_stopped(
+        body: dict[str, Any], event: dict[str, Any], client: Any
+    ) -> None:
+        await service.handle_agent_session_stopped(body=body, event=event, client=client)
 
     @app.action(ACTION_APPROVE)
     async def handle_approve(ack: Any, body: dict[str, Any], client: Any) -> None:
