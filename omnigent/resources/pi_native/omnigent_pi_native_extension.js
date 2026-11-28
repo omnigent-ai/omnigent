@@ -1154,6 +1154,405 @@ function createHistoryQueue(config) {
   };
 }
 
+// Per-pid temp name: an exiting Pi process and its relaunched successor can
+// write concurrently, and a shared temp path could persist a torn file.
+function writeJsonAtomic(filePath, value) {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value));
+    fs.renameSync(tmp, filePath);
+  } catch (_err) {
+    // Remove temporary state after a failed best-effort checkpoint.
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_cleanupErr) {}
+  }
+}
+
+const _CHILD_POLL_MS = 2_000;
+// A child whose last reply ended its turn this long ago is reported idle.
+const _CHILD_QUIET_MS = 20_000;
+const _CHILD_READ_CHUNK_BYTES = 1024 * 1024;
+// A longer record is skipped unbuffered: usage-bearing replies are far smaller, while
+// tool results carrying images can reach megabytes.
+const _CHILD_RECORD_MAX_BYTES = 16 * 1024 * 1024;
+// Each regular poll's synchronous read pass stops starting new chunks after this long.
+const _CHILD_READ_BUDGET_MS = 500;
+const _CHILD_TITLE_MAX_CHARS = 80;
+const _CHILD_HEADER_BYTES = 64 * 1024;
+const _CHILD_SCAN_MAX_DEPTH = 10;
+// pi-subagents names each child session ``subagent-<agent>-<run uuid>-<n>``.
+const _PI_SUBAGENTS_SESSION_NAME = /^subagent-(.+)-[0-9a-f-]{36}-\d+$/;
+
+// Callers check the deadline before the open; an open that ends at or after it reads nothing.
+function readFileRange(file, position, length, deadline) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(length);
+    if (Date.now() >= deadline) return null;
+    return buffer.subarray(0, fs.readSync(fd, buffer, 0, length, position));
+  } catch (_err) {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function parseJsonLine(text) {
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === "object" ? value : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+// Returns null when unread by the deadline, and { pending: true } while the header line is incomplete.
+function readChildHeader(file, deadline) {
+  const head = readFileRange(file, 0, _CHILD_HEADER_BYTES, deadline);
+  if (!head) return null;
+  const newline = head.indexOf(10);
+  if (newline < 0) return head.length >= _CHILD_HEADER_BYTES ? { ignore: true } : { pending: true };
+  const header = parseJsonLine(head.subarray(0, newline).toString("utf8"));
+  if (header?.type !== "session" || typeof header.id !== "string" || !header.id ||
+    typeof header.parentSession !== "string" || !header.parentSession)
+    return { ignore: true };
+  let title = "subagent";
+  // The final split segment is a partial line or empty.
+  for (const line of head.subarray(newline + 1).toString("utf8").split("\n").slice(0, -1)) {
+    const entry = parseJsonLine(line);
+    if (entry?.type !== "session_info" || typeof entry.name !== "string" || !entry.name) continue;
+    // The Agents rail splits a child title at its first colon.
+    const name = (entry.name.match(_PI_SUBAGENTS_SESSION_NAME)?.[1] || entry.name).replace(/:/g, "-").trim();
+    title = Array.from(name).slice(0, _CHILD_TITLE_MAX_CHARS).join("") || title;
+    break;
+  }
+  return {
+    key: header.id,
+    parentFile: path.resolve(path.dirname(file), header.parentSession),
+    startedAt: Date.parse(header.timestamp) || 0,
+    title,
+  };
+}
+
+// A persisted child entry missing a field is dropped and rebuilt from its file.
+function validChildEntry(child) {
+  const usage = child?.usage;
+  return typeof child?.file === "string" && typeof child.key === "string" && Boolean(child.key) &&
+    typeof child.parentFile === "string" && typeof child.title === "string" &&
+    Number.isSafeInteger(child.offset) && child.offset >= 0 && Number.isFinite(child.startedAt) &&
+    (child.childId === null || typeof child.childId === "string") &&
+    (child.lastStop === null || typeof child.lastStop === "string") &&
+    Boolean(usage) && typeof usage === "object" && typeof usage.completeCost === "boolean" &&
+    ["input", "output", "cacheRead", "costUsd"].every(field => Number.isFinite(usage[field])) &&
+    (usage.model === null || typeof usage.model === "string");
+}
+
+// Register Pi subagent sessions as Omnigent children under their Pi session id and SET each one's
+// cumulative usage; cursors and totals persist together, so a relaunch never double counts.
+function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdownTimeoutMs = _HISTORY_SHUTDOWN_TIMEOUT_MS }) {
+  const enabled = Boolean(config && config.serverUrl && config.sessionId && config.bridgeDir);
+  const statePath = enabled ? path.join(config.bridgeDir, "pi_subagent_children.json") : null;
+  const ignoredFiles = new Set();
+  let timer = null;
+  let polling = null;
+  let pollAbort = null;
+
+  function readState() {
+    try {
+      const text = fs.readFileSync(statePath, "utf8");
+      const saved = JSON.parse(text);
+      return { text, roots: saved.roots.filter(root => typeof root === "string"), children: saved.children.filter(validChildEntry) };
+    } catch (_err) {
+      return { text: null, roots: [], children: [] };
+    }
+  }
+  const { roots, children } = readState();
+
+  // An overlapping process may have checkpointed further; each child keeps its furthest cursor.
+  function persist() {
+    if (!statePath) return;
+    const saved = readState();
+    roots.push(...saved.roots.filter(root => !roots.includes(root)));
+    for (const entry of saved.children) {
+      const child = children.find(other => other.key === entry.key);
+      if (!child) children.push(entry);
+      else if (entry.offset > child.offset) Object.assign(child, entry, { childId: entry.childId || child.childId, pending: null });
+    }
+    const state = {
+      roots, children: children.map(({ postedKey: _postedKey, postedStatus: _status, pending: _pending, ...child }) => child),
+    };
+    // An unchanged checkpoint is not rewritten.
+    if (JSON.stringify(state) !== saved.text) writeJsonAtomic(statePath, state);
+  }
+
+  // Directories and files still to visit in the current scan; regular polls resume it, and a
+  // drained scan restarts from the roots, revisiting deferred files.
+  let scan = [];
+
+  // Starts no directory listing, header read or stat at or after the deadline.
+  function discover(final, deadline) {
+    // The final poll rescans so files deferred earlier in a partial scan skip the title grace.
+    if (final || !scan.length) {
+      // Pi stores delegated sessions below the parent session directory.
+      scan = roots.map(root => ({ dir: path.join(path.dirname(root), path.basename(root, ".jsonl")), depth: 0 }));
+    }
+    while (scan.length && Date.now() < deadline) {
+      const item = scan.pop();
+      if (item.dir) {
+        let entries = [];
+        try {
+          entries = fs.readdirSync(item.dir, { withFileTypes: true });
+        } catch (_err) {}
+        // Reversed onto the stack, entries are visited in listing order.
+        for (const entry of entries.reverse()) {
+          const full = path.join(item.dir, entry.name);
+          if (entry.isDirectory() && item.depth < _CHILD_SCAN_MAX_DEPTH) scan.push({ dir: full, depth: item.depth + 1 });
+          else if (entry.isFile() && entry.name.endsWith(".jsonl")) scan.push({ file: full });
+        }
+        continue;
+      }
+      const file = item.file;
+      if (ignoredFiles.has(file) || children.some(child => child.file === file)) continue;
+      // An item whose next step has not started keeps its place, carrying a header already read.
+      if (Date.now() >= deadline) {
+        scan.push(item);
+        break;
+      }
+      const readAt = item.readAt ?? Date.now();
+      const header = item.header || readChildHeader(file, deadline);
+      // A header whose open outlasted the deadline is retried once after the scan's other items.
+      if (!header) {
+        if (!item.retried) scan.unshift({ file, retried: true });
+        continue;
+      }
+      // An incomplete header waits for the next scan.
+      if (header.pending) continue;
+      if (header.ignore || children.some(child => child.key === header.key)) {
+        ignoredFiles.add(file);
+        continue;
+      }
+      // Give Pi a moment to write the session name used as the title.
+      if (!final && header.title === "subagent") {
+        if (Date.now() >= deadline) {
+          scan.push({ file, header, readAt });
+          break;
+        }
+        // Within the grace period, or once written after its header was read, the next scan
+        // rereads the header so a later title applies.
+        const mtimeMs = fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs ?? 0;
+        if (now() - mtimeMs < 5_000 || (item.header && mtimeMs >= readAt)) continue;
+      }
+      children.push({
+        ...header, file, childId: null, offset: 0, lastStop: null,
+        usage: { input: 0, output: 0, cacheRead: 0, costUsd: 0, completeCost: true, model: null },
+      });
+    }
+  }
+
+  // Each poll owns its signal, so an aborted poll starts no further posts.
+  async function post(sessionId, body, pollSignal) {
+    if (pollSignal.aborted) throw pollSignal.reason;
+    const signal = AbortSignal.any([AbortSignal.timeout(assistantItemPostTimeoutMs(config)), pollSignal]);
+    return postEventChecked({ ...config, sessionId }, body, signal);
+  }
+
+  // A nested child attaches to the child session that launched it.
+  function parentSessionId(child) {
+    return roots.includes(child.parentFile)
+      ? config.sessionId
+      : children.find(other => other.file === child.parentFile)?.childId;
+  }
+
+  async function ensureMinted(child, signal) {
+    if (child.childId) return true;
+    const parentId = parentSessionId(child);
+    if (!parentId) return false;
+    try {
+      // The server dedupes on this id; a title change must not mint a second child.
+      const response = await post(parentId, {
+        type: "external_acp_subagent_start",
+        data: { subagent_id: child.key, title: child.title },
+      }, signal);
+      const childId = (await response?.json?.())?.child_session_id;
+      if (typeof childId === "string" && childId) child.childId = childId;
+    } catch (_err) {}
+    return Boolean(child.childId);
+  }
+
+  function addUsage(child, message) {
+    const usage = extractPiUsage(message);
+    if (!usage) return;
+    // Same input accounting as the parent's accumulateUsage.
+    child.usage.input += usage.input + usage.cacheRead + usage.cacheWrite;
+    child.usage.output += usage.output;
+    child.usage.cacheRead += usage.cacheRead;
+    if (usage.cost === null) child.usage.completeCost = false;
+    else child.usage.costUsd += usage.cost;
+    if (usage.model) child.usage.model = usage.model;
+  }
+
+  // Consume complete lines appended since the last poll, chunk by chunk up to the observed size.
+  // Starts no chunk at or after the deadline and stops with the cursor on a line boundary, so the
+  // next poll resumes there.
+  function readNew(child, deadline) {
+    let stat;
+    try {
+      stat = fs.statSync(child.file);
+    } catch (_err) {
+      return;
+    }
+    child.mtimeMs = stat.mtimeMs;
+    // The record at the cursor stays pending in memory across passes until its newline arrives;
+    // ``length`` counts its bytes read so far, and ``parts`` holds them while within the cap.
+    if (!child.pending || child.offset + child.pending.length > stat.size) child.pending = { parts: [], length: 0 };
+    const pending = child.pending;
+    // A record longer than one pass completes across polls through the in-memory pending state.
+    while (child.offset + pending.length < stat.size && Date.now() < deadline) {
+      const part = readFileRange(child.file, child.offset + pending.length,
+        Math.min(stat.size - child.offset - pending.length, _CHILD_READ_CHUNK_BYTES), deadline);
+      if (!part?.length) return;
+      const first = part.indexOf(10);
+      const { parts, length } = pending;
+      if (first < 0) {
+        pending.length += part.length;
+        if (pending.length > _CHILD_RECORD_MAX_BYTES) pending.parts = [];
+        else parts.push(part);
+        continue;
+      }
+      // An oversized record is passed unparsed once its newline arrives.
+      const oversized = length + first > _CHILD_RECORD_MAX_BYTES;
+      const end = length + (oversized ? first : part.lastIndexOf(10));
+      const lines = oversized ? [] : Buffer.concat([...parts, part]).subarray(0, end).toString("utf8").split("\n");
+      for (const line of lines) {
+        const entry = parseJsonLine(line);
+        const message = entry?.type === "message" ? entry.message : null;
+        // A forked child starts with a copy of its parent's history.
+        if (message?.role !== "assistant" || message.timestamp < child.startedAt) continue;
+        addUsage(child, message);
+        child.lastStop = typeof message.stopReason === "string" ? message.stopReason : null;
+      }
+      child.offset += end + 1;
+      pending.parts = [];
+      pending.length = 0;
+    }
+  }
+
+  async function report(child, final, signal) {
+    const usage = child.usage;
+    const postKey = JSON.stringify(usage);
+    if ((usage.input || usage.output) && postKey !== child.postedKey) {
+      const data = {
+        cost_complete: usage.completeCost,
+        cumulative_input_tokens: usage.input,
+        cumulative_output_tokens: usage.output,
+        cumulative_cache_read_input_tokens: usage.cacheRead,
+      };
+      if (usage.completeCost) data.cumulative_cost_usd = usage.costUsd;
+      if (usage.model) data.model = usage.model;
+      try {
+        await post(child.childId, { type: "external_session_usage", data }, signal);
+        child.postedKey = postKey;
+      } catch (_err) {}
+    }
+    // The watcher stops after the final poll, so a finished child cannot wait out the quiet window.
+    const quiet = final || now() - child.mtimeMs > _CHILD_QUIET_MS;
+    const status = child.lastStop && child.lastStop !== "toolUse" && quiet ? "idle" : "running";
+    if (status === child.postedStatus) return;
+    // A terminal status edge would deliver a result to the parent's inbox and
+    // wake Pi, which already has it; the idle observation only updates the rail.
+    try {
+      await post(child.childId, status === "idle"
+        ? { type: "subagent.status", data: { idle: true } }
+        : { type: "external_session_status", data: { status: "running" } }, signal);
+      child.postedStatus = status;
+    } catch (_err) {}
+  }
+
+  let resumeChild = null;
+  // The phase a deadline cut short, discovery or registered reads, leads the next poll.
+  let discoveryLeads = true;
+
+  async function runPoll(final, readDeadline, signal) {
+    // One absolute deadline from poll start bounds discovery and every read, including late registrations.
+    const readUntil = final ? readDeadline : Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
+    const current = sessionFile();
+    if (current && !roots.includes(path.resolve(current))) roots.push(path.resolve(current));
+    const discoveredFirst = discoveryLeads;
+    if (discoveredFirst) discover(final, readUntil);
+    const reports = [];
+    let skipped = null;
+    // Persist cursors and totals before reporting them.
+    const flush = ready => {
+      // Once shutdown aborts this poll, it neither posts nor writes state.
+      if (signal.aborted) return;
+      for (const child of ready) {
+        // Past the deadline no further child is touched; the first one skipped leads the next poll.
+        if (Date.now() >= readUntil) {
+          skipped = resumeChild = skipped || child;
+          break;
+        }
+        readNew(child, readUntil);
+      }
+      persist();
+      reports.push(...ready.map(child => report(child, final, signal)));
+    };
+    // Registered children report without waiting on new registrations; the first one the
+    // deadline skipped starts the next poll, so backlogs cannot starve later children.
+    const registered = children.filter(child => child.childId);
+    const start = Math.max(0, registered.indexOf(resumeChild));
+    flush([...registered.slice(start), ...registered.slice(0, start)]);
+    if (!skipped) resumeChild = registered[(start + 1) % registered.length] || null;
+    if (!discoveredFirst) discover(final, readUntil);
+    discoveryLeads = Date.now() < readUntil || !discoveredFirst;
+    // Each registration is tried once per poll; registering a launcher lets its nested children attach.
+    const attempted = new Set();
+    const register = async () => {
+      const batch = children.filter(child => !child.childId && !attempted.has(child) && parentSessionId(child));
+      batch.forEach(child => attempted.add(child));
+      await Promise.all(batch.map(async child => {
+        if (!(await ensureMinted(child, signal))) return;
+        flush([child]);
+        await register();
+      }));
+    };
+    await register();
+    await Promise.all(reports);
+  }
+
+  return {
+    // The final poll skips the title grace period so late children are still reported.
+    poll(final = false, readDeadline = Infinity) {
+      if (enabled && !polling) {
+        pollAbort = new AbortController();
+        polling = runPoll(final, readDeadline, pollAbort.signal).finally(() => { polling = null; });
+      }
+      return polling || Promise.resolve();
+    },
+    start() {
+      if (!enabled || timer) return;
+      timer = setInterval(() => this.poll().catch(() => {}), _CHILD_POLL_MS);
+      timer?.unref?.();
+    },
+    // A last best-effort poll: reading gets half the shutdown budget, leaving the rest for posts.
+    async stop() {
+      clearInterval(timer);
+      timer = null;
+      // A hung request in the in-flight poll must not consume the final poll's budget.
+      if (polling) pollAbort.abort();
+      const deadlineAt = Date.now() + shutdownTimeoutMs;
+      const final = Promise.resolve(polling).catch(() => {})
+        .then(() => Date.now() < deadlineAt && this.poll(true, deadlineAt - shutdownTimeoutMs / 2));
+      const bound = new AbortController();
+      await Promise.race([final.catch(() => {}), sleep(shutdownTimeoutMs, bound.signal)]);
+      bound.abort();
+      // Nothing posts or writes state after shutdown returns.
+      if (polling) pollAbort.abort();
+    },
+  };
+}
+
 function assistantMessageSourceId(message, responseId, text) {
   const response =
     message && typeof message.responseId === "string" && message.responseId
@@ -1675,7 +2074,13 @@ module.exports = function (pi) {
   process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
   const history = createHistoryQueue(config);
-  pi.on("session_shutdown", () => history.close());
+  const childSessions = createChildSessionWatcher(config, {
+    sessionFile: () => latestContext?.sessionManager?.getSessionFile?.() || null,
+  });
+  pi.on("session_shutdown", async () => {
+    const [, closed] = await Promise.all([childSessions.stop(), history.close()]);
+    return closed;
+  });
   pi.on("session_compact", async (_event, ctx) => {
     const manager = ctx?.sessionManager;
     if (typeof manager?.buildSessionProjection !== "function") return;
@@ -2065,28 +2470,14 @@ module.exports = function (pi) {
   function persistCumulativeUsage() {
     const statePath = usageStatePath();
     if (!statePath) return;
-    // Per-pid temp name: an exiting Pi process and its relaunched successor
-    // can flush concurrently, and a shared temp path could persist a torn file.
-    const tmp = `${statePath}.${process.pid}.tmp`;
-    try {
-      fs.writeFileSync(
-        tmp,
-        JSON.stringify({
-          cumulative_input_tokens: cumulativeInputTokens,
-          cumulative_output_tokens: cumulativeOutputTokens,
-          cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
-          cost_complete: completeCost,
-          ...(completeCost ? { cumulative_cost_usd: cumulativeCostUsd } : {}),
-          model: usageModel,
-        }),
-      );
-      fs.renameSync(tmp, statePath);
-    } catch (_err) {
-      // Remove temporary state after a failed best-effort checkpoint.
-      try {
-        fs.unlinkSync(tmp);
-      } catch (_cleanupErr) {}
-    }
+    writeJsonAtomic(statePath, {
+      cumulative_input_tokens: cumulativeInputTokens,
+      cumulative_output_tokens: cumulativeOutputTokens,
+      cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+      cost_complete: completeCost,
+      ...(completeCost ? { cumulative_cost_usd: cumulativeCostUsd } : {}),
+      model: usageModel,
+    });
   }
 
   function raiseUsageTotals(saved) {
@@ -2437,6 +2828,7 @@ module.exports = function (pi) {
       () => compacting,
     );
     markInputReady(config);
+    childSessions.start();
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
@@ -2861,3 +3253,5 @@ module.exports = function (pi) {
     }
   });
 };
+
+module.exports.createChildSessionWatcher = createChildSessionWatcher;
