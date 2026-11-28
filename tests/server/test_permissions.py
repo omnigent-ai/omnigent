@@ -916,6 +916,47 @@ def test_header_mode_rejects_reserved_names(reserved_name: str) -> None:
     )
 
 
+# ── Canonical grantee IDs ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("oidc", "alice@example.com"),
+        ("accounts", "alice@example.com"),
+        ("header", "Alice@Example.com"),
+    ],
+)
+def test_canonical_grantee_id_matches_how_each_mode_signs_in(source: str, expected: str) -> None:
+    """A typed grantee is lowercased only where sign-in lowercases identities."""
+    from omnigent.server.auth import UnifiedAuthProvider, canonical_grantee_id
+
+    provider = UnifiedAuthProvider(source=source, local_single_user=False)
+
+    assert canonical_grantee_id(provider, "  Alice@Example.com ") == expected
+
+
+@pytest.mark.parametrize("source", ["oidc", "accounts"])
+def test_canonical_grantee_id_keeps_the_machine_subject_case(
+    source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The machine client signs in as its exact subject, so only that spelling keeps case."""
+    from omnigent.server.auth import UnifiedAuthProvider, canonical_grantee_id
+
+    monkeypatch.setenv("OMNIGENT_MACHINE_SUB", "BuildBot")
+    provider = UnifiedAuthProvider(source=source, local_single_user=False)
+
+    assert canonical_grantee_id(provider, " BuildBot ") == "BuildBot"
+    assert canonical_grantee_id(provider, "BUILDBOT") == "buildbot"
+
+
+def test_canonical_grantee_id_only_trims_without_a_provider() -> None:
+    """With auth off there is no sign-in to match, so only outer space goes."""
+    from omnigent.server.auth import canonical_grantee_id
+
+    assert canonical_grantee_id(None, " Alice ") == "Alice"
+
+
 # ── resolved_allows / resolved_level (in-memory policy) ──────────────
 
 

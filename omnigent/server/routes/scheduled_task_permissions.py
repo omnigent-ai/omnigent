@@ -32,7 +32,13 @@ from omnigent.entities import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    canonical_grantee_id,
+)
 from omnigent.server.feature_flags import Feature
 from omnigent.server.managed_hosts import is_repo_workspace
 from omnigent.server.scheduled.run_sharing import (
@@ -327,17 +333,21 @@ def _restore_task_grant(
         _logger.exception("automation %s: could not restore %r's grant", task_id, user_id)
 
 
-def _grantee_to_remove(store: PermissionStore, task_id: str, user_id: str) -> str:
+def _grantee_to_remove(
+    store: PermissionStore, task_id: str, user_id: str, auth_provider: AuthProvider | None
+) -> str:
     """The spelling under which the automation holds *user_id*'s grant.
 
     As given when that holds a grant, as a listed ID does, so a store that renames or
-    refuses the principal since can't block the removal. Otherwise the store's
-    canonical form, or as given when the lookup fails.
+    refuses the principal since can't block the removal. Otherwise the canonical form
+    a grant stores, or as given when the lookup fails.
     """
     if store.resolve_scheduled_task_access([user_id], task_id) is not None:
         return user_id
     try:
-        [(grantee, _)] = store.validate_grants([(user_id, LEVEL_READ)])
+        [(grantee, _)] = store.validate_grants(
+            [(canonical_grantee_id(auth_provider, user_id), LEVEL_READ)]
+        )
     except Exception:
         _logger.warning(
             "could not resolve %r to remove it; using it as given", user_id, exc_info=True
@@ -361,11 +371,13 @@ def register_scheduled_task_permissions_routes(
     load_owned_task: Callable[[Request, str], ScheduledTask],
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
+    auth_provider: AuthProvider | None = None,
 ) -> None:
     """Register the automation share routes on the scheduled-tasks *router*.
 
     :param load_owned_task: Returns the caller's live automation, or raises the
         not-found error the other automation routes give.
+    :param auth_provider: Decides how a typed grantee ID is canonicalized.
     """
 
     def require_sharing(request: Request, *, granting: bool) -> PermissionStore:
@@ -504,7 +516,8 @@ def register_scheduled_task_permissions_routes(
         if not store.scheduled_task_shareable(task.id):
             raise OmnigentError(UNSHAREABLE_AUTOMATION_MESSAGE, code=ErrorCode.FORBIDDEN)
         [(grantee, level)] = await asyncio.to_thread(
-            store.validate_grants, [(body.user_id, body.level)]
+            store.validate_grants,
+            [(canonical_grantee_id(auth_provider, body.user_id), body.level)],
         )
         # On the canonical ID, which is how the store names the owner and the public.
         if grantee == (task.user_id or RESERVED_USER_LOCAL):
@@ -568,7 +581,7 @@ def register_scheduled_task_permissions_routes(
 
         :param scheduled_task_id: The automation.
         :param target_user_id: The grantee to remove, e.g. ``"alice@example.com"``, in
-            any spelling :meth:`PermissionStore.validate_grants` resolves.
+            any spelling the grant route accepts.
         :returns: 204 No Content.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
             for an agent or a server that cannot keep automation grants, 500 when the
@@ -579,7 +592,9 @@ def register_scheduled_task_permissions_routes(
         # Audit the requested ID first, in case resolving it fails.
         add_audit_attrs(target_user_id=target_user_id)
         # The stored spelling, so every call below finds the grant the list showed.
-        grantee = await asyncio.to_thread(_grantee_to_remove, store, task.id, target_user_id)
+        grantee = await asyncio.to_thread(
+            _grantee_to_remove, store, task.id, target_user_id, auth_provider
+        )
         add_audit_attrs(target_user_id=grantee)
         # Before their grant is read, so a restore stays pinned to the account that held it
         # and refuses one registered again since.

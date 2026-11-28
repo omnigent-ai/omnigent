@@ -35,6 +35,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     AuthProvider,
+    canonical_grantee_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -146,33 +147,34 @@ def register_permissions_routes(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        if body.user_id == user_id:
+        grantee = canonical_grantee_id(auth_provider, body.user_id)
+        if grantee == user_id:
             raise OmnigentError(
                 "Cannot modify your own permissions",
                 code=ErrorCode.FORBIDDEN,
             )
-        if body.user_id == RESERVED_USER_PUBLIC:
+        if grantee == RESERVED_USER_PUBLIC:
             require_public_grant_allowed(request.app.state, level=body.level)
-        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
-        with target_account_scope(body.user_id, target.account_generation if target else None):
-            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+        target = await asyncio.to_thread(permission_store.get_user, grantee)
+        with target_account_scope(grantee, target.account_generation if target else None):
+            existing = await asyncio.to_thread(permission_store.get, grantee, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
                 raise OmnigentError(
                     "Cannot modify owner permissions",
                     code=ErrorCode.FORBIDDEN,
                 )
-            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
+            await asyncio.to_thread(permission_store.ensure_user, grantee)
             perm = await asyncio.to_thread(
                 permission_store.grant,
-                body.user_id,
+                grantee,
                 session_id,
                 body.level,
                 ensure_minimum=body.ensure_minimum,
             )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
-        _announce_session_added(body.user_id, session_id)
-        add_audit_attrs(target_user_id=body.user_id, level=perm.level)
+        _announce_session_added(grantee, session_id)
+        add_audit_attrs(target_user_id=grantee, level=perm.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -211,19 +213,24 @@ def register_permissions_routes(
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to revoke access from,
             e.g. ``"conv_abc123"``.
-        :param target_user_id: User whose grant to revoke, or the caller's
-            own id to leave, e.g. ``"alice@example.com"``.
+        :param target_user_id: User whose grant to revoke, in any spelling the
+            grant route accepts, or the caller's own id to leave, e.g.
+            ``"alice@example.com"``.
         :returns: 204 No Content.
         :raises OmnigentError: 404 if no session or no access, 403 when the
             target holds the owner grant, 400 when leaving a sub-agent
             session, 401 if unauthenticated.
         """
         user_id = _require_user(request, auth_provider)
-        # Leaving is self-service; revoking someone else is management. Read
-        # access is the floor for the self case — enough to prove the session
-        # exists and is visible to the caller without leaking others' via
-        # 403/404.
+        canonical_id = canonical_grantee_id(auth_provider, target_user_id)
+        # Leaving needs only read access; revoking someone else needs manage. Another
+        # spelling of the caller's ID leaves too, unless that exact ID holds a grant.
         leaving_self = target_user_id == user_id
+        if not leaving_self and canonical_id == user_id and permission_store is not None:
+            exact = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
+            if exact is None:
+                leaving_self = True
+                target_user_id = canonical_id
         await _require_access(
             user_id,
             session_id,
@@ -256,6 +263,10 @@ def register_permissions_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
+        if existing is None and not leaving_self and canonical_id != target_user_id:
+            # A grant stores the canonical ID, so the spelling it was given in removes it too.
+            target_user_id = canonical_id
+            existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
         if existing is not None and existing.level == LEVEL_OWNER:
             raise OmnigentError(
                 "Cannot leave a session you own. Delete or archive it instead."

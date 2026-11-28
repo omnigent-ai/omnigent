@@ -832,6 +832,28 @@ def auth_mode(provider: AuthProvider | None) -> str:
     return "custom"
 
 
+def canonical_grantee_id(provider: AuthProvider | None, user_id: str) -> str:
+    """Return the ID a typed grantee signs in as, so a share reaches them.
+
+    OIDC and accounts sign-in lowercase identities, so ``Alice@Example.com``
+    must be granted as ``alice@example.com``. The machine client authenticates
+    as its configured subject exactly, so that ID keeps its case, as IDs do in
+    other modes.
+
+    :param provider: The app's auth provider, or ``None`` when auth is off.
+    :param user_id: The grantee as typed, e.g. ``" Alice@Example.com"``.
+    :returns: The trimmed ID, lowercased in ``oidc`` and ``accounts`` modes
+        unless it is the machine client's subject.
+    """
+    # Imported here because client_credentials imports this module.
+    from omnigent.server.routes.client_credentials import configured_machine_sub
+
+    trimmed = user_id.strip()
+    if auth_mode(provider) in ("oidc", "accounts") and trimmed != configured_machine_sub():
+        return trimmed.lower()
+    return trimmed
+
+
 class AccountAuthorityMiddleware:
     """Select account checks from the app's provider for every ASGI scope.
 

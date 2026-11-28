@@ -23813,7 +23813,7 @@
             }
           },
           {
-            "description": "The grantee to remove, e.g. `\"alice@example.com\"`, in any spelling `PermissionStore.validate_grants` resolves.",
+            "description": "The grantee to remove, e.g. `\"alice@example.com\"`, in any spelling the grant route accepts.",
             "in": "path",
             "name": "target_user_id",
             "required": true,
@@ -26861,7 +26861,7 @@
             }
           },
           {
-            "description": "User whose grant to revoke, or the caller's own id to leave, e.g. `\"alice@example.com\"`.",
+            "description": "User whose grant to revoke, in any spelling the grant route accepts, or the caller's own id to leave, e.g. `\"alice@example.com\"`.",
             "in": "path",
             "name": "target_user_id",
             "required": true,

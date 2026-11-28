@@ -622,6 +622,27 @@ async def test_read_grant_allows_get_but_blocks_post_events(
     )
 
 
+async def test_header_mode_grant_keeps_the_grantee_case(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The proxy's identity is used as-is, so a grant drops outer space but keeps its case."""
+    session_id = (await _create_session_as(auth_client, "", "owner@example.com"))["id"]
+    resp = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="owner@example.com",
+        target_user="  Bob@Example.com ",
+        level=LEVEL_READ,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["user_id"] == "Bob@Example.com"
+    for identity, status in (("Bob@Example.com", 200), ("bob@example.com", 404)):
+        resp = await auth_client.get(
+            f"/v1/sessions/{session_id}", headers={"X-Forwarded-Email": identity}
+        )
+        assert resp.status_code == status, (identity, resp.text)
+
+
 async def test_edit_grant_blocked_from_stop_session_requires_owner(
     auth_client: httpx.AsyncClient,
 ) -> None:
