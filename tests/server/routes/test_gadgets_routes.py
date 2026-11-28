@@ -1021,9 +1021,14 @@ async def test_template_routes_are_off_where_gadgets_cant_be_shared(
 ) -> None:
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
-    unshared = SimpleNamespace(
-        **{**vars(stores), "permissions": SqlAlchemyPermissionStore(stores.db_uri)}
-    )
+    class NoGadgetGrants(SqlAlchemyPermissionStore):
+        """A permission store that keeps no gadget grants, as a deployment's own may not."""
+
+        @property
+        def supports_gadget_grants(self) -> bool:
+            return False
+
+    unshared = SimpleNamespace(**{**vars(stores), "permissions": NoGadgetGrants(stores.db_uri)})
     async for client in _client(_app(unshared, tmp_path)):
         info = (await client.get("/v1/info")).json()
         assert info["gadget_sharing"] is False and info["gadget_templates"] is False
