@@ -20695,6 +20695,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const openedAt = route.log.indexOf("open:none");
       expect(openedAt).toBeGreaterThan(route.log.indexOf(`open:${host}`));
       expect(route.log.indexOf(`snapshot:${id}:keyless`)).toBeGreaterThan(openedAt);
+      expect(route.opens.map((open) => [open.headers.get(SLICE_KEY), open.aborted])).toEqual([
+        [null, false],
+      ]);
       clearHostKeyless(host);
       setSessionHost(id, null);
     });
