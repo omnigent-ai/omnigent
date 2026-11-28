@@ -4,6 +4,7 @@ import type * as IdentityModule from "@/lib/identity";
 import { ApiError } from "@/lib/sessionsApi";
 
 import {
+  createGadgetRevision,
   GadgetApiError,
   getGadget,
   getGadgetShelf,
@@ -207,5 +208,27 @@ describe("gadget API", () => {
       .mockResolvedValueOnce(json({ items: [], next_cursor: "loop", can_comment: true }))
       .mockResolvedValueOnce(json({ items: [], next_cursor: "loop", can_comment: true }));
     await expect(listGadgetComments("app-1")).rejects.toThrow();
+  });
+});
+
+describe("per-viewer collections", () => {
+  const revision = {
+    html: "<main>Course</main>",
+    sdk_version: 1 as const,
+    capabilities: ["data.read" as const, "data.write" as const],
+    collections: { progress: {} },
+    collection_scopes: { progress: "viewer" as const },
+  };
+
+  it("keeps a revision whose server named its viewer collections", async () => {
+    fetchMock.mockResolvedValueOnce(json({ id: "rev", collection_scopes: { progress: "viewer" } }));
+    await expect(createGadgetRevision("board", revision)).resolves.toEqual({ id: "rev" });
+  });
+
+  it("refuses a revision an older server stored with every collection shared", async () => {
+    fetchMock.mockResolvedValueOnce(json({ id: "rev" }));
+    await expect(createGadgetRevision("board", revision)).rejects.toThrow(
+      "doesn’t support per-viewer collections",
+    );
   });
 });

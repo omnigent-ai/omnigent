@@ -374,6 +374,13 @@ async def test_invalid_arguments_never_reach_the_server() -> None:
             ("sys_gadget_comment_update", {"gadget_id": "a" * 32, "status": "addressed"}),
             ("sys_gadget_records", {"gadget_id": "a" * 32, "op": ["list"]}),
             ("sys_gadget_records", {"gadget_id": "a" * 32, "op": {"list": 1}}),
+            *(
+                (
+                    "sys_gadget_revision_create",
+                    {"gadget_id": "a" * 32, "html": "<main/>", "collection_scopes": scopes},
+                )
+                for scopes in ("viewer", ["cards"], {"cards": ["viewer"]}, {"cards": 1})
+            ),
         ):
             assert "invalid_input" in (await _call(client, tool, **args))["error"]
         malformed = await execute_gadget_tool(
@@ -544,3 +551,46 @@ async def test_the_runner_passes_each_calls_output_item_id_to_the_gadget_tools(
         invocation_id=tool_dispatch.get_item_id(event),
     )
     assert seen == [("call_same", "fc_0a1b2c")]
+
+
+@pytest.mark.asyncio
+async def test_viewer_scopes_round_trip_and_an_older_server_that_drops_them_is_refused(
+    server: httpx.AsyncClient,
+) -> None:
+    from omnigent.tools.builtins.gadgets import SysGadgetRevisionCreateTool
+
+    args = {
+        "html": "<main>Course</main>",
+        "sdk_version": 1,
+        "capabilities": ["data.read", "data.write"],
+        "collections": _CARDS,
+        "collection_scopes": {"cards": "viewer"},
+    }
+    gadget_id = (await _call(server, "sys_gadget_create", name="Course"))["id"]
+    jsonschema.validate(
+        {"gadget_id": gadget_id, **args},
+        SysGadgetRevisionCreateTool().get_schema()["function"]["parameters"],
+    )
+    created = await _call(server, "sys_gadget_revision_create", gadget_id=gadget_id, **args)
+    assert created["collection_scopes"] == {"cards": "viewer"}
+    source = await _call(
+        server, "sys_gadget_revision_get", gadget_id=gadget_id, revision_id=created["id"]
+    )
+    assert source["collection_scopes"] == {"cards": "viewer"}
+
+    # A server from before per-viewer collections answers with the ID alone.
+    def older(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={"id": "0" * 32})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(older), base_url="http://server.example.test"
+    ) as old:
+        refused = await _call(old, "sys_gadget_revision_create", gadget_id=gadget_id, **args)
+        shared = await _call(
+            old,
+            "sys_gadget_revision_create",
+            gadget_id=gadget_id,
+            **{key: value for key, value in args.items() if key != "collection_scopes"},
+        )
+    assert "doesn't support per-viewer collections" in json.dumps(refused)
+    assert shared == {"id": "0" * 32}

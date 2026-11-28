@@ -463,6 +463,19 @@ def create_gadgets_router(
             return _json(await run(request, lambda service: service.discard_unbuilt(app_id)))
         return _json(await run(request, lambda service: service.delete(app_id)))
 
+    @router.post(
+        "/gadgets/{app_id}/copy",
+        status_code=201,
+        openapi_extra=_json_body({"name": _STRING, "include_data": {"type": "boolean"}}, []),
+    )
+    async def copy_gadget(app_id: str, request: Request) -> Response:
+        """Make a copy the caller owns of a published gadget they can read, from
+        ``{"name"?, "include_data"?}``: its published code and, with ``include_data``, its
+        records. Answers the copy with 201."""
+        body = await _body(request)
+        result = await run(request, lambda service: service.copy(app_id, body))
+        return _json(result, 201)
+
     @router.get("/gadgets/{app_id}/session/status")
     async def gadget_session_status(app_id: str, request: Request) -> Response:
         """Whether the caller's gadget session and the sessions it started are working."""

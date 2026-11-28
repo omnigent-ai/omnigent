@@ -45,6 +45,8 @@ export interface GadgetContent {
    * (never a login or email). Older servers omit it.
    */
   viewer?: { id: string; display_name: string | null };
+  /** Collections where each viewer keeps their own records; older servers omit it. */
+  collection_scopes?: Record<string, "viewer">;
 }
 
 /** A rule across records that the server checks on every write (see `gadgets_constraints.py`). */
@@ -72,6 +74,8 @@ export interface CreateGadgetRevisionRequest {
   sdk_version: 1;
   capabilities: GadgetCapability[];
   collections: Record<string, Record<string, unknown>>;
+  /** Collections where each viewer keeps their own records; the others are shared. */
+  collection_scopes?: Record<string, "shared" | "viewer">;
   /** Markdown for agents: what the collections mean, conventions and common tasks. */
   guide?: string;
   constraints?: GadgetConstraint[];
@@ -253,6 +257,15 @@ function parseContent(value: unknown): GadgetContent {
           },
         }
       : {}),
+    ...(isRecord(value.collection_scopes)
+      ? {
+          collection_scopes: Object.fromEntries(
+            Object.entries(value.collection_scopes)
+              .filter(([, scope]) => scope === "viewer")
+              .map(([name]) => [name, "viewer" as const]),
+          ),
+        }
+      : {}),
   };
 }
 
@@ -345,6 +358,25 @@ export async function createGadget(name: string): Promise<Gadget> {
   );
 }
 
+/**
+ * Makes a copy the viewer owns of a published gadget they can read: its published code and,
+ * with `includeData`, its records. The copy keeps no link to the source. Resolves the copy.
+ */
+export async function copyGadget(
+  appId: string,
+  options: { name?: string; includeData: boolean },
+): Promise<Gadget> {
+  return parseGadget(
+    await gadgetRequest(`${appPath(appId)}/copy`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...(options.name !== undefined ? { name: options.name } : {}),
+        include_data: options.includeData,
+      }),
+    }),
+  );
+}
+
 /** Deletes the gadget, with its data and versions, for everyone. Needs manage access. */
 export async function deleteGadget(appId: string): Promise<void> {
   await gadgetRequest(appPath(appId), { method: "DELETE" });
@@ -370,6 +402,22 @@ export async function createGadgetRevision(
   });
   if (!isRecord(body) || typeof body.id !== "string") {
     throw malformed("revision");
+  }
+  // A server from before per-viewer collections drops the scopes and keeps every collection
+  // shared; it answers without naming them, and such a revision must not be published.
+  const wanted = Object.entries(revision.collection_scopes ?? {}).filter(
+    ([, scope]) => scope === "viewer",
+  );
+  if (wanted.length > 0) {
+    const kept = isRecord(body.collection_scopes) ? body.collection_scopes : {};
+    const keptAll =
+      Object.keys(kept).length === wanted.length &&
+      wanted.every(([name]) => kept[name] === "viewer");
+    if (!keptAll) {
+      throw new Error(
+        "This server doesn’t support per-viewer collections, so this version keeps every collection shared.",
+      );
+    }
   }
   return { id: body.id };
 }

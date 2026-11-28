@@ -240,13 +240,49 @@ async def _run(
         return await server.call("GET", f"{path}/revisions/{_segment(revision, 'revision_id')}")
     if tool_name == "sys_gadget_revision_create":
         body = {key: value for key, value in args.items() if key != "gadget_id"}
-        return await server.call("POST", f"{path}/revisions", body=body)
+        scopes = body.get("collection_scopes")
+        # Checked before anything is saved: an older server would store the revision and
+        # leave nothing to check its answer against.
+        if scopes is not None and (
+            not isinstance(scopes, dict)
+            or any(
+                not isinstance(name, str) or not isinstance(v, str) for name, v in scopes.items()
+            )
+        ):
+            raise _ToolError(
+                "invalid_input: collection_scopes must map collection names to shared or viewer"
+            )
+        created = await server.call("POST", f"{path}/revisions", body=body)
+        return _check_scopes_kept(body, created)
     if tool_name == "sys_gadget_publish":
         body = {"revision_id": args.get("revision_id"), "if_version": args.get("if_version")}
         return await server.call("POST", f"{path}/publish", body=body)
     if tool_name == "sys_gadget_records":
         return await _record(server, args, gadget_id, invocation)
     raise _ToolError(f"unknown gadget tool {tool_name}")
+
+
+def _check_scopes_kept(body: dict, created: Any) -> Any:
+    """Refuse a revision whose viewer collections the server didn't keep.
+
+    A server from before per-viewer collections ignores ``collection_scopes`` and stores
+    the revision with every collection shared; publishing it would put records meant to be
+    private where every viewer reads them. Such a server answers without naming the scopes.
+    """
+    wanted = {
+        name: scope
+        for name, scope in (body.get("collection_scopes") or {}).items()
+        if scope == "viewer"
+    }
+    if not wanted or not isinstance(created, dict) or "error" in created:
+        return created
+    if created.get("collection_scopes") != wanted:
+        raise _ToolError(
+            "this Omnigent server doesn't support per-viewer collections; the revision "
+            f"{created.get('id')} keeps every collection shared, so don't publish it. "
+            "Leave collection_scopes out, or use a newer server"
+        )
+    return created
 
 
 async def execute_gadget_tool(

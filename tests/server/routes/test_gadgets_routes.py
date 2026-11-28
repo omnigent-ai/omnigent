@@ -198,6 +198,7 @@ async def test_requests_need_an_identity_and_a_json_body(
     info = (await client.get("/v1/info", headers=_as(ALICE))).json()
     assert info["features"]["gadgets"] is True
     assert info["gadgets"] is True and info["gadget_sharing"] is True
+    assert info["gadget_copy"] is True
 
 
 def _own_session(stores: SimpleNamespace, owner: str = ALICE) -> str:
@@ -964,3 +965,27 @@ def test_the_published_api_states_the_statuses_and_nullable_fields_the_routes_us
     fields = update["requestBody"]["content"]["application/json"]["schema"]["properties"]
     assert fields["summary"]["type"] == ["string", "null"]
     assert fields["session_id"]["type"] == ["string", "null"]
+
+
+async def test_a_viewer_copies_a_shared_gadget_with_its_data(client: httpx.AsyncClient) -> None:
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    created = await client.post(
+        f"{base}/rpc",
+        json=_rpc(gadget, "create", id="t1", value={"title": "Shared"}, operation_id="a1"),
+        headers=_as(ALICE),
+    )
+    assert created.status_code == 200, created.text
+    assert (await client.post(f"{base}/copy", json={}, headers=_as(BOB))).status_code == 404
+    await client.put(f"{base}/permissions", json={"user_id": BOB, "level": 1}, headers=_as(ALICE))
+
+    copied = await client.post(f"{base}/copy", json={"include_data": True}, headers=_as(BOB))
+
+    assert copied.status_code == 201, copied.text
+    copy = copied.json()
+    assert copy["owner_id"] == BOB and copy["permissions"]["manage"] is True
+    listed = await client.post(
+        f"/v1/gadgets/{copy['id']}/rpc", json=_rpc(copy, "list"), headers=_as(BOB)
+    )
+    assert [item["value"] for item in listed.json()["result"]["items"]] == [{"title": "Shared"}]
+    assert (await client.get(f"/v1/gadgets/{copy['id']}", headers=_as(ALICE))).status_code == 404

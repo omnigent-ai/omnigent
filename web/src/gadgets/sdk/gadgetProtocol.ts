@@ -196,7 +196,11 @@ export interface GadgetInitContext {
   viewer: { id: string; displayName: string | null };
   /** Capabilities granted to this viewer for this revision. */
   capabilities: GadgetCapability[];
-  permissions: { writeData: boolean; publish: boolean };
+  /**
+   * `writeData` changes shared records; `writeOwnData` changes the viewer's own records of
+   * per-viewer collections, which Can view is enough for. Older hosts omit `writeOwnData`.
+   */
+  permissions: { writeData: boolean; writeOwnData?: boolean; publish: boolean };
   colorScheme: "light" | "dark";
   /** A template preview: data lives in memory and actions are off. Older hosts omit it. */
   preview?: boolean;

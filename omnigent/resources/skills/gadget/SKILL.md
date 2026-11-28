@@ -134,6 +134,13 @@ real data unless the person gives it to you.
   and combinators such as `oneOf` are refused; leave them out and keep the
   other checks. A published collection's schema cannot change: add a new
   collection instead.
+- `collection_scopes` (optional): `{name: "viewer"}` for collections where each
+  person keeps their own records (progress, notes, settings); others are
+  `"shared"`, one set everyone reads. Anyone who can view the gadget writes their
+  own viewer records, and no one else, the owner included, reads them; the page
+  and the SDK use them like any collection. A scope can't change once published.
+  Rules apply within one viewer's records, and a `reference` must stay within
+  one scope. Your own `sys_gadget_records` calls reach only your viewer records.
 - `constraints`: rules across records, each with a `name`, a `kind` and an
   optional `message` shown when a write breaks it:
   - `max_records`: `collection`, `max`, optional `where` (`{field: value}`).
@@ -188,7 +195,9 @@ And:
 - Put `data-omnigent-ref` (for example `cards/c1`) and `data-omnigent-label`
   on each record's element, so a selection or comment names the exact record.
 - Others may see the gadget read-only. Put `data-omnigent-requires="write"` on
-  every control that changes records and `data-omnigent-requires="action"` on
+  every control that changes shared records, `data-omnigent-requires="own-write"`
+  on one that changes only the viewer's own records of a viewer collection
+  (anyone who can view the gadget may), and `data-omnigent-requires="action"` on
   every control that requests an action; the SDK disables them for people
   without that access and shows why.
 

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { toast } from "sonner";
 
-import { getGadgetShelf, pinGadget, renameGadget } from "@/gadgets/api/gadgetApi";
+import { copyGadget, getGadgetShelf, pinGadget, renameGadget } from "@/gadgets/api/gadgetApi";
 import { copyText } from "@/lib/clipboard";
 import { GadgetActions, GadgetName, GadgetPinButton } from "./GadgetToolbar";
 import { GADGETS_INFO, renderWithGadgets, gadgetFixture } from "./testUtils";
@@ -11,6 +11,7 @@ import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
 
 vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetApiModule>()),
+  copyGadget: vi.fn(),
   getGadgetShelf: vi.fn(),
   pinGadget: vi.fn(),
   renameGadget: vi.fn(),
@@ -173,5 +174,80 @@ describe("Share and the ⋯ menu", () => {
     openMenu();
     expect(await screen.findByRole("menuitem", { name: "Delete gadget" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
+  });
+});
+
+describe("Make a copy", () => {
+  function openMenu() {
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More gadget actions" }), {
+      button: 0,
+    });
+  }
+
+  it("lets a viewer copy a published gadget, with its data if they ask", async () => {
+    vi.mocked(copyGadget).mockResolvedValue(
+      gadgetFixture({ id: "copy", name: "Copy of Launch board" }),
+    );
+    renderWithGadgets(<GadgetActions gadget={VIEW_ONLY} onDeleted={vi.fn()} shareInMenu={false} />);
+
+    openMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Make a copy" }));
+    const dialog = await screen.findByRole("dialog", { name: "Make a copy" });
+    expect(within(dialog).getByRole("textbox", { name: "Name" })).toHaveValue(
+      "Copy of Launch board",
+    );
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: "Copy its data too" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Make a copy" }));
+
+    await waitFor(() =>
+      expect(copyGadget).toHaveBeenCalledWith("board", {
+        name: "Copy of Launch board",
+        includeData: true,
+      }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.getByRole("status", { name: "location" })).toHaveTextContent("/gadget/copy");
+  });
+
+  it("keeps the dialog open with the error when the copy fails", async () => {
+    vi.mocked(copyGadget).mockRejectedValue(new Error("Too many records to copy."));
+    renderWithGadgets(<GadgetActions gadget={VIEW_ONLY} onDeleted={vi.fn()} shareInMenu={false} />);
+
+    openMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Make a copy" }));
+    const dialog = await screen.findByRole("dialog", { name: "Make a copy" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Make a copy" }));
+
+    expect(await within(dialog).findByText(/Too many records to copy/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Make a copy" })).toBeEnabled();
+    // Still where it was: the modal dialog hides the rest of the page from queries.
+    expect(screen.getByRole("status", { name: "location", hidden: true })).toHaveTextContent(
+      /^\/$/,
+    );
+  });
+
+  it("isn't offered by a server that can't make copies", async () => {
+    renderWithGadgets(
+      <GadgetActions gadget={VIEW_ONLY} onDeleted={vi.fn()} shareInMenu={false} />,
+      { info: { ...GADGETS_INFO, gadget_copy: undefined } },
+    );
+
+    openMenu();
+    expect(await screen.findByRole("menuitem", { name: "Gadget details" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Make a copy" })).toBeNull();
+  });
+
+  it("isn't offered before the gadget is published", async () => {
+    renderWithGadgets(
+      <GadgetActions
+        gadget={{ ...VIEW_ONLY, published_revision: null }}
+        onDeleted={vi.fn()}
+        shareInMenu={false}
+      />,
+    );
+
+    openMenu();
+    expect(await screen.findByRole("menuitem", { name: "Gadget details" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Make a copy" })).toBeNull();
   });
 });

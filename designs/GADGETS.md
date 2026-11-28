@@ -105,11 +105,29 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
 
 The server's relational stores keep what the rest of the server queries across users: the
 grants that share gadgets belong in the `PermissionStore`, like session and workflow shares.
-The bundled SQL store doesn't keep them yet (its table comes in a follow-up), so it reports
-`supports_gadget_grants` false: the server advertises `gadget_sharing: false`, the web UI
-hides Share and the Shared list, and the share routes answer `FORBIDDEN` ("Sharing gadgets is
-not supported by this server"). A `PermissionStore` or `GadgetAccess` that keeps grants
-elsewhere, such as one backed by folder permissions, still shares through the same routes. Moving the documents to SQL would be worth it if gadgets needed queries
+The bundled SQL store doesn't keep them yet (its `gadget_shares` table and grant code come in
+a follow-up), so it reports `supports_gadget_grants` false: the server advertises
+`gadget_sharing: false`, the web UI hides Share and the Shared list, and the share routes
+answer `FORBIDDEN`. A `PermissionStore` or `GadgetAccess` that keeps grants elsewhere, such as
+one backed by folder permissions, shares through the same routes. A grant names a username,
+not one registration of it, so a store that keeps grants removes an account's grants when it
+is deleted and refuses to register the username again while any remain.
+
+That cleanup and refusal are what keep a username registered again from inheriting grants, so
+with a store that keeps grants, every server process that can delete or register accounts must
+run a release that has them before gadget sharing is used. **Deployment order:** upgrade every
+replica, then enable the `gadgets` feature; on a server that already has it on, finish the
+rolling upgrade before anyone shares a gadget. A replica of an older release can delete and
+register the same username again without removing its grants, and the new account then holds
+them; a later cleanup does not take them back once that account is live. **Rollback floor:**
+once a grant has been saved, don't run a release older than this one against that store.
+Turning the feature off is not enough, as it leaves the grants in place and that release's
+account deletion and registration would still let a new account inherit them; going further
+back needs the grants removed first, which drops every share. Binding grants to a registration
+instead (a column on `gadget_shares`) would remove the ordering requirement; it is not done
+because group grants have no registration to bind to.
+
+Moving the documents to SQL would be worth it if gadgets needed queries
 across gadgets or users (search over records, reporting), or transactions across records;
 both are out of scope below.
 
@@ -236,6 +254,82 @@ params, which the session treats as a request to consider, not as instructions. 
 the composer is hidden) the Create session menu shows the whole message and the gadget it came
 from, with focus on the menu rather than on Create session, so creating the session is never
 the first sight of what it sends.
+
+## Shared and per-viewer data
+
+Some gadgets are for collaborating on one set of data; others are apps each person runs on
+their own data, and many mix the two (a shared catalog with each viewer's progress). Both are
+supported in one gadget, plus a copy for people who want their own code.
+
+### Collection scope
+
+A revision declares which collections are per viewer, beside their schemas:
+
+```json
+"collections": {"catalog": {...}, "progress": {...}},
+"collection_scopes": {"progress": "viewer"}
+```
+
+- `shared` (the default, for any collection not named) is one set of records that everyone
+  the gadget is shared with reads, and Can edit or above writes.
+- `viewer` gives each viewer their own records in that collection. No one else reads them, the
+  owner and managers included.
+
+Rules:
+
+- **Access.** Can view is enough to read and write one's own `viewer` records, so a gadget can
+  be handed out as an app without letting its users change shared data or code. Shared
+  collections keep the levels in [Permissions](#permissions). The page a read-only viewer
+  loads keeps `data.write` when the revision has a `viewer` collection; writes to shared
+  collections are still refused.
+- **References** stay within one scope: a `viewer` collection references only `viewer`
+  collections (one viewer's records), and a `shared` one only `shared` ones. A revision with a
+  `reference` across scopes is refused. A viewer record naming a shared record by ID is
+  allowed as plain data, without a rule: a reference rule from viewer data to shared data
+  would need a shared delete to reach every viewer's records.
+- **Unique and limit rules** on a `viewer` collection apply within one viewer's records.
+- **Actions** run in the clicker's gadget session and see the clicker's `viewer` records plus
+  the shared ones. Gadget code and the SDK address a collection by name either way; the server
+  picks the viewer's records from the scope. The opaque per-gadget viewer ID is unchanged.
+- **Older releases fail closed.** A stored revision keeps viewer collections' schemas apart,
+  in `viewer_collections`, and `collections` holds only the shared ones, which is all a
+  release from before per-viewer collections reads, and its capabilities carry a marker such
+  a release doesn't know. So it refuses to load, serve or publish the revision at all, and
+  can never read or write a viewer collection as shared, or publish one with only its shared
+  collections' identities. During a rolling
+  upgrade or after a rollback, gadgets with viewer collections stop working on older
+  replicas instead of mixing private records into shared data.
+- **Changing a collection's scope** is refused at publish, like changing its schema (the
+  collection's published identity covers both): data is not moved between scopes, so a
+  publisher who needs it uses a new collection name.
+
+### Where `viewer` data lives
+
+In the viewer's own storage, not the gadget's: the viewer's `GadgetStore.user_files` scope,
+beside their shelf (in the bundled store,
+`<data_dir>/gadgets/users/<viewer key>/viewer-data/<gadget id>/`, where the key covers the
+viewer's registration); on a store backed by folder permissions, the viewer's own folder. So
+the gadget's owner cannot read it even with direct access to the gadget's storage, it counts
+against the viewer, and losing access to the gadget hides it rather than deleting it: sharing
+the gadget again shows it again. Deleting the gadget leaves it unreachable. Deleting the
+viewer's account removes it with the rest of their files, and identity migration refuses a
+user who has any, as it does one with a shelf.
+
+### Make a copy
+
+Anyone who can read a published gadget can make a copy (`POST /v1/gadgets/{id}/copy`): a new
+gadget they own with the source's published revision, published again in the copy, and, if
+they choose (`include_data`), the records of its collections with their IDs, written before
+the copy's rules are published so they count as existing data. Comments, grants, the action
+ledger and gadget sessions stay with the source, and `viewer` data is never copied, the
+copier's own included: the copy starts with none. One copy holds at most
+`MAX_COPIED_RECORDS` (2,000) records; more is refused before anything is created, and a copy
+that fails half-way is deleted. The copy keeps no link to its source; updating a copy from
+its source is a later addition.
+
+A copy is for changing the code, sharing it with one's own group, or keeping a gadget its
+owner may delete. For using an app on one's own data, `viewer` collections are preferable:
+the publisher's fixes reach every user, and no one is left on an outdated copy.
 
 ## Not in scope
 

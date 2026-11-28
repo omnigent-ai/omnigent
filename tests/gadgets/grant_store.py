@@ -1,7 +1,9 @@
 """A permission store that keeps gadget grants in memory, for tests of gadget sharing.
 
 The SQL store keeps no gadget grants yet, so sharing is exercised against this one; the
-rest of the store (accounts, groups, sessions) is the real SQL store.
+rest of the store (accounts, groups, sessions) is the real SQL store. Its grants are keyed by
+username and forgotten between tests; it does not model removing them when an account is
+deleted, which a store that keeps grants must do (see ``PermissionStore``).
 """
 
 from __future__ import annotations

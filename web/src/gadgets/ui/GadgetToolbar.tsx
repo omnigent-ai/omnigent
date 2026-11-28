@@ -1,5 +1,6 @@
 // A gadget's controls in its side panel tab: its inline-editable name, Pin, Comments, Share and a
-// ⋯ menu with Gadget details and Delete. In full screen they move into the panel's top bar.
+// ⋯ menu with Gadget details, Make a copy and Delete. In full screen they move into the panel's
+// top bar.
 import { type KeyboardEvent, type RefObject, useEffect, useRef, useState } from "react";
 import {
   CheckIcon,
@@ -31,10 +32,11 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { copyText } from "@/lib/clipboard";
-import { gadgetSharingAvailable } from "@/lib/permissionsApi";
+import { gadgetCopyAvailable, gadgetSharingAvailable } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import type { Gadget, GadgetContent } from "@/gadgets/api/gadgetApi";
+import { CopyGadgetDialog } from "./CopyGadgetDialog";
 import { DeleteGadgetDialog } from "./DeleteGadgetDialog";
 import { MAX_GADGET_NAME_LENGTH } from "./GadgetTemplateGallery";
 import { gadgetErrorMessage, gadgetLink } from "./gadgetNavigation";
@@ -330,7 +332,7 @@ function GadgetDetailsDialog({
   );
 }
 
-/** Share and the ⋯ menu (Share where there's little room, Gadget details, Delete gadget). */
+/** Share and the ⋯ menu (Share where there's little room, Gadget details, Make a copy, Delete). */
 export function GadgetActions({
   gadget,
   content,
@@ -348,6 +350,7 @@ export function GadgetActions({
   const [shareOpen, setShareOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [copying, setCopying] = useState(false);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const canShare = gadget.permissions.manage && gadgetSharingAvailable(info);
   return (
@@ -388,6 +391,9 @@ export function GadgetActions({
             </DropdownMenuItem>
           )}
           <DropdownMenuItem onSelect={() => setDetailsOpen(true)}>Gadget details</DropdownMenuItem>
+          {gadget.published_revision !== null && gadgetCopyAvailable(info) && (
+            <DropdownMenuItem onSelect={() => setCopying(true)}>Make a copy</DropdownMenuItem>
+          )}
           {gadget.permissions.manage && (
             <>
               <DropdownMenuSeparator />
@@ -408,6 +414,13 @@ export function GadgetActions({
         onOpenChange={setDetailsOpen}
         onCloseAutoFocus={focusTrigger(menuTriggerRef)}
       />
+      {copying && (
+        <CopyGadgetDialog
+          gadget={gadget}
+          onClose={() => setCopying(false)}
+          onCloseAutoFocus={focusTrigger(menuTriggerRef)}
+        />
+      )}
       {deleting && (
         <DeleteGadgetDialog
           gadget={gadget}
