@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -371,3 +372,203 @@ def test_a_checkout_with_no_single_github_host_runs_nothing_but_the_sign_in_list
         github_resource._gh(["auth", "status", "--json", "hosts"], cwd=root)
 
     assert started == [["gh", "auth", "status", "--json", "hosts"]]
+
+
+TOKENS = {
+    "GH_TOKEN": "dummy-gh-token",
+    "GITHUB_TOKEN": "dummy-github-token",
+    "GH_ENTERPRISE_TOKEN": "dummy-enterprise-token",
+    "GITHUB_ENTERPRISE_TOKEN": "dummy-github-enterprise-token",
+}
+STORED = "stored.example.com"
+
+
+@pytest.fixture
+def environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Every token variable, GH_REPO and the debug settings set; one host with a stored login."""
+    for name, value in {**TOKENS, "GH_REPO": "o/r", "GH_DEBUG": "api", "DEBUG": "1"}.items():
+        monkeypatch.setenv(name, value)
+    for name in ("GH_HOST", "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    config = tmp_path / "gh"
+    config.mkdir()
+    (config / "hosts.yml").write_text(f"{STORED}:\n    user: octo\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    return config
+
+
+def _passed_tokens(scope: str, argv: list[str], token: str | None = None) -> set[str]:
+    invocation = github_resource._gh_invocation(argv, token=token, host=scope, cwd="/workspace")
+    env = invocation.env if invocation.env is not None else dict(os.environ)
+    assert not {"GH_REPO", "GH_DEBUG", "DEBUG"} & set(env)
+    return {name for name in TOKENS if name in env}
+
+
+@pytest.mark.parametrize(
+    ("set_up", "destination", "passed"),
+    [
+        ({}, "github.com", {"GH_TOKEN", "GITHUB_TOKEN"}),
+        # The enterprise token goes to GH_HOST or a configured host, never GH_TOKEN.
+        (
+            {"OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS": KNOWN},
+            KNOWN,
+            {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"},
+        ),
+        ({"GH_HOST": KNOWN}, KNOWN, {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}),
+        # A host with only a stored login uses it, not another host's environment token.
+        ({}, STORED, set()),
+        ({"GH_HOST": KNOWN}, STORED, set()),
+        # gh sends GH_TOKEN to GHE.com and github.com's subdomains: only GH_HOST's GHE.com gets it.
+        ({"GH_HOST": "tenant.ghe.com"}, "tenant.ghe.com", {"GH_TOKEN", "GITHUB_TOKEN"}),
+        ({"OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS": "tenant.ghe.com"}, "tenant.ghe.com", set()),
+        ({"OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS": "api.github.com"}, "api.github.com", set()),
+        ({"OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS": "x.github.com"}, "x.github.com", set()),
+        ({"OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS": "github.localhost"}, "github.localhost", set()),
+        ({"GH_HOST": "github.localhost"}, "github.localhost", set()),
+    ],
+)
+def test_each_environment_token_reaches_only_the_host_its_for(
+    environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    set_up: dict[str, str],
+    destination: str,
+    passed: set[str],
+) -> None:
+    for name, value in set_up.items():
+        monkeypatch.setenv(name, value)
+
+    assert _passed_tokens(destination, ["api", "--hostname", destination, "x"]) == passed
+
+
+def test_a_call_naming_no_host_gets_the_tokens_of_where_it_goes(
+    environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _passed_tokens("github.com", ["api", "user"]) == {"GH_TOKEN", "GITHUB_TOKEN"}
+    assert _passed_tokens(STORED, ["auth", "status", "--json", "hosts"]) == {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    }
+    monkeypatch.setenv("GH_HOST", KNOWN)
+    enterprise = {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+    assert _passed_tokens(KNOWN, ["api", "user"]) == enterprise
+    assert _passed_tokens(KNOWN, ["auth", "status"]) == enterprise
+
+
+def test_a_sandbox_passes_no_environment_token_and_a_chosen_one_replaces_them(
+    environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv = ["api", "--hostname", STORED, "x"]
+    invocation = github_resource._gh_invocation(argv, token="chosen", host=STORED)
+    assert invocation.env is not None
+    assert {name: invocation.env.get(name) for name in TOKENS} == {
+        "GH_TOKEN": "chosen",
+        "GITHUB_TOKEN": None,
+        "GH_ENTERPRISE_TOKEN": "chosen",
+        "GITHUB_ENTERPRISE_TOKEN": None,
+    }
+
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: True)
+    assert _passed_tokens("github.com", ["api", "--hostname", "github.com", "x"]) == set()
+
+
+def test_a_stored_logins_token_is_read_without_the_environments_enterprise_token(
+    environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise gh would answer with the environment's token for another host's login."""
+    envs: list[dict[str, str] | None] = []
+
+    def run(argv: list[str], *, env: dict[str, str] | None = None, **_kwargs: object):
+        envs.append(env)
+        return 0, "stored-token", ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+
+    assert github_resource._gh_active_token("/workspace", STORED) == "stored-token"
+    assert envs[0] is not None
+    assert not set(TOKENS) & set(envs[0])
+
+
+def test_an_environment_with_nothing_to_remove_is_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (*TOKENS, "GH_REPO", "GH_DEBUG", "DEBUG"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+
+    invocation = github_resource._gh_invocation(
+        ["api", "--hostname", "github.com", "x"], token=None, host="github.com"
+    )
+
+    assert invocation.env is None
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("GH_CONFIG_DIR", "{root}/explicit"),
+        ("XDG_CONFIG_HOME", "{root}/xdg"),
+    ],
+)
+def test_a_stored_login_is_read_from_where_gh_keeps_hosts_yml(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, variable: str, value: str
+) -> None:
+    """GH_CONFIG_DIR, else XDG_CONFIG_HOME/gh, else ~/.config/gh, as gh itself reads it."""
+    for name in (
+        "GH_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "GH_HOST",
+        "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    directory = Path(value.format(root=tmp_path))
+    hosts = (
+        directory / "hosts.yml" if variable == "GH_CONFIG_DIR" else directory / "gh" / "hosts.yml"
+    )
+    hosts.parent.mkdir(parents=True)
+    hosts.write_text(f"{STORED}:\n    user: octo\n", encoding="utf-8")
+    # The home directory's hosts.yml names a different host, and loses.
+    home = tmp_path / "home" / ".config" / "gh"
+    home.mkdir(parents=True)
+    (home / "hosts.yml").write_text(f"{OTHER_KNOWN}:\n    user: octo\n", encoding="utf-8")
+
+    assert not github_resource._known_github_host(STORED)
+    assert github_resource._known_github_host(OTHER_KNOWN)
+    monkeypatch.setenv(variable, str(directory))
+    assert github_resource._known_github_host(STORED)
+    assert not github_resource._known_github_host(OTHER_KNOWN)
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        f"{KNOWN}:8443",
+        "[::1]",
+        f"{KNOWN}.",
+        f"https://{KNOWN}",
+        f"xn--{KNOWN}",
+        f"*.{KNOWN}",
+        f".{KNOWN}",
+    ],
+)
+@pytest.mark.parametrize("side", ["GH_HOST", "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "hosts.yml"])
+def test_a_set_up_host_matches_only_exactly_after_lower_casing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, side: str, configured: str
+) -> None:
+    """No port, bracket, trailing-dot, scheme, IDNA or wildcard handling: each fails closed."""
+    for name in ("GH_HOST", "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path))
+
+    def set_up(value: str) -> None:
+        if side == "hosts.yml":
+            (tmp_path / "hosts.yml").write_text(f"{value}:\n    user: octo\n", encoding="utf-8")
+        else:
+            monkeypatch.setenv(side, value)
+
+    set_up(configured)
+    assert not github_resource._known_github_host(KNOWN)
+    assert not github_resource._known_github_host("ghe-b.example.com.example.com")
+    set_up(KNOWN.upper())
+    assert github_resource._known_github_host(KNOWN)

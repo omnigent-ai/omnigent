@@ -106,7 +106,12 @@ def test_gh_starts_gh_with_todays_command_and_environment(
         result = github_resource._gh(argv, cwd="/workspace", token=token)
 
     if not sandbox and token is None:
-        expected_env = None
+        # A configured enterprise host gets the environment's enterprise token, not GH_TOKEN.
+        expected_env = {
+            name: value
+            for name, value in ambient.items()
+            if name not in {"GH_TOKEN", "GITHUB_TOKEN"}
+        }
     else:
         expected_env = _without_tokens(ambient) if sandbox else dict(ambient)
         if token is not None:
@@ -137,8 +142,14 @@ def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
             late = github_resource._gh(["api", "user"], cwd="/workspace")
 
     assert late == (None, "", "gh deadline exceeded")
+    # github.com gets GH_TOKEN, never an enterprise token.
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+    }
     assert gh_starts == [
-        {"argv": ["gh", "api", "user"], "cwd": "/workspace", "timeout": 90.0, "env": None}
+        {"argv": ["gh", "api", "user"], "cwd": "/workspace", "timeout": 90.0, "env": env}
     ]
 
 

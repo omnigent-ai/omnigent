@@ -268,7 +268,7 @@ def checkout_github_host(root: str) -> str | None:
 CHECKOUT_SCOPE = "<checkout>"
 
 
-def _gate(argv: list[str], scope: str | None, cwd: str | None) -> gh_argv.GhTarget:
+def _gate(argv: list[str], scope: str | None, cwd: str | None) -> str:
     """The host ``argv`` sends to, checked before ``gh`` starts.
 
     Every call runs in a host scope, on a host the user set up for GitHub: a pull request
@@ -276,6 +276,7 @@ def _gate(argv: list[str], scope: str | None, cwd: str | None) -> gh_argv.GhTarg
     be the scope's, whether the argv names it, ``gh`` reads it from the checkout's remotes,
     or it's ``GH_HOST`` or github.com. A sign-in listing checks each host as itself.
 
+    :returns: The host the call goes to; for the listing, ``GH_HOST`` or github.com.
     :raises gh_argv.GhArgvRefused: For a call that mustn't run.
     """
     target = gh_argv.classify(argv)
@@ -289,18 +290,56 @@ def _gate(argv: list[str], scope: str | None, cwd: str | None) -> gh_argv.GhTarg
     if scope != CHECKOUT_SCOPE and not _known_github_host(scope):
         raise gh_argv.GhArgvRefused(f"{scope} isn't a host set up for GitHub")
     if listing:
-        return target
+        return _default_github_host()
     if target.host is not None:
         goes_to = target.host
     elif target.from_checkout:
         goes_to = checkout_github_host(cwd) if cwd else None
     else:
         goes_to = _default_github_host()
-    if goes_to != scope:
+    if goes_to is None or goes_to != scope:
         raise gh_argv.GhArgvRefused(
             f"A gh call for {scope} goes to {goes_to or 'no single GitHub host'}"
         )
-    return target
+    return goes_to
+
+
+_TOKEN_VARIABLES = frozenset(
+    {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+)
+_GITHUB_COM_TOKENS = frozenset({"GH_TOKEN", "GITHUB_TOKEN"})
+_ENTERPRISE_TOKENS = frozenset({"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"})
+# GH_REPO retargets a call that names no repository; the debug settings print request
+# headers, tokens included, into output the panel keeps.
+_NEVER_PASSED = frozenset({"GH_REPO", "GH_DEBUG", "DEBUG"})
+
+
+def _github_family(host: str) -> bool:
+    """Hosts gh treats as GitHub's own, which it sends ``GH_TOKEN`` to."""
+    return any(
+        host == base or host.endswith(f".{base}")
+        for base in ("github.com", "ghe.com", "github.localhost")
+    )
+
+
+def _environment_tokens_for(destination: str) -> frozenset[str]:
+    """The environment's token variables ``gh`` may read for a call to ``destination``.
+
+    ``gh`` sends ``GH_TOKEN`` to github.com and every host it treats as GitHub's own, and
+    an enterprise token to every other host, so each is kept only for the host it's for:
+    ``GH_TOKEN`` for github.com, or a GHE.com host that is ``GH_HOST``; an enterprise token
+    for ``GH_HOST`` or a configured GitHub host. Anywhere else, ``gh`` uses that host's own
+    stored sign-in.
+    """
+    gh_host = (os.environ.get("GH_HOST") or "").strip().lower()
+    if destination == "github.com" or (
+        destination == gh_host and destination.endswith(".ghe.com")
+    ):
+        return _GITHUB_COM_TOKENS
+    configured = EnvInstances().hosts_for("github")
+    if not _github_family(destination) and (destination == gh_host or destination in configured):
+        return _ENTERPRISE_TOKENS
+    return frozenset()
 
 
 def _gh_invocation(
@@ -317,27 +356,22 @@ def _gh_invocation(
     :param cwd: Where ``gh`` runs, whose remotes it reads when the argv names no host.
     :raises gh_argv.GhArgvRefused: When the gate refuses the call; see :func:`_gate`.
     """
-    _gate(argv, host, cwd)
-    # In a managed sandbox the panel must authenticate as the connected owner via
-    # the per-user hosts.yml that configure_host_gh writes — never an ambient
-    # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
-    # token in the sandbox/runner env (e.g. a gh-MCP passthrough) can't silently
-    # make the panel act as a shared identity. Outside a sandbox (local dev) the
-    # env is inherited untouched, so the developer's own gh auth still works.
-    #
-    # ``token`` deliberately re-adds GH_TOKEN to run this one call as a chosen
-    # account (the account selector). It's only ever set outside a sandbox — see
-    # _account_token_for — so it never overrides the sandbox's broker identity.
+    destination = _gate(argv, host, cwd)
+    # In a managed sandbox the panel authenticates as the connected owner through the
+    # hosts.yml configure_host_gh writes, never an ambient token, which gh ranks above it.
+    # Outside one, each environment token reaches only the host it's for.
+    removed = _NEVER_PASSED | (
+        _TOKEN_VARIABLES
+        if _in_sandbox()
+        else _TOKEN_VARIABLES - _environment_tokens_for(destination)
+    )
     env: dict[str, str] | None = None
-    if _in_sandbox():
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k
-            not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
-        }
+    if token or removed & set(os.environ):
+        env = {name: value for name, value in os.environ.items() if name not in removed}
     if token:
-        env = dict(os.environ) if env is None else env
+        # ``token`` runs this one call as a chosen account, looked up for this host. It's
+        # only ever set outside a sandbox, so it never overrides the broker identity.
+        assert env is not None
         env["GH_TOKEN"] = token
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
