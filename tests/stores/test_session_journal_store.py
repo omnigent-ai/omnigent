@@ -357,6 +357,41 @@ def test_deleting_a_session_deletes_its_journal_in_batches(
     assert _count(db_uri, "session_journal_heads", SESSION) == 0
 
 
+def _answer(request_id: str, session: str, answer: str) -> dict[str, object]:
+    return {
+        "request_id": request_id,
+        "conversation_id": session,
+        "step": "deploy",
+        "action": "accept",
+        "source": "web_form",
+        "authenticated_by": "session_cookie",
+        "answered_by": "alice@example.com",
+        "answered_at": 1_800_000_000,
+        "content": {"questions": [], "answers": [{"answer": answer}]},
+    }
+
+
+def test_a_workflow_answer_is_recorded_once_and_goes_with_its_session(
+    db_uri: str, conversations: SqlAlchemyConversationStore, journal: SessionJournalStore
+) -> None:
+    assert journal.record_workflow_answer(_answer("elicit_journal_a", SESSION, "Go"))
+    # A second resolution of the same request leaves the first record.
+    assert not journal.record_workflow_answer(_answer("elicit_journal_a", SESSION, "Hold"))
+    assert journal.record_workflow_answer(_answer("elicit_journal_b", OTHER, "Skip"))
+    record = journal.get_workflow_answer("elicit_journal_a")
+    assert record is not None
+    assert (record["session_id"], record["source"], record["answers"]) == (
+        SESSION,
+        "web_form",
+        [{"answer": "Go"}],
+    )
+    assert journal.get_workflow_answer("elicit_journal_unknown") is None
+
+    assert asyncio.run(conversations.delete_conversation(SESSION)) is True
+    assert journal.get_workflow_answer("elicit_journal_a") is None
+    assert journal.get_workflow_answer("elicit_journal_b") is not None
+
+
 def test_journal_deletion_removes_ranges_across_sessions_in_key_order(
     db_uri: str, journal: SessionJournalStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

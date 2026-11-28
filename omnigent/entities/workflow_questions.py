@@ -21,6 +21,14 @@ OPTIONS_MIN = 2
 OPTIONS_MAX = 4
 _RECOMMENDED_SUFFIX = " (recommended)"
 
+# How a workflow answer reached the server, decided from server-side facts only:
+# a person signed in to the web app, the session's own runner or harness, or
+# any other authenticated client (a CLI token, a script, another proxy user).
+ANSWER_SOURCES: tuple[str, ...] = ("web_form", "harness", "api")
+# How the person answered one question: an offered option, their own text, or
+# not at all.
+ANSWER_INPUTS: tuple[str, ...] = ("option", "text", "none")
+
 
 def workflow_elicitation_id(session_id: str, idempotency_key: str) -> str:
     """Let the runner register the answer before the server publishes the question."""
@@ -155,4 +163,36 @@ def answers_from_content(
         if recommended is not None and answer == recommended + _RECOMMENDED_SUFFIX:
             answer = recommended
         answers.append({"question": question["question"], "answer": answer.strip()})
+    return answers
+
+
+def answers_with_input(
+    form_questions: list[Mapping[str, Any]], content: Mapping[str, Any] | None
+) -> list[dict[str, str]]:
+    """Pair each asked question with its answer and how it was given.
+
+    Reads the questions as the user saw them (:func:`question_form`), so an
+    option counts only when the answer equals a label that form offered.
+
+    :param form_questions: ``question_form(...)["questions"]``.
+    :param content: The resolved elicitation's ``content``, or ``None``.
+    :returns: ``[{"question", "answer", "input"}]``, where ``input`` is one of
+        :data:`ANSWER_INPUTS` and a recommended option's mark is dropped.
+    """
+    answers = []
+    for question in form_questions:
+        text = str(question.get("question", ""))
+        labels = [str(option.get("label", "")) for option in question.get("options", [])]
+        raw = (content or {}).get(text)
+        if isinstance(raw, list):
+            raw = ", ".join(str(item) for item in raw if isinstance(item, str) and item)
+        answer = raw.strip() if isinstance(raw, str) else ""
+        if not answer:
+            kind = "none"
+        elif answer in labels:
+            kind = "option"
+            answer = answer.removesuffix(_RECOMMENDED_SUFFIX)
+        else:
+            kind = "text"
+        answers.append({"question": text, "answer": answer, "input": kind})
     return answers

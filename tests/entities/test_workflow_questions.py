@@ -7,6 +7,7 @@ import pytest
 from omnigent.entities.session_journal import InvalidJournalEntryError
 from omnigent.entities.workflow_questions import (
     answers_from_content,
+    answers_with_input,
     normalize_questions,
     question_form,
     status_text,
@@ -154,3 +155,26 @@ def test_questions_have_no_length_limit_on_their_text() -> None:
         "label": ("Use staging " * 10).strip(),
         "description": ("Probe it first. " * 30).strip(),
     }
+
+
+@pytest.mark.parametrize(
+    ("given", "answer", "kind"),
+    [
+        ("Use staging (recommended)", "Use staging", "option"),
+        ("Use prod", "Use prod", "option"),
+        ("Use staging, then prod", "Use staging, then prod", "text"),
+        ("  ", "", "none"),
+        (None, "", "none"),
+    ],
+    ids=["recommended_option", "option", "own_text", "blank", "unanswered"],
+)
+def test_an_answer_is_an_option_only_when_it_is_a_label_the_form_offered(
+    given: str | None, answer: str, kind: str
+) -> None:
+    [form] = question_form(normalize_questions([_question(recommended="Use staging")]))[
+        "questions"
+    ]
+    content = {} if given is None else {form["question"]: given}
+    assert answers_with_input([form], content) == [
+        {"question": form["question"], "answer": answer, "input": kind}
+    ]

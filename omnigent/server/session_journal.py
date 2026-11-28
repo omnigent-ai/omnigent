@@ -19,6 +19,9 @@ Routes, under ``/v1``:
   task for ``sys_workflow_request_input``: it marks the task ``needs_input`` and
   raises an elicitation whose answer the runner waits for. Runner-only, like
   the append.
+* ``GET /workflow-answers/{request_id}`` returns how a question set was
+  answered, as the server recorded it when the elicitation resolved (owner
+  access to the session that asked).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -47,6 +51,7 @@ from omnigent.entities.session_journal import (
 )
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.entities.workflow_questions import (
+    answers_with_input,
     normalize_questions,
     question_form,
     status_text,
@@ -58,14 +63,24 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.runtime import session_stream
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.runtime import pending_elicitations, session_stream
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+)
 from omnigent.server.journal_markers import (
     record_journal_checkpoint,
     record_plan_marker,
     record_status_marker,
 )
-from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
+from omnigent.server.routes._auth_helpers import (
+    attribution_user,
+    get_user_id,
+    require_access_and_level,
+)
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.routes.workflow_permissions import readable_workflow
 from omnigent.server.schemas import (
@@ -87,6 +102,7 @@ from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_journal_store import JournalSessionNotFoundError, SessionJournalStore
+from omnigent.telemetry.surface import resolve_client_surface
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 _logger = logging.getLogger(__name__)
@@ -132,6 +148,138 @@ def open_store(conversation_store: object) -> SessionJournalStore | None:
                 return None
             _stores[location] = store
         return store
+
+
+# Client surfaces of Omnigent's own apps, where a person answers in the question form.
+_APP_SURFACES = frozenset({"web", "desktop", "ios", "android", "mobile"})
+_WORKFLOW_PHASE = "workflow_request_input"
+
+
+def pending_workflow_question(session_id: str, elicitation_id: object) -> dict[str, Any] | None:
+    """The workflow question set an elicitation asks, while it is still pending.
+
+    Read before the elicitation resolves, since resolving drains the pending index.
+
+    :param session_id: The session the resolution is for, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The resolution's ``elicitation_id``.
+    :returns: ``{"request_id", "step", "questions"}``, or ``None`` for anything
+        but a pending ``sys_workflow_request_input`` question set.
+    """
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return None
+    found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+    if found is None:
+        return None
+    params = found[1].get("params")
+    if not isinstance(params, dict) or params.get("phase") != _WORKFLOW_PHASE:
+        return None
+    if params.get("target_session_id") not in (None, session_id):
+        return None
+    form = params.get("ask_user_question")
+    questions = form.get("questions") if isinstance(form, dict) else None
+    if not isinstance(questions, list):
+        return None
+    return {
+        "request_id": elicitation_id,
+        "step": str(params.get("journal_step") or ""),
+        "questions": questions,
+    }
+
+
+def workflow_answer_identity(
+    request: Request, auth_provider: AuthProvider | None
+) -> dict[str, str | None]:
+    """Who sent a resolution and how, from what the server itself verified.
+
+    ``source`` is ``"harness"`` whenever the call carries a runner's headers,
+    ``"web_form"`` only when a signed-in app session cookie identified the
+    caller, and ``"api"`` for everything else, such as a CLI or script bearer
+    token or a proxy-asserted identity. The self-reported client surface can only
+    narrow ``web_form`` to Omnigent's own apps; it never grants it.
+
+    :returns: ``{"source", "authenticated_by", "answered_by"}``.
+    """
+    user_id = get_user_id(request, auth_provider)
+    cookie_name = getattr(auth_provider, "session_cookie_name", None)
+    if auth_provider is None or user_id is None or user_id == RESERVED_USER_LOCAL:
+        authenticated_by = "none"
+    elif isinstance(cookie_name, str) and request.cookies.get(cookie_name):
+        authenticated_by = "session_cookie"
+    elif request.headers.get("Authorization", "").startswith("Bearer "):
+        authenticated_by = "bearer"
+    else:
+        authenticated_by = "proxy_header"
+    from_runner = request.headers.get(ORCHESTRATION_SOURCE_HEADER) or request.headers.get(
+        RUNNER_TUNNEL_TOKEN_HEADER
+    )
+    if from_runner:
+        source = "harness"
+    elif (
+        authenticated_by == "session_cookie"
+        and resolve_client_surface({k.lower(): v for k, v in request.headers.items()})
+        in _APP_SURFACES
+    ):
+        source = "web_form"
+    else:
+        source = "api"
+    return {
+        "source": source,
+        "authenticated_by": authenticated_by,
+        "answered_by": attribution_user(user_id),
+    }
+
+
+async def record_workflow_answer(
+    conversation_store: ConversationStore,
+    request: object,
+    auth_provider: AuthProvider | None,
+    session_id: str,
+    data: dict[str, Any] | None,
+    question: dict[str, Any] | None,
+) -> None:
+    """Record how a resolved workflow question set was answered; never raises.
+
+    :param request: The HTTP request that resolved it, or the server's own context
+        for an event a runner relayed, which counts as ``"harness"``.
+    :param question: :func:`pending_workflow_question`, read before resolving.
+    :param data: The resolution: ``elicitation_id``, ``action`` and ``content``.
+    """
+    if question is None or not isinstance(data, dict):
+        return
+    action = data.get("action")
+    if action not in ("accept", "decline", "cancel"):
+        return
+    store = open_store(conversation_store)
+    if store is None:
+        return
+    content = data.get("content") if action == "accept" else None
+    record = {
+        "request_id": question["request_id"],
+        "conversation_id": session_id,
+        "step": question["step"][:64],
+        "action": action,
+        **(
+            workflow_answer_identity(request, auth_provider)
+            if isinstance(request, Request)
+            else {"source": "harness", "authenticated_by": "none", "answered_by": None}
+        ),
+        "answered_at": int(time.time()),
+        "content": {
+            "questions": question["questions"],
+            "answers": answers_with_input(
+                question["questions"], content if isinstance(content, dict) else None
+            ),
+        },
+    }
+    try:
+        await asyncio.to_thread(store.record_workflow_answer, record)
+    except Exception:
+        _logger.warning(
+            "could not record the answer to workflow question %s",
+            question["request_id"],
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 def titled_for_workflow_run(
@@ -637,5 +785,28 @@ def create_session_journal_router(
         return SessionJournalInputRequested(
             entry=entry_to_response(entry), elicitation_id=elicitation_id
         )
+
+    @router.get(
+        "/workflow-answers/{request_id}",
+        # Read by lanes that check an answer before acting; not in the public reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def get_workflow_answer(request: Request, request_id: str) -> dict[str, Any]:
+        """How a ``sys_workflow_request_input`` question set was answered.
+
+        Returns the record the server wrote when the question resolved: the
+        verdict, ``source`` and ``authenticated_by``, ``answered_by``, the
+        questions as shown and each answer with its ``input`` kind. Only the
+        owner of the session that asked may read it; an unknown request is 404.
+        """
+        record = await asyncio.to_thread(_store().get_workflow_answer, request_id)
+        if record is None:
+            raise OmnigentError(
+                f"workflow_answer_not_found: no answer recorded for {request_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+        await _session(request, record["session_id"], LEVEL_OWNER)
+        return record
 
     return router

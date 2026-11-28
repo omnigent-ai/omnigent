@@ -396,6 +396,7 @@ async def test_a_question_waits_for_the_answer_and_returns_it(
     assert not pending_approvals.has_pending(SESSION)
     assert result == {
         "answered": True,
+        "request_id": elicitation_id,
         "answers": [{"question": "Deploy to prod now?", "answer": "Wait"}],
     }
     assert requests == [
@@ -508,13 +509,22 @@ def _late_question_server(
     return handler
 
 
-_ANSWERED_NOTICE = (
-    '[System: the user answered your question on task "deploy"]\n'
-    "Q: Deploy to prod now?\n"
-    "A: Deploy\n"
-    "Write the task's next status: started to resume it, done for an approval given, "
-    "failed for one refused. Then go on with the plan."
-)
+_LATE_REQUEST_ID = workflow_elicitation_id(SESSION, "tool:toolu_late")
+
+
+def _answered_notice(request_id: str = _LATE_REQUEST_ID) -> str:
+    """The late-answer message for *request_id*, which it names."""
+    return (
+        '[System: the user answered your question on task "deploy"]\n'
+        f"Request ID: {request_id}\n"
+        "Q: Deploy to prod now?\n"
+        "A: Deploy\n"
+        "Write the task's next status: started to resume it, done for an approval given, "
+        "failed for one refused. Then go on with the plan."
+    )
+
+
+_ANSWERED_NOTICE = _answered_notice()
 
 
 @pytest.mark.parametrize(
@@ -525,6 +535,7 @@ _ANSWERED_NOTICE = (
             "decline",
             None,
             '[System: the user dismissed your question on task "deploy"]\n'
+            f"Request ID: {_LATE_REQUEST_ID}\n"
             "The task stays waiting for them; don't ask again unless they bring it up.",
             False,
         ),
@@ -569,6 +580,8 @@ async def test_an_answer_after_the_call_returned_reaches_the_session_as_a_messag
             )
             assert result["answered"] is False
             assert result["still_open"] is True
+            # The ID a lane checks the server's answer record by.
+            assert result["request_id"] == elicitation_id
             # Nothing clears the question, so it stays answerable in the Inbox and chat.
             assert [event["type"] for event in published] == ["session.journal.appended"]
             # No turn waits on it any more, so the session's messages aren't held back.
@@ -714,7 +727,10 @@ async def test_a_late_answer_outlasts_a_failed_delivery(
             await journal_tools.cancel_session_questions(SESSION)
     expected = {
         "type": "message",
-        "data": {"role": "user", "content": [{"type": "input_text", "text": _ANSWERED_NOTICE}]},
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": _answered_notice(elicitation_id)}],
+        },
     }
     assert messages == ([expected] if then == "server_back" else [])
     assert not journal_tools.answer_arrives_as_message(elicitation_id)
@@ -748,7 +764,9 @@ async def test_a_stopped_turn_leaves_its_question_open_for_a_late_answer() -> No
             await poll_until_async(lambda: messages, timeout_s=5)
         finally:
             await journal_tools.cancel_session_questions(SESSION)
-    assert [message["data"]["content"][0]["text"] for message in messages] == [_ANSWERED_NOTICE]
+    assert [message["data"]["content"][0]["text"] for message in messages] == [
+        _answered_notice(elicitation_id)
+    ]
 
 
 @pytest.mark.parametrize("ending", ["expiry", "session_deleted"])
