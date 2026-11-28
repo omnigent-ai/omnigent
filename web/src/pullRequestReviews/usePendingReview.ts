@@ -26,7 +26,9 @@ import {
   type HostPendingRoute,
   hostPendingRoute,
   hostPendingScopeCurrent,
+  hostPendingScopeOf,
 } from "./hostPendingRoute";
+import { resolvePendingRecoveries } from "./pendingComposer";
 
 /**
  * `page` with the pending review's drafts in their threads, keeping the previous threads and
@@ -121,8 +123,18 @@ export function usePendingReview(
         : [PENDING_REVIEW_KEY, "off"],
     queryFn: async () => {
       const issuedAt = Date.now();
-      const read = await readPendingReviewOnHost(hostRoute!);
-      return { ...read, issued_at: issuedAt };
+      const read = { ...(await readPendingReviewOnHost(hostRoute!)), issued_at: issuedAt };
+      // A start that added nothing is let go once its review is no longer the one pending.
+      resolvePendingRecoveries(
+        owner,
+        prUrl!,
+        {
+          login: hostRoute!.actor.login,
+          host: hostPendingScopeOf(hostRoute!),
+        },
+        read,
+      );
+      return read;
     },
     meta: readPriorityMeta(priority),
     enabled: enabled && available,

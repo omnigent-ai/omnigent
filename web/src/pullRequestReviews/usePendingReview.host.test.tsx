@@ -7,7 +7,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const host = vi.hoisted(() => ({ served: new Set<string>(), read: vi.fn() }));
+const host = vi.hoisted(() => ({ served: new Set<string>(), read: vi.fn(), write: vi.fn() }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({ features: {} }) }));
 vi.mock("@/lib/workspaceApi", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -20,15 +20,28 @@ vi.mock("@/lib/workspaceApi", async (importOriginal) => ({
 vi.mock("@/lib/pullRequestRpc", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   readPullRequestRpc: host.read,
+  writePullRequestRpc: host.write,
 }));
 
+import { PullRequestApiError } from "@/lib/pullRequestRpc";
 import type { WorkspaceClient } from "@/lib/workspaceApi";
 import {
   resetPullRequestPageRoutesForTests,
   usePullRequestPageRoute,
 } from "@/pullRequestPage/pullRequestPageRoute";
-import { draftThread, noReviewAnswer, pendingAnswer, REVIEW_ID } from "@/test/pendingReviewAnswers";
+import {
+  BASE,
+  draftThread,
+  HEAD,
+  noReviewAnswer,
+  pendingAnswer,
+  REVIEW_ID,
+} from "@/test/pendingReviewAnswers";
 
+import { resetPendingRecoveriesForTests } from "./pendingComposer";
+import type { DraftPlace } from "./pendingReview";
+import { resetPendingReviewChangesForTests } from "./pendingReviewChanges";
+import { usePendingComposer } from "./usePendingComposer";
 import { invalidatePendingReview, usePendingReview } from "./usePendingReview";
 
 const PR = "https://github.com/acme/app/pull/42";
@@ -79,11 +92,14 @@ async function sentRequest(call = 0): Promise<{ method: string; request: unknown
 
 beforeEach(() => {
   host.read.mockReset();
+  host.write.mockReset();
 });
 
 afterEach(() => {
   vi.useRealTimers();
   resetPullRequestPageRoutesForTests();
+  resetPendingRecoveriesForTests();
+  resetPendingReviewChangesForTests();
 });
 
 describe("usePendingReview through the session's host", () => {
@@ -147,5 +163,75 @@ describe("usePendingReview through the session's host", () => {
     const { view } = await renderPending(EDITOR);
 
     await waitFor(() => expect(view.result.current.pending.state.kind).toBe("error"));
+  });
+});
+
+describe("a comment box whose start made a review but didn't add its comment", () => {
+  const LINES: DraftPlace = {
+    kind: "lines",
+    path: "src/app.ts",
+    side: "RIGHT",
+    line: 12,
+    startLine: null,
+    headSha: HEAD,
+    baseSha: BASE,
+  };
+  const DRAFT_KEY = ["pr-draft", SESSION, PR, "line"];
+
+  async function renderComposer() {
+    host.served = new Set(EDITOR);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(DRAFT_KEY, { body: "Why strip?", pending: false, error: null });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    const view = renderHook(
+      () => ({
+        route: usePullRequestPageRoute(SESSION),
+        composer: usePendingComposer({
+          conversationId: SESSION,
+          prUrl: PR,
+          place: LINES,
+          draftKey: DRAFT_KEY,
+          head: HEAD,
+          post: () => {},
+          commentLabel: "Comment",
+        }),
+      }),
+      { wrapper },
+    );
+    await waitFor(() => expect(view.result.current.composer?.mode).toBe("comment_or_start"));
+    return { view, queryClient };
+  }
+
+  it.each([
+    ["is submitted or discarded", noReviewAnswer()],
+    ["is replaced by another", pendingAnswer({ reviewId: "PRR_other" })],
+  ])("lets the text go once a later read shows the review %s", async (_case, later) => {
+    host.read.mockResolvedValue(noReviewAnswer());
+    host.write
+      .mockResolvedValueOnce({
+        object: "session.github.pr_review_start",
+        pr_url: PR,
+        review_id: REVIEW_ID,
+        commit_oid: HEAD,
+      })
+      .mockRejectedValueOnce(new PullRequestApiError("That line isn't in the diff.", 400));
+    const { view, queryClient } = await renderComposer();
+    host.read.mockResolvedValue(pendingAnswer());
+    act(() => view.result.current.composer!.secondary!.run());
+    await waitFor(() => expect(view.result.current.composer?.mode).toBe("recovering"));
+
+    // Read after the start, so it speaks for the review the start made.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+    host.read.mockResolvedValue(later);
+    act(() => invalidatePendingReview(queryClient, PR));
+    await waitFor(() => expect(view.result.current.composer?.mode).toBe("recovery_gone"));
+    const reuse = view.result.current.composer!.notice!.actions[0]!;
+    expect(reuse.label).toBe("Use for a new comment");
+    act(() => reuse.run());
+    expect(view.result.current.composer?.mode).not.toBe("recovery_gone");
   });
 });
