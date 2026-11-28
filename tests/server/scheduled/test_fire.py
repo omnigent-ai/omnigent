@@ -38,6 +38,7 @@ from omnigent.db.account_authority import account_checks_scope
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import (
+    PagedList,
     ScheduledTask,
     ScheduledTaskPermission,
     ScheduledTaskRun,
@@ -80,6 +81,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
+    SpawnTreeUsage,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -2997,11 +2999,17 @@ class _ExistingConversationStore(FakeConversationStore):
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return self.existing.get(conversation_id)
 
-    def list_conversations(self, *, root_conversation_id: str, **_: Any) -> SimpleNamespace:
-        tree = [
-            c for c in self.existing.values() if c.root_conversation_id == root_conversation_id
-        ]
-        return SimpleNamespace(data=tree, has_more=False, last_id=None)
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int, after: str | None = None
+    ) -> PagedList[SpawnTreeUsage]:
+        return PagedList(
+            data=[
+                SpawnTreeUsage(c.id, c.parent_conversation_id, c.session_usage)
+                for c in self.existing.values()
+                if c.root_conversation_id == root_conversation_id
+            ],
+            has_more=False,
+        )
 
 
 def _continuing_task(**overrides: Any) -> ScheduledTask:

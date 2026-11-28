@@ -281,6 +281,17 @@ def test_increment_session_usage(store: SqlAlchemyConversationStore) -> None:
     assert result2["input_tokens"] == 150
 
 
+@pytest.mark.parametrize("page_size", [1, 2, 10])
+def test_spawn_tree_usage_pages_across_dbs(
+    store: SqlAlchemyConversationStore, page_size: int
+) -> None:
+    """Split-DB mode: shape and usage live apart, and ``after`` pages still read the whole tree."""
+    from tests.stores.tree_usage_scenario import assert_paged_tree_usage_matches_full_listing
+
+    assert store._conv_engine is not store._engine
+    assert_paged_tree_usage_matches_full_listing(store, page_size)
+
+
 def test_apply_session_usage_delta_drops_negative_and_non_finite_increments() -> None:
     """A forged usage frame can't drive a cumulative counter backwards or poison it.
 

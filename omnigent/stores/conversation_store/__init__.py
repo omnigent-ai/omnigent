@@ -2259,7 +2259,7 @@ class ConversationStore(ABC):
         )
 
     def list_spawn_tree_usage(
-        self, root_conversation_id: str, *, limit: int
+        self, root_conversation_id: str, *, limit: int, after: str | None = None
     ) -> PagedList[SpawnTreeUsage]:
         """Read one spawn tree's hierarchy and usage in a single bounded read.
 
@@ -2269,10 +2269,13 @@ class ConversationStore(ABC):
 
         :param root_conversation_id: Root of the spawn tree.
         :param limit: Maximum conversations to return.
+        :param after: Return only members with an id after this one, e.g. the
+            previous page's ``last_id``.
         :returns: The tree's members with their parent and own usage.
         """
         page = self.list_conversations(
             limit=limit,
+            after=after,
             kind=None,
             include_archived=True,
             root_conversation_id=root_conversation_id,

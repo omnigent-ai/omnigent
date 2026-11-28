@@ -1543,7 +1543,7 @@ def _publish_subtree_cost_to_ancestors(
     _publish_ancestor_subtree_costs(tree, session_id)
 
 
-def _publish_ancestor_subtree_costs(tree: list[Conversation], session_id: str) -> None:
+def _publish_ancestor_subtree_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> None:
     """
     Publish each ancestor's subtree cost from an already-loaded spawn tree.
 

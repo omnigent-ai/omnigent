@@ -4778,44 +4778,80 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
 
     def list_spawn_tree_usage(
-        self, root_conversation_id: str, *, limit: int
+        self, root_conversation_id: str, *, limit: int, after: str | None = None
     ) -> PagedList[SpawnTreeUsage]:
-        """Walk the root index for ids and parents, then read usage by those ids."""
-        with self._conv_session("list_spawn_tree_usage") as session:
-            members = session.execute(
-                select(SqlConversation.id, SqlConversation.parent_conversation_id)
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.root_conversation_id == root_conversation_id,
-                )
-                .order_by(SqlConversation.id)
-                .limit(limit + 1)
-            ).all()
-        has_more = len(members) > limit
-        members = members[:limit]
+        """Walk the root index for ids and parents, with each member's usage.
+
+        One joined statement when conversations and metadata share an engine;
+        otherwise the members, then their usage by id. Either way the reads
+        share one pool checkout per engine.
+        """
+        members_of_tree = (
+            SqlConversation.workspace_id == current_workspace_id(),
+            SqlConversation.root_conversation_id == root_conversation_id,
+            *([SqlConversation.id > after] if after is not None else []),
+        )
         usage_by_id: dict[str, str | None] = {}
-        if members:
-            with self._session("list_spawn_tree_usage") as session:
-                usage_by_id = {
-                    str(row.id): row.session_usage
-                    for row in session.execute(
+        with shared_read_scope():
+            if self._conv_engine is self._engine:
+                with self._conv_session("list_spawn_tree_usage") as session:
+                    joined = session.execute(
                         select(
-                            SqlConversationMetadata.id, SqlConversationMetadata.session_usage
-                        ).where(
-                            SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            SqlConversationMetadata.id.in_([row.id for row in members]),
+                            SqlConversation.id,
+                            SqlConversation.parent_conversation_id,
+                            SqlConversationMetadata.session_usage,
                         )
+                        .outerjoin(
+                            SqlConversationMetadata,
+                            and_(
+                                SqlConversationMetadata.workspace_id
+                                == SqlConversation.workspace_id,
+                                SqlConversationMetadata.id == SqlConversation.id,
+                            ),
+                        )
+                        .where(*members_of_tree)
+                        .order_by(SqlConversation.id)
+                        .limit(limit + 1)
                     ).all()
-                }
+                members = [(row.id, row.parent_conversation_id) for row in joined]
+                usage_by_id = {str(row.id): row.session_usage for row in joined}
+            else:
+                with self._conv_session("list_spawn_tree_usage") as session:
+                    members = [
+                        (row.id, row.parent_conversation_id)
+                        for row in session.execute(
+                            select(SqlConversation.id, SqlConversation.parent_conversation_id)
+                            .where(*members_of_tree)
+                            .order_by(SqlConversation.id)
+                            .limit(limit + 1)
+                        ).all()
+                    ]
+                if members:
+                    with self._session("list_spawn_tree_usage") as session:
+                        usage_by_id = {
+                            str(row.id): row.session_usage
+                            for row in session.execute(
+                                select(
+                                    SqlConversationMetadata.id,
+                                    SqlConversationMetadata.session_usage,
+                                ).where(
+                                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                    SqlConversationMetadata.id.in_(
+                                        [member_id for member_id, _ in members[:limit]]
+                                    ),
+                                )
+                            ).all()
+                        }
+        has_more = len(members) > limit
         rows = [
             SpawnTreeUsage(
-                id=str(row.id),
-                parent_conversation_id=(
-                    str(row.parent_conversation_id) if row.parent_conversation_id else None
-                ),
-                session_usage=json.loads(usage) if (usage := usage_by_id.get(str(row.id))) else {},
+                id=str(member_id),
+                parent_conversation_id=str(parent_id) if parent_id else None,
+                session_usage=json.loads(usage)
+                if (usage := usage_by_id.get(str(member_id)))
+                else {},
             )
-            for row in members
+            for member_id, parent_id in members[:limit]
         ]
         return PagedList(
             data=rows,
