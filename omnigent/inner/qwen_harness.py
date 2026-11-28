@@ -34,6 +34,8 @@ Env vars read at startup:
   ``providers:`` config. When both are set, the executor exports
   ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``OPENAI_MODEL`` into the ``qwen``
   subprocess instead of relying on the CLI's ambient auth.
+- ``HARNESS_QWEN_PROMPT_TIMEOUT_S``: optional idle (time-without-progress) deadline in
+  seconds for a prompt turn (default 300); must be positive and finite or the child aborts.
 """
 
 from __future__ import annotations
