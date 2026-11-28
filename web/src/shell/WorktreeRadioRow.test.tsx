@@ -150,8 +150,14 @@ describe("WorktreeRadioRow", () => {
       "focus-within:bg-muted",
       "focus-within:ring-1",
     );
-    expect(screen.getByRole("radio")).toHaveClass("size-4", "appearance-none", "rounded-full");
-    expect(screen.getByRole("radio")).not.toHaveClass("sr-only");
+    const radio = screen.getByRole("radio");
+    expect(radio.parentElement).toHaveClass("relative", "size-4", "shrink-0");
+    expect(radio).toHaveClass("peer", "appearance-none", "opacity-0");
+    expect(radio.nextElementSibling).toHaveClass(
+      "peer-checked:border-[5px]",
+      "peer-checked:border-primary",
+      "peer-focus-visible:ring-2",
+    );
     expect(screen.getByText("auth-refresh")).toHaveClass("font-normal", "leading-4");
     expect(screen.getByText("Unknown")).toHaveClass("text-xs", "leading-4");
   });
