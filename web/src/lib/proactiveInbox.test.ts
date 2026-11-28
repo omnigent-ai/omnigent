@@ -221,4 +221,19 @@ describe("suggestionPreview", () => {
     expect(suggestionPreview("x".repeat(10), 5)).toBe("xxxx…");
     expect(suggestionPreview("")).toBe("");
   });
+
+  it("keeps leading characters that only look like markers", () => {
+    // A hyphen or "N." not followed by whitespace is content, not a list or
+    // heading marker, so dropping it would corrupt the preview.
+    expect(suggestionPreview("-10% drop in signups")).toBe("-10% drop in signups");
+    expect(suggestionPreview("3.5 hours until the deploy window")).toBe(
+      "3.5 hours until the deploy window",
+    );
+    expect(suggestionPreview("-5°C tonight")).toBe("-5°C tonight");
+    // Real markers (followed by a space) are still stripped.
+    expect(suggestionPreview("1. First item")).toBe("First item");
+    expect(suggestionPreview("> quoted")).toBe("quoted");
+    // A marker-only line (thematic break) still collapses and is skipped.
+    expect(suggestionPreview("---\nActual content")).toBe("Actual content");
+  });
 });
