@@ -70,7 +70,11 @@ from omnigent.entities.project_routing import choose_router
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.project_status_cache import invalidate_after_commit
-from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
+from omnigent.stores.project_store import (
+    RETIRED_ROLES_CONFIG_KEY,
+    ProjectOrderPreference,
+    ProjectStore,
+)
 from omnigent.stores.project_store.access import (
     SHARE_ROLES,
     ProjectRole,
@@ -109,6 +113,7 @@ _SERVER_CONFIG_KEYS = frozenset(
         ROUTER_IDENTITY_CONFIG_KEY,
         LEAD_REMOVED_CONFIG_KEY,
         LEAD_CHARTER_CONFIG_KEY,
+        RETIRED_ROLES_CONFIG_KEY,
     }
 )
 
@@ -121,6 +126,13 @@ def _client_config(config: dict[str, Any] | None) -> dict[str, Any]:
 def _server_config(raw: str | None) -> dict[str, Any]:
     """The server-owned keys of a stored config, kept when a client replaces it."""
     return {k: v for k, v in _decode_config(raw).items() if k in _SERVER_CONFIG_KEYS}
+
+
+def _retired_roles(raw: str | None) -> dict[str, dict[str, Any]]:
+    value = _decode_config(raw).get(RETIRED_ROLES_CONFIG_KEY)
+    if not isinstance(value, dict):
+        return {}
+    return {key: row for key, row in value.items() if isinstance(row, dict)}
 
 
 def _retired_ids(raw: str | None) -> list[str]:
@@ -403,6 +415,7 @@ def _to_entity(row: SqlProject) -> Project:
         lead_removed=_decode_config(row.config).get(LEAD_REMOVED_CONFIG_KEY) is True,
         lead_charter=_lead_charter(row.config),
         description=_description(row.config),
+        retired_roles=_retired_roles(row.config),
     )
 
 
@@ -1425,6 +1438,62 @@ class SqlAlchemyProjectStore(ProjectStore):
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project_identity", write)
+
+    def retire_identity(
+        self,
+        project_id: str,
+        identity_id: str,
+        snapshot: Mapping[str, Any],
+        *,
+        user_id: str | None,
+    ) -> bool:
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            project = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if project is None or project_role(session, project, user_id) is None:
+                return False
+            row = session.get(
+                SqlProjectIdentity, (current_workspace_id(), project_id, identity_id)
+            )
+            if row is None:
+                return False
+            config = _decode_config(project.config)
+            retired = dict(config.get(RETIRED_ROLES_CONFIG_KEY) or {})
+            retired[identity_id] = dict(snapshot)
+            project.config = _encode_config({**config, RETIRED_ROLES_CONFIG_KEY: retired})
+            session.delete(row)
+            session.execute(
+                delete(SqlProjectRoleKpiRevision).where(
+                    SqlProjectRoleKpiRevision.workspace_id == current_workspace_id(),
+                    SqlProjectRoleKpiRevision.project_id == project_id,
+                    SqlProjectRoleKpiRevision.identity_id == identity_id,
+                )
+            )
+            invalidate_after_commit(session, project_id)
+            return True
+
+        return run_write_transaction(self._session_immediate, "retire_project_identity", write)
+
+    def drop_retired_role(self, project_id: str, identity_id: str, *, user_id: str | None) -> bool:
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            project = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if project is None or project_role(session, project, user_id) is None:
+                return False
+            config = _decode_config(project.config)
+            retired = dict(config.get(RETIRED_ROLES_CONFIG_KEY) or {})
+            if retired.pop(identity_id, None) is None:
+                return False
+            config[RETIRED_ROLES_CONFIG_KEY] = retired
+            project.config = _encode_config(config)
+            invalidate_after_commit(session, project_id)
+            return True
+
+        return run_write_transaction(self._session_immediate, "drop_retired_project_role", write)
 
     def set_identity_session(
         self,

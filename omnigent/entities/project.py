@@ -49,6 +49,8 @@ class Project:
         scope, out of scope, how we'll know it's working, starting roster),
         written by the owner or the Lead, or ``None`` when unset. Unlike the
         mandate it reaches no session's instructions.
+    :param retired_roles: Snapshots of roles the Lead or owner retired, by identity ID.
+        Server-owned, so the owner can restore one.
     """
 
     id: str
@@ -65,6 +67,7 @@ class Project:
     lead_removed: bool = False
     lead_charter: str | None = None
     description: str | None = None
+    retired_roles: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

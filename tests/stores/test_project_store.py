@@ -900,3 +900,34 @@ def test_deleting_a_role_or_its_project_removes_its_kpi_revisions(db_uri: str) -
     assert store.delete(project.id, user_id=owner)
     recreated = store.create(project.id, "Roles", owner)
     assert kpis.current(recreated.id, user_id=owner, identity_id=roles[1].id) is None
+
+
+def test_a_retired_roles_snapshot_survives_a_concurrent_config_save(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """Retiring saves the snapshot and drops the role in one write, and a config save
+    made from an earlier read keeps it, because the snapshot is server-owned."""
+    owner = "alice@example.com"
+    project = store.create(_uid("p1"), "Team", owner)
+    role_id = uuid.uuid4().hex
+    store.create_identity(project.id, role_id, user_id=owner, name="zz Designer")
+    stale = store.get(project.id, user_id=owner)
+    assert stale is not None
+
+    assert store.retire_identity(
+        project.id, role_id, {"id": role_id, "name": "zz Designer"}, user_id=owner
+    )
+    store.update(project.id, user_id=owner, config={**stale.config, "theme": "dark"})
+
+    saved = store.get(project.id, user_id=owner)
+    assert saved is not None
+    assert saved.retired_roles == {role_id: {"id": role_id, "name": "zz Designer"}}
+    assert saved.config == {"theme": "dark"}
+    assert [identity.id for identity in store.list_identities(project.id, user_id=owner)] == []
+
+    # A config save can't forge or clear it either.
+    store.update(project.id, user_id=owner, config={"_omnigent_retired_roles": {}})
+    assert store.get(project.id, user_id=owner).retired_roles != {}
+    assert store.drop_retired_role(project.id, role_id, user_id=owner)
+    assert store.get(project.id, user_id=owner).retired_roles == {}
+    assert not store.drop_retired_role(project.id, role_id, user_id=owner)

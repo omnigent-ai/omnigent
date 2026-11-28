@@ -28,6 +28,10 @@ class ProjectOrderPreference(TypedDict):
     ordered_project_ids: list[str] | None
 
 
+# Server-owned config key holding each retired role's snapshot, by identity ID.
+RETIRED_ROLES_CONFIG_KEY = "_omnigent_retired_roles"
+
+
 class ProjectStore(ABC):
     """
     Abstract base for project persistence.
@@ -339,6 +343,24 @@ class ProjectStore(ABC):
 
     def delete_identity(self, project_id: str, identity_id: str, *, user_id: str | None) -> bool:
         """Delete an identity; its sessions remain ordinary project conversations."""
+        raise NotImplementedError
+
+    def retire_identity(
+        self,
+        project_id: str,
+        identity_id: str,
+        snapshot: Mapping[str, Any],
+        *,
+        user_id: str | None,
+    ) -> bool:
+        """Save *snapshot* under the project's retired roles and delete the identity, atomically.
+
+        :returns: ``False`` when the project or identity doesn't exist.
+        """
+        raise NotImplementedError
+
+    def drop_retired_role(self, project_id: str, identity_id: str, *, user_id: str | None) -> bool:
+        """Remove a retired role's snapshot once it's restored; ``False`` if there was none."""
         raise NotImplementedError
 
     def set_identity_session(

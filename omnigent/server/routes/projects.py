@@ -367,7 +367,6 @@ async def _record_role_event(
     )
 
 
-RETIRED_ROLES_CONFIG_KEY = "retired_roles"
 # Roles the mandate requires; only the owner may retire them.
 _OWNER_RETIRED_ROLE_NAMES = frozenset({"reviewer", "merger"})
 
@@ -379,8 +378,7 @@ def _retired_summary(retired: dict[str, Any]) -> dict[str, Any]:
 
 def _retired_roles(project: Project) -> list[dict[str, Any]]:
     """The project's retired roles, most recently retired first."""
-    stored = (project.config or {}).get(RETIRED_ROLES_CONFIG_KEY) or {}
-    rows = [_retired_summary(row) for row in stored.values() if isinstance(row, dict)]
+    rows = [_retired_summary(row) for row in project.retired_roles.values()]
     return sorted(rows, key=lambda row: row.get("retired_at") or 0, reverse=True)
 
 
@@ -663,10 +661,6 @@ def create_projects_router(
         if body.config is not None:
             stored = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
             is_owner = stored is None or stored.user_id == user_id
-            # Retired roles are written only by the retire and restore routes.
-            body.config.pop(RETIRED_ROLES_CONFIG_KEY, None)
-            if stored is not None and stored.config.get(RETIRED_ROLES_CONFIG_KEY):
-                body.config[RETIRED_ROLES_CONFIG_KEY] = stored.config[RETIRED_ROLES_CONFIG_KEY]
             _refuse_owner_config_write(
                 request, body.config, stored.config if stored else None, is_owner=is_owner
             )
@@ -1187,17 +1181,16 @@ def create_projects_router(
             "retired_by": "lead" if source is not None else "owner",
             "reason": body.reason.strip(),
         }
-        config = dict(project.config or {})
-        config[RETIRED_ROLES_CONFIG_KEY] = {
-            **(config.get(RETIRED_ROLES_CONFIG_KEY) or {}),
-            identity.id: retired,
-        }
-        await asyncio.to_thread(
-            project_store.update, project.id, user_id=project.user_id, config=config
-        )
-        await asyncio.to_thread(
-            project_store.delete_identity, project.id, identity.id, user_id=project.user_id
-        )
+        # One write saves the snapshot and removes the role, so a concurrent config
+        # save can't lose the snapshot.
+        if not await asyncio.to_thread(
+            project_store.retire_identity,
+            project.id,
+            identity.id,
+            retired,
+            user_id=project.user_id,
+        ):
+            raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
         if identity.active_session_id and conversation_store is not None:
             await asyncio.to_thread(
                 conversation_store.update_conversation, identity.active_session_id, archived=True
@@ -1223,9 +1216,7 @@ def create_projects_router(
                 "Only the project owner can restore a role", code=ErrorCode.FORBIDDEN
             )
         normalized = _identity_id(identity_id)
-        config = dict(project.config or {})
-        retired_roles = dict(config.get(RETIRED_ROLES_CONFIG_KEY) or {})
-        retired = retired_roles.get(normalized)
+        retired = project.retired_roles.get(normalized)
         if not isinstance(retired, dict):
             raise OmnigentError("No retired role with that ID", code=ErrorCode.NOT_FOUND)
         identity = await asyncio.to_thread(
@@ -1250,9 +1241,9 @@ def create_projects_router(
                 user_id=user_id,
                 expected=None,
             )
-        retired_roles.pop(normalized, None)
-        config[RETIRED_ROLES_CONFIG_KEY] = retired_roles
-        await asyncio.to_thread(project_store.update, project.id, user_id=user_id, config=config)
+        await asyncio.to_thread(
+            project_store.drop_retired_role, project.id, normalized, user_id=user_id
+        )
         await _record_role_event(request, project, user_id, "role.restored", identity.id, None)
         announce_projects_changed(user_id)
         return await _identity_payload(project, identity)
