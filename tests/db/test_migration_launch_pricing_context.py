@@ -10,10 +10,12 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy.orm import Session
 
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
-from omnigent.db.db_models import ConversationBase, OmnigentBase, SqlConversationMetadata
+from omnigent.db.db_models import ConversationBase, OmnigentBase, SqlConversationMetadata, Uuid16
 from omnigent.db.utils import (
     _build_alembic_config,
     _get_current_db_revision,
@@ -263,4 +265,86 @@ def test_startup_recovers_an_interrupted_pricing_reference_upgrade(
                 column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
             }
             _migrate(db_uri, engine, "stamp" if present else "upgrade", _REVISION)
+        _migrate(db_uri, engine, "upgrade", head)
+
+
+@pytest.mark.parametrize("incompatible", ["wrong-type", "not-null"])
+def test_startup_preserves_an_incompatible_existing_pricing_reference(
+    db_uri: str, incompatible: str, record_property: Callable[[str, object], None]
+) -> None:
+    engine = get_or_create_engine(db_uri)
+    head = _get_head_db_revision(db_uri)
+    _migrate(db_uri, engine, "downgrade", _PREVIOUS)
+    value = 17 if incompatible == "wrong-type" else _SESSION_ID
+    statements: list[str] = []
+
+    def record(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    try:
+        with engine.connect() as connection:
+            if engine.dialect.name == "cockroachdb":
+                _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+            operation = Operations(MigrationContext.configure(connection))
+            operation.add_column(
+                _TABLE,
+                sa.Column(
+                    _COLUMN,
+                    sa.Integer() if incompatible == "wrong-type" else Uuid16(),
+                    nullable=incompatible != "not-null",
+                ),
+            )
+            connection.commit()
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"INSERT INTO {_TABLE} (workspace_id, id, kind, {_COLUMN}) "
+                    "VALUES (0, :id, 1, :context)"
+                ),
+                {"id": _SESSION_ID, "context": value},
+            )
+        sa.event.listen(engine, "before_cursor_execute", record)
+        try:
+            with pytest.raises(RuntimeError) as error:
+                _initialize_or_verify_schema(engine, db_uri)
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", record)
+        cause = error.value
+        while cause.__cause__ is not None:
+            cause = cause.__cause__
+        assert "launch_pricing_context_id column has an incompatible schema" in str(cause)
+        assert not any(
+            statement.lstrip().upper().startswith(("ALTER TABLE", "UPDATE "))
+            for statement in statements
+        )
+        assert _get_current_db_revision(engine) == _PREVIOUS
+        with engine.connect() as connection:
+            assert (
+                connection.scalar(
+                    sa.text(f"SELECT {_COLUMN} FROM {_TABLE} WHERE id = :id"),
+                    {"id": _SESSION_ID},
+                )
+                == value
+            )
+        record_property(
+            "launch_pricing_incompatible_schema",
+            json.dumps(
+                {
+                    "dialect": engine.dialect.name,
+                    "incompatible": incompatible,
+                    "existing_value_preserved": True,
+                    "revision_unchanged": True,
+                    "alter_or_version_update_attempts": 0,
+                }
+            ),
+        )
+    finally:
+        if _COLUMN in {column["name"] for column in sa.inspect(engine).get_columns(_TABLE)}:
+            with engine.connect() as connection:
+                if engine.dialect.name == "cockroachdb":
+                    _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+                operation = Operations(MigrationContext.configure(connection))
+                with operation.batch_alter_table(_TABLE) as batch:
+                    batch.drop_column(_COLUMN)
+                connection.commit()
         _migrate(db_uri, engine, "upgrade", head)

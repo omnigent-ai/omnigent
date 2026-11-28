@@ -41,6 +41,11 @@ replica or job that can reopen the database. Confirm that deployments that
 apply migrations on first connection have completed this compatibility step.
 This proposal does not change or bypass that guard.
 
+If the column commits before Alembic records this revision, startup can resume
+the upgrade. It accepts the existing column only when its reflected type,
+nullability and default match the proposed schema. An incompatible column stops
+the migration without rewriting the column, its data or the revision ledger.
+
 Normal application rollback leaves the extra column in place and uses a build
 that still knows this revision. A downgrade to an earlier build requires
 stopping all database clients, using a migration-aware build to downgrade,
