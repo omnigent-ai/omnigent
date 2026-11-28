@@ -784,6 +784,10 @@ class SqlConversationMetadata(OmnigentBase):
     session_usage: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
     # JSON-encoded provider binding and model catalog captured at session creation.
     inference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Keep the optional launch-pricing artifact reference out of ordinary reads.
+    launch_pricing_context_id: Mapped[str | None] = mapped_column(
+        Uuid16(), nullable=True, deferred=True
+    )
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
