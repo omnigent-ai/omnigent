@@ -383,6 +383,41 @@ def _mark_viewer_data(files: GadgetFiles) -> None:
             files.create_json(VIEWER_DATA_MARKER, {"viewer_data": True})
 
 
+def _stored_revision(value: dict) -> dict:
+    """A revision as it is stored: viewer collections' schemas in ``viewer_collections``.
+
+    ``collections`` then holds only the shared ones, which is all a server from before
+    per-viewer collections reads: it can never treat a viewer collection as shared. Rules
+    that name a viewer collection fail its validation, so it refuses the whole revision; a
+    page without such rules loads, and its viewer collections are undeclared there.
+    """
+    scopes = value.get("collection_scopes", {})
+    if not scopes:
+        return value
+    stored = {key: item for key, item in value.items() if key != "collection_scopes"}
+    stored["collections"] = {
+        name: schema for name, schema in value["collections"].items() if name not in scopes
+    }
+    stored["viewer_collections"] = {
+        name: schema for name, schema in value["collections"].items() if name in scopes
+    }
+    return stored
+
+
+def _logical_revision(stored: dict) -> dict:
+    """The stored revision with every collection in ``collections`` and the viewer ones named
+    in ``collection_scopes``, as the rest of the service and clients see it."""
+    viewer = stored.get("viewer_collections")
+    if not viewer:
+        return stored
+    if not isinstance(viewer, dict) or not isinstance(stored.get("collections"), dict):
+        raise CorruptData("Invalid frontend revision")
+    value = {key: item for key, item in stored.items() if key != "viewer_collections"}
+    value["collections"] = {**stored["collections"], **viewer}
+    value["collection_scopes"] = dict.fromkeys(viewer, "viewer")
+    return value
+
+
 def _scope_digest(schema: Any, scope: str) -> str:
     """A collection's identity: its schema, and its scope when that isn't ``shared``, so
     publishing a change of either is refused. Shared collections keep their old digest."""
@@ -552,6 +587,7 @@ class GadgetService:
             raise NotFound("Revision not found") from None
         if value.get("id") != revision_id:
             raise CorruptData("Invalid frontend revision")
+        value = _logical_revision(value)
         try:
             _frontend_input(value)
         except (InvalidInput, CapacityExceeded) as exc:
@@ -749,7 +785,7 @@ class GadgetService:
             files = self._files(copied)
             value = {**revision, "id": uuid.uuid4().hex}
             files.mkdirs("code/revisions")
-            files.create_json(f"code/revisions/{value['id']}.json", value)
+            files.create_json(f"code/revisions/{value['id']}.json", _stored_revision(value))
             # Before publishing, so the copy's rules count these records as existing data.
             target = ImmutableDocumentStore(files, "data", limits=_DATA_STORE_LIMITS)
             for collection, record_id, record in records:
@@ -1154,7 +1190,7 @@ class GadgetService:
             value["collection_scopes"] = scopes
         files = self._files(gadget)
         files.mkdirs("code/revisions")
-        files.create_json(f"code/revisions/{revision_id}.json", value)
+        files.create_json(f"code/revisions/{revision_id}.json", _stored_revision(value))
         # Naming the scopes back lets a client tell a server that kept them from an older one
         # that dropped the field and would make every collection shared.
         return {"id": revision_id, "collection_scopes": scopes}
