@@ -70,6 +70,7 @@ const cases: [string, string, number, string?][] = [
   ["deep ordered marker duplicate", "1. word\n   1. word\n      1. ⟦1⟧\n2. word", 0, "1"],
   ["alphabetic and roman list markers", "a. word\n   i. word\n   ii. **⟦word⟧**\nb. word", 2],
   ["ordered list blank lines", "1. word\n\n   1. word\n\n2. ⟦word⟧\n", 2],
+  ["ordered item fence", "1. word\n\n   word\n\n   ```js\n   word ⟦word⟧\n   ```\n2. word", 3],
   ["heading marker", "# ⟦#⟧ hello\n\n#", 0, "#"],
   ["ordered list marker", "1. ⟦1⟧\n2. 1", 0, "1"],
   ["single-tilde strikethrough", `~word~ **⟦word⟧** word\n\n${link}`, 1],

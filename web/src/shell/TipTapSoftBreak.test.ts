@@ -18,6 +18,7 @@ import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
 import { SOFT_BREAK_NODE, SoftBreak } from "./TipTapSoftBreak";
+import { AlignedOrderedList } from "./tiptapOrderedList";
 import { findMatches } from "./TipTapSearchExtension";
 import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
 import {
@@ -49,8 +50,15 @@ afterEach(() => {
 
 function viewerExtensions(withSoftBreak: boolean) {
   return [
-    StarterKit.configure({ link: false, blockquote: false, listItem: false, codeBlock: false }),
+    StarterKit.configure({
+      link: false,
+      blockquote: false,
+      listItem: false,
+      codeBlock: false,
+      orderedList: false,
+    }),
     SafeListItem,
+    AlignedOrderedList,
     CodeBlockWithLanguage,
     TaskList,
     TaskItem.configure({ nested: true }),
@@ -178,6 +186,61 @@ describe("SoftBreak serialisation", () => {
     editor = makeEditor(md);
     expect(softBreakPositions(editor.state.doc).length).toBeGreaterThan(0);
     expect(editor.getMarkdown().trim()).toBe(roundTrip(md, false));
+  });
+
+  it("keeps blocks after a table in an ordered item on the item's column", () => {
+    const wrapped = [
+      "For every table in the shared lineage, the job creates a view that",
+      "links the lineage to",
+      "it.",
+    ];
+    const json = '{\n  "consumer_schema": "<hub catalog>.lineage_demo"\n}';
+    const md = [
+      "1. **Setup:** first",
+      "",
+      "2. **Task:**",
+      "",
+      "   | Field | Value |",
+      "   |---|---|",
+      "   | Task name | `stitch_lineage` |",
+      "",
+      "   In the task's **Parameters** section, paste this:",
+      "",
+      "   ```json",
+      ...json.split("\n").map((line) => `   ${line}`),
+      "   ```",
+      "",
+      ...wrapped.map((line) => `   ${line}`),
+      "",
+      "3. **Trigger:** run",
+    ].join("\n");
+    editor = makeEditor(md);
+    const task = editor.state.doc.child(0).child(1);
+    const children = Array.from({ length: task.childCount }, (_, index) => task.child(index));
+    expect(children.map((child) => child.type.name)).toEqual([
+      "paragraph",
+      "table",
+      "paragraph",
+      "codeBlock",
+      "paragraph",
+    ]);
+    expect(children[3].attrs.language).toBe("json");
+    expect(children[3].textContent).toBe(json);
+    expect(children[4].textContent).toBe(wrapped.join("\n"));
+    expect(softBreakPositions(children[4])).toHaveLength(wrapped.length - 1);
+
+    const saved = editor.getMarkdown();
+    expect(saved).toContain(
+      ["   ```json", ...json.split("\n").map((line) => `   ${line}`)].join("\n"),
+    );
+    expect(saved).toContain(wrapped.map((line) => `   ${line}`).join("\n"));
+    expect(roundTrip(saved, true)).toBe(saved.trim());
+  });
+
+  it("keeps a nested ordered item's paragraph at a stable indent across saves", () => {
+    const saved = roundTrip("1. first\n   1. child\n\n      para\n      wrapped\n2. next", true);
+    expect(saved).toMatch(/^ +para\n +wrapped$/m);
+    expect(roundTrip(saved, true)).toBe(saved);
   });
 
   it("keeps the surrounding soft breaks when the user edits a line", () => {

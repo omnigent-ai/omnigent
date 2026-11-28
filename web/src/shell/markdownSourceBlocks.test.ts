@@ -208,6 +208,13 @@ describe("saving after an edit", () => {
     expect(saved(ed)).toBe("![a](a.png)\n\n![b](b.png)\n\n- new text");
   });
 
+  it("keeps a fence after a paragraph in an edited ordered item", () => {
+    const fence = "```js\n   x\n     y\n   ```";
+    const ed = makeEditor(`1. word\n\n   para\n\n   ${fence}\n\n   after\n2. next`);
+    ed.commands.insertContentAt(textPosition(ed, "next"), "the ");
+    expect(saved(ed)).toBe(`1. word\n\n   para\n   ${fence}\n\n   after\n2. the next`);
+  });
+
   it("serialises references when the definitions change", () => {
     const markdown = "See [x][r] and https://example.com\n\n[r]: /r";
     const ed = makeEditor(markdown);

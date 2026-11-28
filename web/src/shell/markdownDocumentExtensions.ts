@@ -10,6 +10,7 @@ import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { SoftBreak } from "./TipTapSoftBreak";
 import { BoundedTable, BoundedTaskList } from "./tiptapBoundedTokenizers";
+import { AlignedOrderedList } from "./tiptapOrderedList";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
 
 // Parsed list items may start with a nested list, code block, quote, heading or
@@ -29,8 +30,11 @@ export function createMarkdownDocumentExtensions(
       blockquote: false,
       listItem: false,
       codeBlock: false,
+      orderedList: false,
     }),
     SafeListItem,
+    // Keeps blocks indented under an ordered item on its content column.
+    AlignedOrderedList,
     CodeBlockWithLanguage,
     // StarterKit lacks TaskList/TaskItem; these parse and round-trip GFM `- [ ]`
     // checkboxes, and `nested` lets Tab indent sub-checklists.

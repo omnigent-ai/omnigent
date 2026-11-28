@@ -280,6 +280,10 @@ instead of treating one comparison clip as complete feature verification.
   after a list, an unclosed fence), re-serialize the whole file, so an unrelated
   block's syntax can still change after a deletion. An edited block is separated from
   its neighbours by exactly one blank line. `web/src/shell/markdownSourceBlocks.ts`.
+- Ordered-list continuation lines are realigned to the item's content column
+  before tokenizing, and code blocks accept fences indented up to three spaces.
+  `web/src/shell/tiptapOrderedList.test.ts` checks list extents against
+  upstream. Remove each workaround once upstream TipTap parses that shape.
 - Load measurements do not establish typing latency. Dirty detection compares
   immutable editor documents; autosave writes edited blocks only.
   Changes that serialize identically become clean when autosave checks them.
