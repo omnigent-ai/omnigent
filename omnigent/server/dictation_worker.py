@@ -23,27 +23,71 @@ Then start the main server pointed at it::
 The same ``OMNIGENT_DICTATION_*`` env vars configure the worker itself
 (model dirs, stream cap, fake engine for tests).
 
-Security: the worker has NO authentication — it accepts raw audio from
-anyone who can reach the port and returns transcripts. Bind it to a
-trusted network (LAN/VPN) only; the main server enforces user auth on
-its own dictation route before relaying.
+Security: set the same ``OMNIGENT_DICTATION_WORKER_TOKEN`` (e.g.
+``openssl rand -hex 32``) on the worker and the main server so the worker
+requires ``Authorization: Bearer <token>``. With a token, the main server
+only connects over ``wss://`` (or ``ws://`` to loopback); serve TLS with
+uvicorn directly::
+
+    python -m uvicorn omnigent.server.dictation_worker:create_worker_app \\
+        --factory --host 0.0.0.0 --port 8100 \\
+        --ssl-certfile cert.pem --ssl-keyfile key.pem
+
+Without a token the worker has NO authentication — it accepts raw audio
+from anyone who can reach the port. Bind it to a trusted network
+(LAN/VPN) only. The main server enforces user auth on its own dictation
+route before relaying.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import secrets
 from collections.abc import Sequence
 
 from fastapi import FastAPI
+from starlette.requests import HTTPConnection
 
+from omnigent.server.auth import AuthProvider
+from omnigent.server.dictation import worker_token
 from omnigent.server.routes.dictation import create_dictation_router
+
+_WORKER_USER_ID = "dictation-worker"
+
+
+class _WorkerTokenAuth(AuthProvider):
+    """Accepts exactly one ``Authorization: Bearer <token>`` header."""
+
+    def __init__(self, token: str) -> None:
+        self._token = token.encode("ascii")
+
+    def __repr__(self) -> str:
+        return "_WorkerTokenAuth()"
+
+    def get_user_id(self, request: HTTPConnection) -> str | None:
+        values = request.headers.getlist("authorization")
+        if len(values) != 1:
+            return None
+        scheme, _, credential = values[0].partition(" ")
+        if scheme.lower() != "bearer" or not credential or " " in credential:
+            return None
+        # Starlette decodes headers as latin-1, so this round-trips any bytes.
+        if not secrets.compare_digest(credential.encode("latin-1"), self._token):
+            return None
+        return _WORKER_USER_ID
 
 
 def create_worker_app() -> FastAPI:
-    """Build the single-route worker app."""
+    """Build the single-route worker app.
+
+    :raises ValueError: When ``OMNIGENT_DICTATION_WORKER_TOKEN`` is set
+        but invalid, so a typo fails startup instead of disabling auth.
+    """
+    token = worker_token()
+    auth_provider = _WorkerTokenAuth(token) if token is not None else None
     app = FastAPI(title="omnigent dictation worker")
-    app.include_router(create_dictation_router(), prefix="/v1")
+    app.include_router(create_dictation_router(auth_provider=auth_provider), prefix="/v1")
     return app
 
 
@@ -54,7 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--host",
         default="127.0.0.1",
         help="bind address; use a LAN/VPN address for a remote main server "
-        "(the worker is unauthenticated — never expose it publicly)",
+        "(without OMNIGENT_DICTATION_WORKER_TOKEN the worker is unauthenticated)",
     )
     parser.add_argument("--port", type=int, default=8100)
     args = parser.parse_args(argv)
