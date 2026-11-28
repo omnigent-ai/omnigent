@@ -313,7 +313,8 @@ the header menu), and each place is a separate entry point.
 - `import-progress`: import recent sessions or one session by ID from an online
   machine. Settings shows a spinner and count; the sidebar heading retains
   progress after leaving Settings. Results stay compact, with expandable failure
-  details and retry of the original selection.
+  details and retry of the original selection. A session-ID import can replace
+  an earlier snapshot that was never resumed in Omnigent.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
   Pi imports retain readable history and compaction checkpoints; continuation
   uses the latest summary, retained context and subsequent turns.
@@ -526,10 +527,11 @@ Quoted replies recover as serialized text.
 sessions** on the empty landing. The X beside the landing button dismisses the
 suggestion and keeps it hidden after reload in this browser; Settings → Import
 sessions remains available. Choose a machine, harness, and recent count
-or session ID. After starting, go Back to the session list; its heading shows
-progress and links back to Settings. Imported sessions appear in the normal list,
-except Codex threads archived in Codex, which land in Archived, so the list can
-show fewer sessions than the import count.
+or session ID. For a session ID, turn on **Replace existing snapshot** to refresh
+an earlier import with the latest transcript. After starting, go Back to the
+session list; its heading shows progress and links back to Settings. Imported
+sessions appear in the normal list, except Codex threads archived in Codex, which
+land in Archived, so the list can show fewer sessions than the import count.
 On phones, the progress link opens the Import panel directly; its header arrow
 returns to the Settings menu.
 For a local Pi session, the CLI also accepts
@@ -1495,6 +1497,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_import_oversized_session.py` verifies recent and
   exact-ID imports through a real host when a transcript exceeds the tunnel's
   message cap; the batch summary links to all three sessions in the sidebar.
+  `tests/e2e_ui/sessions/test_import_refresh_drifted_session.py` re-imports a
+  grown session by ID through a real host and replaces the stale snapshot.
   Component coverage checks compact large batches, failure expansion, retry
   after navigation, and collapsed headings. `web/src/shell/NewChatDialog.test.tsx`
   covers the landing import link and dismissal, including persistence after
