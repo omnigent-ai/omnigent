@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -274,3 +275,78 @@ async def test_shell_command_lost_reply_never_probes_for_a_receipt(
             )
     request.assert_awaited_once_with("thread/shellCommand", params)
     connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_number", [1, 2])
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+async def test_receipt_binding_read_does_not_block_deadline_or_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_number: int, stop: str
+) -> None:
+    """A stalled ownership read cannot hold the loop or confirm a late receipt."""
+    client, request, connect, state = _lost_reply_setup(tmp_path, monkeypatch)
+    request.side_effect = None
+    request.return_value = {
+        "result": {
+            "thread": {
+                "id": state.thread_id,
+                "turns": [
+                    {
+                        "id": "turn_accepted",
+                        "items": [{"type": "userMessage", "id": "item", "clientId": "receipt"}],
+                    }
+                ],
+            }
+        }
+    }
+    loop = asyncio.get_running_loop()
+    read_started = asyncio.Event()
+    release_read = threading.Event()
+    read_finished = threading.Event()
+    original_read = Path.read_text
+    reads = 0
+
+    def delayed_read(path: Path, *args, **kwargs) -> str:
+        nonlocal reads
+        if path == tmp_path / "state.json":
+            reads += 1
+            if reads == read_number:
+                loop.call_soon_threadsafe(read_started.set)
+                try:
+                    assert release_read.wait(2), "ownership read blocked the event loop"
+                finally:
+                    read_finished.set()
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", delayed_read)
+    monkeypatch.setattr(
+        native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0.1 if stop == "timeout" else 5
+    )
+    task = asyncio.create_task(
+        native_executor._read_native_delivery_receipt(
+            client,
+            state,
+            bridge_dir=tmp_path,
+            client_message_id="receipt",
+            requested_turn_id=None,
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), 1)
+        assert not release_read.is_set()
+        if stop == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+        else:
+            assert await asyncio.wait_for(task, 1) is None
+        assert not release_read.is_set()
+        assert request.await_count == read_number - 1
+        assert connect.await_count == read_number - 1
+    finally:
+        release_read.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(read_finished.wait, 2)
+        await client.close()
+    assert task.cancelled() if stop == "cancel" else task.result() is None
