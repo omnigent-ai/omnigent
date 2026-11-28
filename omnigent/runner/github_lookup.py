@@ -49,7 +49,10 @@ def _reference(pr_url: str) -> PullRequestRef:
 
 def _query(root: str, host: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
     """One read-only GraphQL query on ``host`` as gh's active account, keeping partial data."""
-    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+    with (
+        github.gh_target_host_scope(host),
+        github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS),
+    ):
         _, output, _ = github._pr_json_write(
             root,
             host=["--hostname", host],

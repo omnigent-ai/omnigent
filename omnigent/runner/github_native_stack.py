@@ -379,7 +379,10 @@ def pull_request_native_stack(root: str, reference: PullRequestRef) -> dict[str,
     if not github._known_github_host(reference.host):
         raise PullRequestError(_UNKNOWN_HOST)
     owner, name = reference.repository.split("/", 1)
-    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+    with (
+        github.gh_target_host_scope(reference.host),
+        github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS),
+    ):
         token = github._pr_token(root, reference)
         # gh exits non-zero when the answer has errors, and still prints it.
         _, output, _ = github._pr_json_write(

@@ -376,6 +376,7 @@ def read_pull_request_image(
     if not github._known_github_host(reference.host):
         raise ValueError(_UNKNOWN_HOST)
     with (
+        github.gh_target_host_scope(reference.host),
         github._one_pr_account(root, reference, timed_out=_AUTHENTICATION_TIMED_OUT),
         github._gh_deadline_scope(time.monotonic() + _READ_TOKEN_SECONDS),
     ):

@@ -298,7 +298,10 @@ def test_a_reviewer_edit_past_its_deadline_reports_an_unknown_outcome(
 
     monkeypatch.setattr(github, "_run", run)
 
-    with pytest.raises(ValueError, match="took too long to update the reviewers"):
+    with (
+        github.gh_target_host_scope("github.com"),
+        pytest.raises(ValueError, match="took too long to update the reviewers"),
+    ):
         github._edit_reviewers(
             "/workspace",
             PullRequestRef.from_url(PR_URL),

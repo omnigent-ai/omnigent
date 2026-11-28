@@ -357,7 +357,10 @@ def test_a_label_edit_past_its_deadline_reports_an_unknown_outcome(
 
     monkeypatch.setattr(github, "_run", run)
 
-    with pytest.raises(ValueError, match="took too long to update the labels"):
+    with (
+        github.gh_target_host_scope("github.com"),
+        pytest.raises(ValueError, match="took too long to update the labels"),
+    ):
         github._edit_labels(
             "/workspace", PullRequestRef.from_url(PR_URL), add=["ready"], remove=["bug"]
         )

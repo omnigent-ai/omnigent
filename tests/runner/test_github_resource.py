@@ -97,11 +97,13 @@ def test_gh_starts_gh_with_todays_command_and_environment(
 ) -> None:
     """Pin the process every ``gh`` call starts: command, environment, cwd and timeout."""
     monkeypatch.setattr(github_resource, "_in_sandbox", lambda: sandbox)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "ghe.example.test")
     # The synthetic environment, plus what pytest itself sets during the call.
     ambient = dict(os.environ)
     argv = ["pr", "view", "7", "-R", "ghe.example.test/acme/repo", "--json", "number"]
 
-    result = github_resource._gh(argv, cwd="/workspace", token=token)
+    with github_resource.gh_target_host_scope("ghe.example.test"):
+        result = github_resource._gh(argv, cwd="/workspace", token=token)
 
     if not sandbox and token is None:
         expected_env = None
@@ -144,6 +146,7 @@ def test_concurrent_steps_keep_their_own_target_host(
 ) -> None:
     """Two steps for different hosts, overlapping in two threads, each see only their own."""
     monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "one.example.test,two.example.test")
     built = github_resource._gh_invocation
     hosts_by_thread: dict[str, list[str | None]] = {}
     both_scoped = threading.Barrier(2, timeout=budget(10))

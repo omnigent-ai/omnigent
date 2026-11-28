@@ -133,7 +133,9 @@ def created_prs(
             # Stdout names any host; query only hosts a local account signs in to.
             if reference.host.lower() not in {host for host, _ in logins}:
                 continue
-            if (output := lookup(reference)) is None:
+            with github_resource.gh_target_host_scope(reference.host):
+                output = lookup(reference)
+            if output is None:
                 continue
             author, _, created_at = output.strip().partition(" ")
             if (reference.host.lower(), author.lower()) not in logins:

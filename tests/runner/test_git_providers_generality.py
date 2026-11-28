@@ -398,7 +398,7 @@ def test_legacy_resources_route_a_mixed_provider_session(
             assert args[-1] == "github.com/example/project"
             return 0, "github patch", ""
         assert args[-1].startswith("repos/example/project/pulls/42/files")
-        return 0, json.dumps([[{"filename": "github.py", "status": "modified"}]]), ""
+        return 0, json.dumps([{"filename": "github.py", "status": "modified"}]), ""
 
     monkeypatch.setattr(github, "_gh", gh)
     info = github.github_info(repo, session_id="mixed-session")

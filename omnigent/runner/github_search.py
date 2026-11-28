@@ -44,7 +44,10 @@ def _searching(root: str, reference: PullRequestRef) -> Iterator[str | None]:
     """
     if not github._known_github_host(reference.host):
         raise PullRequestError(_UNKNOWN_HOST)
-    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+    with (
+        github.gh_target_host_scope(reference.host),
+        github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS),
+    ):
         yield github._pr_token(root, reference)
 
 
@@ -359,7 +362,10 @@ def branch_pull_requests(root: str, *, branch: str) -> dict[str, Any]:
     pushed_to = _remote_repository(root, _push_remote(root, branch))
     source = pushed_to[1] if pushed_to is not None and pushed_to[0] == host else repository
     owner = source.split("/", 1)[0]
-    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+    with (
+        github.gh_target_host_scope(host),
+        github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS),
+    ):
         # GitHub keeps only the owner's branch before it cuts the page, so other forks'
         # same-named branches can't crowd this one out. Each field is sent URL-encoded.
         rc, output, _ = github._gh(

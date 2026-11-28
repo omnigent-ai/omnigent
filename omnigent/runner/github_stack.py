@@ -97,6 +97,7 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
     A pull request from the default branch, such as a backport, has no stack.
     """
     with (
+        github._own_scope(reference.host),
         github._gh_deadline_scope(time.monotonic() + WALK_SECONDS),
         github._gh_call_count_scope() as calls,
     ):

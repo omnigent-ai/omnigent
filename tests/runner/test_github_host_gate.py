@@ -1,0 +1,216 @@
+"""The gate every ``gh`` call passes before it starts: the host it names must be its scope's.
+
+A pull request URL can name any host, and ``gh`` sends a token to the host it's told to, so
+a refused call starts no process at all.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+
+import pytest
+
+from omnigent.runner import github_resource
+from omnigent.runner.session_prs import PullRequestRef
+
+KNOWN = "ghe-b.example.com"
+OTHER_KNOWN = "ghe-a.example.com"
+UNKNOWN = "pr-host.example.com"
+RUNNER = Path(github_resource.__file__).parent
+
+
+@pytest.fixture
+def started(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Record the argv of each process ``_gh`` starts; two hosts are set up for GitHub."""
+    starts: list[list[str]] = []
+
+    def run(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        starts.append(argv)
+        if argv[1:4] == ["auth", "status", "--json"]:
+            hosts = {
+                host: [{"login": "octo", "state": "success"}] for host in (KNOWN, OTHER_KNOWN)
+            }
+            return 0, json.dumps({"hosts": hosts}), ""
+        if argv[-2:] == ["--jq", ".id"]:
+            return 0, "123", ""
+        return 0, "{}", ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", f"{KNOWN},{OTHER_KNOWN}")
+    monkeypatch.setattr(github_resource._config, "github_account_preference", lambda _key: None)
+    return starts
+
+
+@pytest.mark.parametrize(
+    ("scope", "argv"),
+    [
+        # A host named with no scope, or another scope's, never runs.
+        (None, ["api", "--hostname", KNOWN, "x"]),
+        (None, ["pr", "view", "1", "-R", f"{KNOWN}/o/r"]),
+        (OTHER_KNOWN, ["api", "--hostname", KNOWN, "x"]),
+        (OTHER_KNOWN, ["repo", "view", f"{KNOWN}/o/r", "--json", "name"]),
+        (OTHER_KNOWN, ["pr", "view", f"https://{KNOWN}/o/r/pull/1", "--json", "title"]),
+        (
+            OTHER_KNOWN,
+            ["api", "-X", "POST", f"https://{KNOWN}/api/uploads/user-attachments/assets"],
+        ),
+        # A scope on a host the user never set up runs nothing, even a call naming no host.
+        (UNKNOWN, ["api", "--hostname", UNKNOWN, "x"]),
+        (UNKNOWN, ["auth", "status", "--json", "hosts"]),
+        (UNKNOWN, ["auth", "token", "-h", UNKNOWN]),
+        # Commands and flags the panel doesn't run.
+        (KNOWN, ["pr", "create", "-R", f"{KNOWN}/o/r"]),
+        (KNOWN, ["api", "--hostname", KNOWN, "--paginate", "x"]),
+        (KNOWN, ["auth", "status", "--show-token"]),
+    ],
+)
+def test_a_refused_call_starts_no_process(
+    started: list[list[str]], scope: str | None, argv: list[str]
+) -> None:
+    with github_resource.gh_target_host_scope(scope):
+        rc, out, err = github_resource._gh(argv, cwd="/workspace", token="chosen-token")
+
+    assert started == []
+    assert (rc, out) == (1, "")
+    assert err.startswith(github_resource.GH_REFUSED)
+    assert "chosen-token" not in err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["api", "--hostname", KNOWN, "x"],
+        ["pr", "view", "1", "-R", f"{KNOWN}/o/r"],
+        ["api", "-X", "POST", f"https://{KNOWN}/api/uploads/user-attachments/assets"],
+        ["auth", "status", "--json", "hosts"],
+        ["api", "repos/o/r/commits/abc/pulls"],
+    ],
+)
+def test_a_call_naming_its_scopes_known_host_or_none_runs(
+    started: list[list[str]], argv: list[str]
+) -> None:
+    with github_resource.gh_target_host_scope(KNOWN.upper()):
+        github_resource._gh(argv, cwd="/workspace")
+
+    assert started == [["gh", *argv]]
+
+
+def test_github_com_needs_no_set_up_but_still_its_own_scope(started: list[list[str]]) -> None:
+    with github_resource.gh_target_host_scope("github.com"):
+        github_resource._gh(["api", "--hostname", "github.com", "x"], cwd="/workspace")
+        github_resource._gh(["api", "--hostname", KNOWN, "x"], cwd="/workspace")
+
+    assert started == [["gh", "api", "--hostname", "github.com", "x"]]
+
+
+def test_an_attachment_upload_goes_only_to_its_own_pull_requests_host(
+    started: list[list[str]],
+) -> None:
+    """The upload names its host in a full URL, with no --hostname: the scope still decides."""
+    reference = PullRequestRef.from_url(f"https://{KNOWN}/o/r/pull/7")
+
+    with github_resource.gh_target_host_scope(KNOWN), pytest.raises(ValueError):
+        # The fake answers the upload with no asset URL, so it fails after it starts.
+        github_resource._upload_attachment(
+            "/workspace", reference, name="a.png", content_type="image/png", content=b"x"
+        )
+    uploads = [argv for argv in started if any("/api/uploads/" in part for part in argv)]
+    assert len(uploads) == 1
+    assert any(part.startswith(f"https://{KNOWN}/api/uploads/") for part in uploads[0])
+
+    started.clear()
+    with github_resource.gh_target_host_scope(OTHER_KNOWN), pytest.raises(ValueError):
+        github_resource._upload_attachment(
+            "/workspace", reference, name="a.png", content_type="image/png", content=b"x"
+        )
+    assert not any(KNOWN in part for argv in started for part in argv)
+
+
+def test_token_lookups_take_their_hosts_scope_and_keep_an_outer_one(
+    started: list[list[str]],
+) -> None:
+    assert github_resource._gh_active_token("/workspace", KNOWN) == "{}"
+    with github_resource.gh_target_host_scope(OTHER_KNOWN):
+        assert github_resource._gh_active_token("/workspace", KNOWN) is None
+
+    assert started == [["gh", "auth", "token", "-h", KNOWN]]
+
+
+# Calls that start a process from their first argument.
+_PROCESS_STARTS = frozenset(
+    {
+        "run",
+        "Popen",
+        "call",
+        "check_call",
+        "check_output",
+        "system",
+        "spawn",
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+        "_run",
+    }
+)
+
+
+def _names_gh(node: ast.AST) -> bool:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return bool(node.elts) and _names_gh(node.elts[0])
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and (node.value == "gh" or node.value.startswith("gh "))
+    )
+
+
+def _gh_process_starts(tree: ast.AST) -> list[tuple[int, str]]:
+    """Each ``gh`` command line built as a list, or passed to a process start, by line."""
+    found: list[tuple[int, str]] = []
+
+    def visit(node: ast.AST, function: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function = node.name
+        if isinstance(node, (ast.List, ast.Tuple)) and _names_gh(node):
+            found.append((node.lineno, function))
+        if isinstance(node, ast.Call) and node.args:
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if (
+                name in _PROCESS_STARTS
+                and _names_gh(node.args[0])
+                and not isinstance(node.args[0], (ast.List, ast.Tuple))
+            ):
+                found.append((node.lineno, function))
+        for child in ast.iter_child_nodes(node):
+            visit(child, function)
+
+    visit(tree, "<module>")
+    return found
+
+
+def test_every_gh_process_in_the_runner_starts_through_the_gate() -> None:
+    """No runner code builds a ``gh`` command line outside ``_gh_invocation``."""
+    outside = [
+        f"{path.relative_to(RUNNER)}:{line} in {function}"
+        for path in sorted(RUNNER.rglob("*.py"))
+        for line, function in _gh_process_starts(ast.parse(path.read_text(encoding="utf-8")))
+        if (path.name, function) != ("github_resource.py", "_gh_invocation")
+    ]
+
+    assert outside == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'subprocess.run(["gh", "api", "user"])',
+        'subprocess.run("gh api user", shell=True)',
+        'os.system("gh auth token")',
+        'asyncio.create_subprocess_exec("gh", "api")',
+        'argv = ("gh", "pr", "view")',
+    ],
+)
+def test_the_audit_finds_each_way_to_start_gh(source: str) -> None:
+    assert _gh_process_starts(ast.parse(source)) != []

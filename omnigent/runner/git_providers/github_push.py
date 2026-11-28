@@ -155,9 +155,10 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
             if time.monotonic() >= deadline:
                 break
             endpoint = f"repos/{repository}/commits/{quote(branch, safe='')}/pulls"
-            code, output, _ = github_resource._gh(
-                ["api", "--hostname", host, endpoint], cwd=tempfile.gettempdir(), timeout=5.0
-            )
+            with github_resource.gh_target_host_scope(host):
+                code, output, _ = github_resource._gh(
+                    ["api", "--hostname", host, endpoint], cwd=tempfile.gettempdir(), timeout=5.0
+                )
             if code != 0:
                 continue
             try:

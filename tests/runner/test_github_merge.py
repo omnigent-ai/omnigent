@@ -286,7 +286,10 @@ def test_a_merge_past_its_deadline_reports_an_unknown_outcome(
 
     monkeypatch.setattr(github, "_run", run)
 
-    with pytest.raises(ValueError, match="took too long to merge"):
+    with (
+        github.gh_target_host_scope("github.com"),
+        pytest.raises(ValueError, match="took too long to merge"),
+    ):
         github._merge_pr(
             "/workspace",
             PullRequestRef.from_url(PR_URL),

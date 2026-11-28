@@ -75,8 +75,8 @@ from omnigent import config as _config
 from omnigent.git_providers import EnvInstances, host_of
 from omnigent.git_providers.github import GitHubProvider
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.runner import gh_argv, pr_resource
 from omnigent.runner import github_review_fields as review_fields
-from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
     COMMIT_OBJECT,
     MERGE_OPTIONS_OBJECT,
@@ -231,6 +231,25 @@ def gh_target_host_scope(host: str | None) -> Iterator[None]:
         _gh_target_host.reset(token)
 
 
+def _gate(argv: list[str], scope: str | None) -> gh_argv.GhTarget:
+    """The host ``argv`` sends to, checked before ``gh`` starts.
+
+    A host the argv names must be the call's scope, and the scope a host the user set up
+    for GitHub: a pull request URL can name any host, and ``gh`` would send it a token.
+
+    :raises gh_argv.GhArgvRefused: For a call that mustn't run.
+    """
+    target = gh_argv.classify(argv)
+    if scope is not None and not _known_github_host(scope):
+        raise gh_argv.GhArgvRefused(f"{scope} isn't a host set up for GitHub")
+    if target.host is not None:
+        if scope is None:
+            raise gh_argv.GhArgvRefused(f"A gh call names {target.host} outside a host scope")
+        if target.host != scope:
+            raise gh_argv.GhArgvRefused(f"A gh call for {scope} names {target.host}")
+    return target
+
+
 def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> GhInvocation:
     """Return the command and environment that run ``gh`` with *argv*.
 
@@ -238,8 +257,11 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
 
     :param argv: Arguments after ``gh``.
     :param token: A GitHub token to run this one call as a chosen account, or ``None``.
-    :param host: The code host the call is for, or ``None``; every host runs ``gh``.
+    :param host: The code host the call is for, from :func:`gh_target_host_scope`, or
+        ``None`` outside one.
+    :raises gh_argv.GhArgvRefused: When the gate refuses the call; see :func:`_gate`.
     """
+    _gate(argv, host)
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -267,6 +289,12 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
     return GhInvocation(argv=["gh", *argv], env=env, host=host)
 
 
+# What a refused call answers in place of gh's stderr.
+GH_REFUSED = (
+    "Sign in to this GitHub host with gh, or set GH_HOST to it, before using its pull requests."
+)
+
+
 def _gh(
     argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
 ) -> tuple[int | None, str, str]:
@@ -278,7 +306,13 @@ def _gh(
         if timeout <= 0:
             _gh_timed_out.set(True)
             return None, "", "gh deadline exceeded"
-    invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    scope = _gh_target_host.get()
+    try:
+        invocation = _gh_invocation(argv, token=token, host=scope)
+    except gh_argv.GhArgvRefused as exc:
+        # The reason names hosts and the command, never a token.
+        _logger.warning("gh call refused before it started: %s", exc)
+        return 1, "", f"{GH_REFUSED} {exc}."
     if (count := _gh_call_count.get()) is not None:
         count.started += 1
     result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
@@ -454,9 +488,20 @@ def _workspace_key(root: str) -> str | None:
     return None
 
 
+@contextmanager
+def _own_scope(host: str) -> Iterator[None]:
+    """Scope the block to ``host`` when no step set a scope; inside one, the gate matches it."""
+    if _gh_target_host.get() is not None:
+        yield
+        return
+    with gh_target_host_scope(host):
+        yield
+
+
 def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
     """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
-    rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
+    with _own_scope(host):
+        rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
     if rc != 0:
         return None
     return out.strip() or None
@@ -464,7 +509,8 @@ def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | Non
 
 def _gh_active_token(root: str, host: str = "github.com") -> str | None:
     """Return the token of ``gh``'s active account on *host* (never logged)."""
-    rc, out, _ = _gh(["auth", "token", "-h", host], cwd=root)
+    with _own_scope(host):
+        rc, out, _ = _gh(["auth", "token", "-h", host], cwd=root)
     if rc != 0:
         return None
     return out.strip() or None

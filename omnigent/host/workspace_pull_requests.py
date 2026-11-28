@@ -20,13 +20,14 @@ from connectrpc.errors import ConnectError
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import PullRequestVouch
 from omnigent.host.workspace_pull_request_input import PullRequestRefused
-from omnigent.runner import github_lookup, github_search, pr_actions, pr_resource
+from omnigent.runner import github_lookup, github_resource, github_search, pr_actions, pr_resource
 from omnigent.runner.github_images import ImageRefused, PullRequestImage
 from omnigent.runner.pull_request_errors import (
     InvalidPullRequestInput,
     PullRequestError,
     UnknownOutcomeError,
 )
+from omnigent.runner.session_prs import PullRequestRef
 from omnigent.workspace_fs import WorkspaceReader
 
 
@@ -385,7 +386,7 @@ def run_pull_request_op(
     :raises PullRequestRefused: FAILED_PRECONDITION for a PR the session doesn't link, or
         another refusal with its code and reason; UNKNOWN for a change GitHub never confirmed.
     """
-    return _under_vouch(call, lambda: PULL_REQUEST_OPS[name](reader, call, request))
+    return _under_vouch(call, request, lambda: PULL_REQUEST_OPS[name](reader, call, request))
 
 
 def run_pull_request_stream_op(
@@ -396,12 +397,26 @@ def run_pull_request_stream_op(
     :raises PullRequestRefused: As :func:`run_pull_request_op`; UNAVAILABLE for an image
         GitHub didn't send, which a client may retry.
     """
-    return _under_vouch(call, lambda: PULL_REQUEST_STREAM_OPS[name](reader, call, request))
+    return _under_vouch(
+        call, request, lambda: PULL_REQUEST_STREAM_OPS[name](reader, call, request)
+    )
 
 
-def _under_vouch(call: PullRequestCall, operation: Callable[[], _Result]) -> _Result:
+def _request_host(request: Any) -> str | None:
+    """The host of the pull request a request names, the scope of its ``gh`` calls."""
+    url = getattr(request, "pr_url", None)
+    try:
+        return PullRequestRef.from_url(url).host if isinstance(url, str) and url else None
+    except ValueError:
+        return None
+
+
+def _under_vouch(call: PullRequestCall, request: Any, operation: Callable[[], _Result]) -> _Result:
     vouch = call.vouch or PullRequestVouch()
-    with pr_resource.server_tracking(vouch.server_tracked is True, vouch.default_pr_url):
+    with (
+        pr_resource.server_tracking(vouch.server_tracked is True, vouch.default_pr_url),
+        github_resource.gh_target_host_scope(_request_host(request)),
+    ):
         try:
             return operation()
         except ValueError as exc:

@@ -372,14 +372,16 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         return 0, '{"title": "Enterprise PR"}', ""
 
     monkeypatch.setattr(github, "_run", run)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "github.example.org")
     token = github._gh_deadline.set(12.0)
     timeout_token = github._gh_timed_out.set(False)
     try:
-        result = github._pr_json(
-            str(tmp_path),
-            PullRequestRef.from_url(A.replace("github.com", "github.example.org")),
-            "title",
-        )
+        with github.gh_target_host_scope("github.example.org"):
+            result = github._pr_json(
+                str(tmp_path),
+                PullRequestRef.from_url(A.replace("github.com", "github.example.org")),
+                "title",
+            )
         timed_out = github._gh_timed_out.get()
     finally:
         github._gh_timed_out.reset(timeout_token)
