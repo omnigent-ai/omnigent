@@ -288,6 +288,11 @@ directory footer, and extension hooks remain active; extensions can modify the
 final prompt. This setting supports `pi` and `pi-native` only. Native settings
 apply on the next terminal launch; explicit native CLI arguments remain available.
 
+### Microsoft Foundry
+
+For keyless Microsoft Foundry access through the OpenAI Agents SDK harness,
+see [Microsoft Foundry with Entra ID](AZURE_FOUNDRY.md).
+
 ### GitHub Copilot
 
 `harness: copilot` runs the agent through the

@@ -99,6 +99,103 @@ def test_model_threads_into_env_var() -> None:
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == "databricks-gpt-5-4-mini"
 
 
+def test_azure_entra_precedes_global_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_provider(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Azure authentication must not resolve another provider")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", unexpected_provider
+    )
+    spec = _make_spec(model="test-deployment", use_responses=False)
+    spec.executor.config.update(
+        {"azure_entra": True, "azure_endpoint": "https://resource.openai.azure.com"}
+    )
+    env = _build_openai_agents_sdk_spawn_env(spec)
+    assert env["HARNESS_OPENAI_AGENTS_AZURE_ENTRA"] == "1"
+    assert env["HARNESS_OPENAI_AGENTS_MODEL"] == "test-deployment"
+    assert (
+        env["HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL"]
+        == "https://resource.openai.azure.com/openai/v1/"
+    )
+    assert env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] == "false"
+    for key in ("API_KEY", "DATABRICKS_PROFILE", "GATEWAY_HOST", "GATEWAY_AUTH_COMMAND"):
+        assert env[f"HARNESS_OPENAI_AGENTS_{key}"] == ""
+
+
+@pytest.mark.parametrize(
+    "auth", [ApiKeyAuth(api_key="fixture-key"), DatabricksAuth(profile="test")]
+)
+def test_azure_entra_rejects_explicit_auth(auth: ApiKeyAuth | DatabricksAuth) -> None:
+    spec = _make_spec(model="test-deployment", auth=auth)
+    spec.executor.config.update(
+        {"azure_entra": "true", "azure_endpoint": "https://resource.openai.azure.com"}
+    )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _build_openai_agents_sdk_spawn_env(spec)
+
+
+@pytest.mark.parametrize(
+    "config,model",
+    [
+        ({"azure_entra": True}, "test-deployment"),
+        ({"azure_endpoint": "https://resource.openai.azure.com"}, "test-deployment"),
+        ({"azure_entra": "invalid"}, "test-deployment"),
+        ({"azure_entra": True, "azure_endpoint": "https://resource.openai.azure.com"}, None),
+        (
+            {"azure_entra": True, "azure_endpoint": "http://resource.openai.azure.com"},
+            "test-deployment",
+        ),
+        (
+            {
+                "azure_entra": True,
+                "azure_endpoint": "https://resource.openai.azure.com",
+                "profile": "test",
+            },
+            "test-deployment",
+        ),
+    ],
+)
+def test_azure_entra_rejects_incomplete_or_conflicting_config(
+    config: dict[str, object], model: str | None
+) -> None:
+    spec = _make_spec(model=model)
+    spec.executor.config.update(config)
+    with pytest.raises(ValueError):
+        _build_openai_agents_sdk_spawn_env(spec)
+
+
+def test_azure_entra_bundle_survives_parser(tmp_path: Path) -> None:
+    from omnigent.spec.parser import parse
+    from omnigent.spec.validator import validate
+
+    bundle = tmp_path / "azure-agent"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_text(
+        _yaml.safe_dump(
+            {
+                "spec_version": 1,
+                "name": "azure-agent",
+                "prompt": "Answer briefly.",
+                "executor": {
+                    "type": "omnigent",
+                    "model": "test-deployment",
+                    "config": {
+                        "harness": "openai-agents-sdk",
+                        "azure_entra": True,
+                        "azure_endpoint": "https://resource.openai.azure.com",
+                    },
+                },
+            }
+        )
+    )
+    spec = parse(bundle)
+    validation = validate(spec)
+    assert validation.valid, validation.errors
+    env = _build_openai_agents_sdk_spawn_env(spec)
+    assert env["HARNESS_OPENAI_AGENTS_AZURE_ENTRA"] == "1"
+    assert env["HARNESS_OPENAI_AGENTS_MODEL"] == "test-deployment"
+
+
 @pytest.mark.parametrize(
     ("use_responses", "expected"),
     [

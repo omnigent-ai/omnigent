@@ -176,6 +176,9 @@ kms = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # lazily, so only users of this backend need the extra.
 s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 vertex = ["google-auth>=2.0,<3"]
+# Keyless Microsoft Foundry authentication for the OpenAI Agents SDK harness.
+# azure.identity.aio builds an aiohttp transport; azure-core[aio] supplies it.
+azure = ["azure-identity>=1.25,<2", "azure-core[aio]>=1.31,<2"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
 # so only users of the provider need this extra.

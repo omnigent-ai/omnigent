@@ -46,6 +46,7 @@ from omnigent.models.model_metadata import (
     ModelReasoningMode,
     ModelWireAPI,
 )
+from omnigent.models.model_override import normalize_model_for_provider
 from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.providers import ModelInfo
@@ -770,6 +771,59 @@ def test_resolve_provider_openai_agents_api_key_auth_keeps_base_url(
     assert provider.family == "openai"
     assert provider.base_url == "https://gw.example.com/v1"
     assert provider.api_key == "sk-oai-inline"
+
+
+@pytest.mark.parametrize(
+    "global_config",
+    [_DATABRICKS_DEFAULT_CONFIG, "auth:\n  type: api_key\n  api_key: sk-global\n"],
+    ids=["global-provider", "global-auth"],
+)
+def test_resolve_provider_openai_agents_azure_entra_ignores_global_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, global_config: str
+) -> None:
+    """Azure Entra openai-agents workers report no enumerable provider.
+
+    The Entra launch skips global providers and auth, so the catalog must
+    not list unrelated models or rewrite deployment names.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :param global_config: Global config the Entra launch ignores.
+    """
+    _isolate_config(monkeypatch, tmp_path, global_config)
+
+    def _unexpected_request(request: httpx.Request) -> httpx.Response:
+        """Fail if the listing reaches any model endpoint."""
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(
+            type="omnigent",
+            model="databricks-gpt-deploy",
+            config={"harness": "openai-agents", "azure_entra": "true"},
+        ),
+    )
+    provider = resolve_model_provider(spec, "openai-agents")
+    assert provider.kind == "none"
+    assert provider.detail == "Azure Entra deployment (not enumerable)"
+    row = catalog_for_spec(spec, transport=httpx.MockTransport(_unexpected_request))["self"]
+    assert row["source"] == "static"
+    assert [model["id"] for model in row["models"]] == ["databricks-gpt-deploy"]
+    assert "cannot run" not in str(row["note"])
+    assert (
+        normalize_model_for_provider("databricks-gpt-deploy", provider.kind)
+        == "databricks-gpt-deploy"
+    )
+
+    spec.executor.config["azure_entra"] = False
+    assert resolve_model_provider(spec, "openai-agents").kind != "none"
+    entra_codex = _worker_spec("codex-native")
+    entra_codex.executor.config["azure_entra"] = True
+    assert resolve_model_provider(entra_codex, "codex-native") == resolve_model_provider(
+        _worker_spec("codex-native"), "codex-native"
+    )
 
 
 def test_resolve_provider_global_auth_consumed_by_claude_sdk_not_codex(
