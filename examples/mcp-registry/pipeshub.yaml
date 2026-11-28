@@ -1,0 +1,22 @@
+# Company knowledge through PipesHub, with each person signed in as themselves.
+# Merge this service into the file OMNIGENT_MCP_REGISTRY points at and replace
+# the example hosts and client ID. See "Example: company knowledge with
+# PipesHub" in README.md for the PipesHub side.
+public_url: https://omnigent.example.com
+services:
+  - id: pipeshub
+    title: PipesHub
+    description: Search your company's Slack, Jira, Confluence, Drive and GitHub, with sources.
+    url: https://pipeshub.example.com/mcp
+    auth: oauth
+    tools: [pipeshub_search, pipeshub_get_record_content]
+    oauth:
+      # Copy both endpoints from https://pipeshub.example.com/.well-known/oauth-authorization-server.
+      authorize_url: https://pipeshub.example.com/api/v1/oauth2/authorize
+      token_url: https://pipeshub.example.com/api/v1/oauth2/token
+      client_id: replace-with-the-pipeshub-oauth-app-client-id
+      client_secret_env: PIPESHUB_OAUTH_CLIENT_SECRET
+      resource: https://pipeshub.example.com/mcp
+      # offline_access: refresh tokens. semantic:write: PipesHub's search endpoint.
+      # kb:read: reading a record. Add scopes only for tools you add above.
+      scopes: [offline_access, semantic:write, kb:read]
