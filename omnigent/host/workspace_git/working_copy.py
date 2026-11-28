@@ -326,9 +326,29 @@ async def default_branch(repository: GitRepository, deadline: Deadline) -> tuple
 
 
 _CREATED_FROM = "branch: Created from "
-# A plain ref name, not an expression such as ``HEAD@{2}``, ``next@{upstream}`` or ``next~1``
-# whose meaning changes later.
-_PLAIN_REF_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]*")
+# Characters Git refuses in a ref name, which revision expressions such as ``next~1`` use.
+_NOT_IN_A_REF_NAME = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+# The prefixes Git tries, in order, when it looks up a short ref name.
+_REF_LOOKUP_PREFIXES = ("", "refs/", "refs/tags/", "refs/heads/", "refs/remotes/")
+
+
+def _is_plain_ref_name(name: str) -> bool:
+    """Whether Git would accept ``name`` as a ref's name, not an expression like ``HEAD@{2}``."""
+    if (
+        not name
+        or name == "@"
+        or name.startswith("-")
+        or name.endswith(".")
+        or "@{" in name
+        or ".." in name
+        or _NOT_IN_A_REF_NAME.search(name)
+    ):
+        return False
+    components = name.split("/")
+    return all(
+        component and not component.startswith(".") and not component.endswith(".lock")
+        for component in components
+    )
 
 
 async def _remote_start_point(
@@ -365,12 +385,7 @@ async def _remote_start_point(
     if not oldest.startswith(_CREATED_FROM):
         return None
     start = oldest.removeprefix(_CREATED_FROM)
-    if (
-        not _PLAIN_REF_NAME.fullmatch(start)
-        or ".." in start
-        or "//" in start
-        or start.endswith((".", "/", ".lock"))
-    ):
+    if not _is_plain_ref_name(start):
         return None
     # Git's own lookup, where an ambiguous name resolves to none; any failure means no start.
     resolved = await repository.run_unchecked(
@@ -378,8 +393,11 @@ async def _remote_start_point(
         deadline=deadline,
     )
     candidate = first_line(resolved.stdout) if resolved.success else ""
+    # A symbolic ref, such as a remote's HEAD or the remote's bare name, resolves to its target's
+    # name, which is no longer the recorded name under any of Git's prefixes.
     if (
         not candidate.startswith("refs/remotes/")
+        or candidate not in {prefix + start for prefix in _REF_LOOKUP_PREFIXES}
         or candidate.endswith("/HEAD")
         or candidate in own_copies
         or await verify_commit(repository, candidate, deadline) is None

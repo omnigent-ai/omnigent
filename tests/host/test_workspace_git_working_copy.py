@@ -831,6 +831,22 @@ async def test_a_long_lived_branch_still_compares_with_the_branch_it_started_fro
     assert response.base.base == fork_next
 
 
+@pytest.mark.parametrize("remote", ["_mirror", "team@site", "mirror."])
+async def test_a_remote_with_an_unusual_but_valid_name_is_still_where_a_branch_started(
+    tmp_path: Path, remote: str
+) -> None:
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _add_remote(root, remote)
+    _git(root, "update-ref", f"refs/remotes/{remote}/next", fork_next)
+    _git(root, "checkout", "-q", "-b", "feature", f"{remote}/next")
+    _push_upstream(root, "fork", "feature")
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == f"{remote}/next"
+    assert response.base.base == fork_next
+
+
 async def test_an_oversized_oldest_entry_falls_back_to_origins_default(tmp_path: Path) -> None:
     """Once the creation entry expires, a huge commit subject can be the oldest entry."""
     root, main, _fork_next = _fork_checkout(tmp_path)
@@ -934,6 +950,8 @@ async def test_a_branch_on_origin_without_a_default_compares_with_the_branch_it_
         "local branch",
         "remote branch a local one now shadows",
         "upstream expression retargeted since",
+        "another remote's HEAD",
+        "another remote's name, which means its HEAD",
         "deleted remote branch",
         "own copy",
         "no reflog",
@@ -946,6 +964,10 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
     _git(root, "tag", "v1", fork_next)
     _git(root, "branch", "--track", "local-next", "fork/next")
     _git(root, "update-ref", "refs/remotes/fork/feature", fork_next)
+    # A remote whose HEAD names its next, ahead of origin's main.
+    _add_remote(root, "source")
+    _git(root, "update-ref", "refs/remotes/source/next", fork_next)
+    _git(root, "symbolic-ref", "refs/remotes/source/HEAD", "refs/remotes/source/next")
     starts = {
         "HEAD": ["HEAD"],
         "commit": [fork_next],
@@ -953,6 +975,8 @@ async def test_a_pushed_branch_without_a_remote_start_falls_back_to_origins_defa
         "local branch": ["local-next"],
         "remote branch a local one now shadows": ["fork/next"],
         "upstream expression retargeted since": ["local-next@{upstream}"],
+        "another remote's HEAD": ["source/HEAD"],
+        "another remote's name, which means its HEAD": ["source"],
         "deleted remote branch": ["fork/next"],
         "own copy": ["fork/feature"],
         "no reflog": ["fork/next"],
