@@ -965,6 +965,118 @@ async def test_model_selected_mirrors_and_dedupes() -> None:
 # --- execution failure ------------------------------------------------------
 
 
+async def test_execution_failure_retains_observed_model_and_typed_evidence() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event("session.model.selected", model={"providerID": "gateway", "id": "model-a"})
+    )
+    await fwd.handle_event(
+        _event(
+            "session.execution.failed",
+            error={
+                "type": "provider.invalid-request",
+                "message": "The requested model does not exist.",
+                "status": 404,
+                "provider_request_id": "req_upstream_1",
+            },
+        )
+    )
+    status = _status_edges(server.posts)[-1]
+    assert status["output"] == "The requested model does not exist."
+    context = status["failure_context"]
+    assert context["native_model"] == "gateway/model-a"
+    assert context["native_provider"] == "gateway"
+    assert context["provider_error_type"] == "provider.invalid-request"
+    assert context["http_status"] == 404
+    assert context["provider_request_id"] == "req_upstream_1"
+    assert "configured_provider_origin" not in context
+
+
+async def test_execution_failure_does_not_borrow_root_model_for_child() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_root", model={"providerID": "root", "id": "a"}))
+    fwd._turns["ses_child"] = fwd_mod._SessionTurn(
+        session_id="ses_child", conversation_id="conv_child"
+    )
+    await fwd.handle_event(
+        _event("session.execution.failed", sessionID="ses_child", error={"message": "failed"})
+    )
+    context = _status_edges(server.posts)[-1]["failure_context"]
+    assert "native_model" not in context
+    assert "native_provider" not in context
+
+
+@pytest.mark.parametrize("status", [None, {}, [], True, "401"])
+async def test_execution_failure_malformed_metadata_preserves_cause(status: object) -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.execution.failed",
+            error={
+                "message": "authoritative failure",
+                "status": status,
+            },
+        )
+    )
+    failed = _status_edges(server.posts)[-1]
+    assert failed["status"] == "failed"
+    assert failed["output"] == "authoritative failure"
+    assert "http_status" not in failed["failure_context"]
+    assert "reauth_required" not in failed
+
+
+async def test_execution_failure_provenance_is_sanitized_on_wire(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.harnesses.opencode_native.bridge import xdg_config_home_for_bridge_dir
+    from omnigent.harnesses.opencode_native.provider import write_opencode_provider_config
+    from omnigent.native.failure_telemetry import failure_log_attributes
+
+    write_opencode_provider_config(
+        xdg_config_home_for_bridge_dir(tmp_path),
+        {
+            "providers": {
+                "gateway": {
+                    "settings": {
+                        "baseURL": "https://user:secret@gateway.example.test/ai-gateway/mlflow/v1"
+                        "?token=secret",
+                        "apiKey": "secret",
+                    }
+                },
+            }
+        },
+    )
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+    await fwd.handle_event(
+        _step_started("msg_1", model={"providerID": "gateway", "id": "model-a"})
+    )
+    await fwd.handle_event(
+        _event(
+            "session.execution.failed",
+            error={
+                "type": "provider.invalid-request",
+                "status": 404,
+                "message": "original failure",
+                "headers": {"Authorization": "Bearer secret"},
+                "body": "private prompt",
+            },
+        )
+    )
+    failed = _status_edges(server.posts)[-1]
+    context = failed["failure_context"]
+    assert failed["output"] == "original failure"
+    assert context["configured_provider_origin"] == "gateway.example.test"
+    assert context["configured_provider_route_family"] == "mlflow"
+    assert "provider_request_id" not in context
+    assert failure_log_attributes(context)["native_provider"] == "gateway"
+    assert "secret" not in json.dumps(context) + caplog.text
+    assert "private prompt" not in json.dumps(context) + caplog.text
+
+
 async def test_execution_failed_auth_posts_failed_with_reauth() -> None:
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
