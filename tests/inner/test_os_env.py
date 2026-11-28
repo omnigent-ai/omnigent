@@ -41,6 +41,7 @@ from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
 )
+from tests.inner.test_os_env_pdf import make_pdf
 
 
 def _inactive_policy() -> SandboxPolicy:
@@ -513,6 +514,51 @@ def test_read_impl_nul_byte_file_classified_binary(tmp_path: Path) -> None:
 
     assert result["encoding"] == "base64"
     assert result["total_bytes"] == 10
+
+
+def test_read_impl_pdf_returns_pages_for_agent(tmp_path: Path) -> None:
+    result = _read_impl(make_pdf(tmp_path, ["Alpha"]), 1, None, pdf=True)
+
+    assert result["total_pages"] == 1
+    assert result["pages"][0]["image_base64"]
+
+
+def test_read_impl_pdf_bytes_unchanged_for_filesystem_service(tmp_path: Path) -> None:
+    result = _read_impl(make_pdf(tmp_path, ["Alpha"]), 1, None, max_bytes=1_000_000, pdf=True)
+
+    assert result["encoding"] == "base64"
+    assert "pages" not in result
+
+
+def test_read_impl_pages_on_text_file_errors(tmp_path: Path) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("hello\n")
+
+    assert _read_impl(path, 1, None, pdf=True, pages="1") == {
+        "error": "pages applies only to PDF files"
+    }
+
+
+def test_read_impl_pdf_descriptor_unless_requested(tmp_path: Path) -> None:
+    """ACP fs delegation reads without ``pdf`` and keeps the binary descriptor."""
+    result = _read_impl(make_pdf(tmp_path, ["Alpha"]), 1, None)
+
+    assert result["encoding"] == "base64"
+    assert result["content"] == ""
+
+
+def test_caller_process_read_forwards_pages(tmp_path: Path) -> None:
+    path = make_pdf(tmp_path, ["Alpha", "Beta"])
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        result = asyncio.run(os_env.read(str(path), pdf=True, pages="2"))
+    finally:
+        os_env.close()
+
+    assert [page["page"] for page in result["pages"]] == [2]
 
 
 # ---------------------------------------------------------------------------

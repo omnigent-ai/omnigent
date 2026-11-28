@@ -34,11 +34,14 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, OSEnvironment
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.json_serialization import json_dumps_transport_safe
+from omnigent.util.json_types import JsonObject
 
 _logger = logging.getLogger(__name__)
 
@@ -65,6 +68,13 @@ _OS_READ_SCHEMA: dict[str, Any] = {
         "limit": {
             "type": "integer",
             "description": "Maximum number of lines to return.",
+        },
+        "pages": {
+            "type": "string",
+            "description": (
+                'Page range for PDF files (e.g. "1-5", "3", "10-20"). '
+                "Required for PDFs over 10 pages; at most 20 pages per call."
+            ),
         },
     },
     "required": ["path"],
@@ -208,7 +218,7 @@ class SysOsReadTool(_OSEnvBackedTool):
     @classmethod
     def description(cls) -> str:
         """:returns: Description shown to the LLM."""
-        return "Read a text file from the OS environment."
+        return "Read a text file, or a PDF as page text plus page images, from the OS environment."
 
     @classmethod
     def get_schema(cls) -> dict[str, Any]:
@@ -232,18 +242,53 @@ class SysOsReadTool(_OSEnvBackedTool):
         :param kwargs: Parsed args; ``path`` is required.
         :returns: OpResult from the OSEnvironment.
         """
-        return dict(
-            await self._os_env.read(
-                path=kwargs["path"],
-                offset=kwargs.get("offset", 1),
-                # Unspecified limit → agent-tool default (2 000 lines).
-                # None is now "unlimited" in _read_impl, so we must be explicit.
-                # Use is-None check (not `or`) so that invalid values like 0 are
-                # forwarded to os_env.read for validation rather than silently
-                # replaced with the default.
-                limit=(lv if (lv := kwargs.get("limit")) is not None else _DEFAULT_READ_LIMIT),
-            )
+        return await read_for_agent(self._os_env, kwargs)
+
+
+async def read_for_agent(os_env: OSEnvironment, args: Mapping[str, Any]) -> dict[str, Any]:
+    """Run ``sys_os_read`` against *os_env*; shared by the tool and the runner dispatch.
+
+    :param os_env: Environment to read from.
+    :param args: Tool arguments (``path``, optional ``offset``, ``limit``, ``pages``).
+    :returns: The read OpResult, or a text + image envelope for a PDF.
+    """
+    result = dict(
+        await os_env.read(
+            path=args["path"],
+            offset=args.get("offset", 1),
+            # Unspecified limit → agent-tool default (2 000 lines).
+            # None is now "unlimited" in _read_impl, so we must be explicit.
+            # Use is-None check (not `or`) so that invalid values like 0 are
+            # forwarded to os_env.read for validation rather than silently
+            # replaced with the default.
+            limit=(lv if (lv := args.get("limit")) is not None else _DEFAULT_READ_LIMIT),
+            pdf=True,
+            # Models sometimes send a single page as a number.
+            pages=str(pages) if type(pages := args.get("pages")) is int else pages,
         )
+    )
+    if isinstance(result.get("pages"), list):
+        return _pdf_pages_envelope(result)
+    return result
+
+
+def _pdf_pages_envelope(result: dict[str, Any]) -> dict[str, Any]:
+    """Wrap PDF pages as MCP text + image blocks so harnesses send real images.
+
+    :param result: :func:`omnigent.inner.os_env_pdf.read_pdf_pages` success result.
+    :returns: The decoded image-result envelope (see ``encode_mcp_image_result``).
+    """
+    pages = result["pages"]
+    total = result["total_pages"]
+    summary = {"path": result["path"], "total_pages": total, "pages_returned": len(pages)}
+    blocks: list[JsonObject] = [{"type": "text", "text": json.dumps(summary)}]
+    for page in pages:
+        text = page["text"] or "(no extractable text)"
+        blocks.append({"type": "text", "text": f"--- page {page['page']} of {total} ---\n{text}"})
+        blocks.append(
+            {"type": "image", "mimeType": page["media_type"], "data": page["image_base64"]}
+        )
+    return cast(dict[str, Any], json.loads(encode_mcp_image_result(blocks, is_error=False)))
 
 
 class SysOsWriteTool(_OSEnvBackedTool):

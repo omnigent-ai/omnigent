@@ -35,7 +35,9 @@ from omnigent.runner.tool_dispatch import (
     execute_tool,
     should_dispatch_locally,
 )
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
+from tests.inner.test_os_env_pdf import make_pdf
 
 # The session file tools are off by default; these tests exercise them, so opt in.
 _FILE_TOOLS_ON = ToolGroupsConfig(files=True)
@@ -1175,3 +1177,33 @@ async def test_send_message_failure_surfaces_child_delete_http_error(
     assert len(copies) == 1
     assert len(events) == 1
     assert deletes == [_CHILD_ID, _CHILD_ID]
+
+
+async def test_runner_sys_os_read_pdf_forwards_pages_and_returns_images(tmp_path: Path) -> None:
+    """The runner's ``/mcp/execute`` path, not only the tool class, must render PDFs."""
+    make_pdf(tmp_path, [f"P{number}" for number in range(1, 13)])
+    spec = AgentSpec(
+        spec_version=1,
+        skills_filter="none",
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+
+    output = await execute_tool(
+        tool_name="sys_os_read",
+        arguments=json.dumps({"path": "doc.pdf", "pages": "11-12"}),
+        agent_spec=spec,
+        conversation_id=_CONVERSATION_ID,
+    )
+
+    decoded = decode_mcp_image_result(json.loads(output))
+    assert decoded is not None
+    assert [block["type"] for block in decoded.content] == [
+        "text",
+        "text",
+        "image",
+        "text",
+        "image",
+    ]
+    assert str(decoded.content[1]["text"]).startswith("--- page 11 of 12 ---\nP11")

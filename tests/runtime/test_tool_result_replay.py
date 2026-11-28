@@ -450,3 +450,23 @@ def test_sanitize_replayed_image_blocks_downgrades_typeless_compaction_marker() 
     assert sanitized[0]["type"] == "input_text"
     assert "image omitted" in sanitized[0]["text"]
     assert "binary" not in sanitized[0]["text"]
+
+
+def test_envelope_as_text_replaces_images_with_placeholders() -> None:
+    from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+    from omnigent.runtime.tool_result_replay import envelope_as_text, image_omitted_placeholder
+
+    envelope = json.loads(
+        encode_mcp_image_result(
+            [
+                {"type": "text", "text": "--- page 1 of 1 ---"},
+                {"type": "image", "mimeType": "image/png", "data": "QUJD" * 100},
+            ],
+            is_error=False,
+        )
+    )
+
+    text = envelope_as_text(envelope)
+
+    assert text == "--- page 1 of 1 ---\n" + image_omitted_placeholder("image/png")
+    assert envelope_as_text({"result": "plain"}) is None

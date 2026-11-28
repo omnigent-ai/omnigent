@@ -70,6 +70,8 @@ dependencies = [
     # uv.lock pins 13.0.0 for its security fixes; the floor stays at 12.2 so
     # installs behind a package-age cooldown mirror still resolve until 13 ages in.
     "pillow>=12.2,<14",
+    # Render PDF pages to text and images for the agent file-read tool.
+    "pypdfium2>=4.30,<6",
     # Round-trip (comment/format-preserving) TOML editing of the user's
     # ~/.codex/config.toml when removing a Databricks provider
     # (omnigent/onboarding/ucode_cleanup.py). stdlib tomllib is read-only.

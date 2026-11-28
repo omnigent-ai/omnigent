@@ -24,6 +24,7 @@ from omnigent.inner.cursor_executor import (
     CursorExecutor,
     UnresolvableCursorModelError,
     _build_cursor_prompt,
+    _encode_tool_result,
     _normalize_cursor_usage,
     _resolve_model,
     _sdk_message_to_events,
@@ -2057,3 +2058,24 @@ def test_cursor_policy_hook_uses_long_read_timeout(monkeypatch: pytest.MonkeyPat
     _call_kwargs = mock_fn.call_args
     read_timeout = _call_kwargs.kwargs.get("read_timeout") or _call_kwargs.args[3]
     assert read_timeout == 86400.0
+
+
+def test_encode_tool_result_strips_envelope_images() -> None:
+    """Cursor tool results are text, so image envelopes become placeholders."""
+    from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+
+    envelope = json.loads(
+        encode_mcp_image_result(
+            [
+                {"type": "text", "text": "page"},
+                {"type": "image", "mimeType": "image/png", "data": "QUJD"},
+            ],
+            is_error=False,
+        )
+    )
+
+    encoded = _encode_tool_result(envelope)
+
+    assert isinstance(encoded, str)
+    assert "QUJD" not in encoded
+    assert encoded.startswith("page\n")

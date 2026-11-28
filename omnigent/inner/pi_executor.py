@@ -84,6 +84,7 @@ from omnigent.models.pi_model_compatibility import (
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.runtime.tool_result_replay import envelope_as_text
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
 from omnigent.telemetry.surface import harness_client_surface
@@ -498,6 +499,9 @@ class _ToolServer:
                 else self._tool_executor(name, args)
             )
             resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
+            # The pi extension sends tool results as text; drop envelope image bytes.
+            if (flattened := envelope_as_text(resolved)) is not None:
+                return {"result": flattened}
             if not isinstance(resolved, dict):
                 resolved = {"result": resolved}
             return {"result": resolved}

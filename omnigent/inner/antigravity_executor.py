@@ -52,6 +52,7 @@ from types import ModuleType
 from typing import Any, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.runtime.tool_result_replay import envelope_as_text
 from omnigent.spec.types import RetryPolicy
 
 from .executor import (
@@ -978,7 +979,9 @@ class AntigravityExecutor(Executor):
                     tool_args = parsed if isinstance(parsed, dict) else {"input": args[0]}
                 except json.JSONDecodeError:
                     tool_args = {"input": args[0]}
-            return await self._tool_executor(tool_name, tool_args)
+            result = await self._tool_executor(tool_name, tool_args)
+            # Gemini function responses are JSON, not images; drop envelope image bytes.
+            return envelope_as_text(result) or result
 
         # The SDK builds the function declaration from these.
         _invoke.__name__ = tool_name
