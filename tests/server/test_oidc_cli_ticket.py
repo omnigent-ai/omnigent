@@ -515,6 +515,20 @@ async def test_legacy_login_opens_upgrade_instructions_and_stops_polling() -> No
             assert "refresh_token" not in poll.json()
 
 
+async def test_legacy_upgrade_page_does_not_promise_a_store_update() -> None:
+    """A store listing may already be current, so the page must allow for no compatible build."""
+    async with httpx.AsyncClient(transport=_build_app(), base_url="http://test") as client:
+        body = (await client.post("/auth/cli-login")).json()
+        page = await client.get(body["login_url"])
+        rejected = await client.post("/auth/cli-login", content=b"{}")
+    assert page.status_code == 200
+    assert "may not be released yet" in page.text
+    assert "security update" not in page.text
+    assert "Update the Omnigent app through" not in page.text
+    assert rejected.status_code == 400
+    assert "if the app store has no compatible build yet" in rejected.json()["error"]
+
+
 async def test_legacy_upgrade_notice_cannot_issue_credentials(tmp_path: Path) -> None:
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
     async with httpx.AsyncClient(

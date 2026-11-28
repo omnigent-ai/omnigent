@@ -11,8 +11,13 @@
 
 import { act, render, renderHook } from "@testing-library/react";
 import { StrictMode, useRef, useState, type ReactNode } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { useDictationInsert } from "./useDictationInsert";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import {
+  createFakeComposerSurface,
+  type FakeComposerSurface,
+} from "@/components/composer/engine/testing/fakeComposerSurface";
 
 type Api = ReturnType<typeof useDictationInsert>;
 
@@ -372,5 +377,165 @@ describe("useDictationInsert", () => {
       });
       expect(composer.value).toBe("One. Two. TAIL");
     });
+  });
+});
+
+describe("useDictationInsert with a setter that writes through its input", () => {
+  it.each([
+    ["adjusts", (next: string) => `${next}\n`, ["hel\n", true, "hello\n"]],
+    ["refuses", () => null, ["", false, ""]],
+  ] as const)("revises only its own text when the input %s a write", (_how, write, expected) => {
+    const { result } = renderHook(() => {
+      const [value, setValue] = useState("");
+      const dictation = useDictationInsert(value, (next) => {
+        const written = write(next) ?? value;
+        setValue(written);
+        return written;
+      });
+      return { value, ...dictation };
+    });
+    act(() => result.current.replaceInterim("hel"));
+    expect([result.current.value, result.current.hasInterim]).toEqual(expected.slice(0, 2));
+    act(() => result.current.replaceInterim("hello"));
+    expect(result.current.value).toBe(expected[2]);
+  });
+
+  it("keeps its region when a later revision is refused", () => {
+    let refuse = false;
+    const { result } = renderHook(() => {
+      const [value, setValue] = useState("");
+      const dictation = useDictationInsert(value, (next) => {
+        const written = refuse ? value : next;
+        setValue(written);
+        return written;
+      });
+      return { value, ...dictation };
+    });
+    act(() => result.current.replaceInterim("hel"));
+    refuse = true;
+    act(() => result.current.replaceInterim("hell"));
+    expect([result.current.value, result.current.hasInterim]).toEqual(["hel", true]);
+    refuse = false;
+    act(() => result.current.replaceInterim("hello"));
+    expect(result.current.value).toBe("hello");
+  });
+});
+
+describe("useDictationInsert's setter arguments and offsets", () => {
+  it("tells the setter each change, and whether it pins an utterance", () => {
+    const calls: unknown[][] = [];
+    const { result } = renderHook(() => {
+      const [value, setValue] = useState("Intro");
+      const dictation = useDictationInsert(value, (next, change, final) => {
+        calls.push([change, final]);
+        setValue(next);
+      });
+      return { value, ...dictation };
+    });
+    act(() => result.current.replaceInterim("hel"));
+    act(() => result.current.appendFinal("hello"));
+    expect(result.current.value).toBe("Intro hello");
+    expect(calls).toEqual([
+      [{ from: 5, to: 5, insert: " hel" }, false],
+      [{ from: 5, to: 9, insert: " hello" }, true],
+    ]);
+  });
+
+  it.each([
+    [
+      "keeps",
+      "before",
+      (next: string) => next.replace("Intro", "INTRO"),
+      ["INTRO hel", true, "INTRO hello"],
+    ],
+    [
+      "drops",
+      "across",
+      (next: string) => next.toUpperCase(),
+      ["INTRO HEL", false, "INTRO HEL HELLO"],
+    ],
+  ] as const)(
+    "%s a partial's region when the input rewrites the text %s it",
+    (_keeps, _where, write, expected) => {
+      const { result } = renderHook(() => {
+        const [value, setValue] = useState("Intro");
+        const dictation = useDictationInsert(value, (next) => {
+          const written = write(next);
+          setValue(written);
+          return written;
+        });
+        return { value, ...dictation };
+      });
+      act(() => result.current.replaceInterim("hel"));
+      expect([result.current.value, result.current.hasInterim]).toEqual(expected.slice(0, 2));
+      act(() => result.current.replaceInterim("hello"));
+      expect(result.current.value).toBe(expected[2]);
+    },
+  );
+});
+
+describe("useDictationInsert on a non-textarea composer surface", () => {
+  const mountedSurfaces: FakeComposerSurface[] = [];
+  afterEach(() => {
+    for (const surface of mountedSurfaces.splice(0)) {
+      surface.unregister();
+      surface.element.remove();
+    }
+  });
+
+  function renderSurfaceComposer(initial: string) {
+    const surface = createFakeComposerSurface(initial);
+    mountedSurfaces.push(surface);
+    const box: { api: Api | null } = { api: null };
+    function Composer() {
+      const [value, setValue] = useState(initial);
+      // The engine mirrors the controlled value, as a real editor would after render.
+      surface.value = value;
+      const ref = useRef<ComposerTextTarget>(surface);
+      box.api = useDictationInsert(value, setValue, ref);
+      return null;
+    }
+    render(<Composer />);
+    return {
+      surface,
+      api: () => box.api!,
+      click: (at: number) =>
+        act(() => {
+          surface.focus();
+          surface.setSelectionRange(at, at);
+          box.api!.noteFocus();
+        }),
+    };
+  }
+
+  it("inserts at the caret read across blur and places the caret after it without focusing", () => {
+    const composer = renderSurfaceComposer("PASTED CONTEXT");
+    composer.click(0);
+    act(() => composer.surface.blur());
+    composer.surface.scrollTop = 40;
+    // Browsers scroll an unfocused element to reveal a new selection; the hook must undo that.
+    const setSelection = composer.surface.setSelectionRange;
+    composer.surface.setSelectionRange = (start, end) => {
+      setSelection(start, end);
+      composer.surface.scrollTop = 0;
+    };
+
+    act(() => composer.api().appendFinal("Refactor this:"));
+
+    expect(composer.surface.value).toBe("Refactor this: PASTED CONTEXT");
+    expect(composer.surface.selectionStart).toBe("Refactor this:".length);
+    expect(document.activeElement).not.toBe(composer.surface.element);
+    expect(composer.surface.scrollTop).toBe(40);
+  });
+
+  it("revises a streaming partial in place at the caret", () => {
+    const composer = renderSurfaceComposer("PASTED CONTEXT");
+    composer.click(0);
+
+    act(() => composer.api().replaceInterim("refac"));
+    act(() => composer.api().replaceInterim("refactor thi"));
+
+    expect(composer.surface.value).toBe("refactor thi PASTED CONTEXT");
+    expect(composer.surface.selectionStart).toBe("refactor thi".length);
   });
 });

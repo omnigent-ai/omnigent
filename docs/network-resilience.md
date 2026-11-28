@@ -44,7 +44,8 @@ is pinned as a strict expected failure (`xfail(strict=True)`, or `known_gap` on
 the single check), so a fix that makes it pass must also remove the marker.
 The one exception is R8: it is a race, so its marker does not turn stale when
 a run happens to pass. Outages beyond the short default run only with
-`OMNIGENT_E2E_RESILIENCE_FULL=1`.
+`OMNIGENT_E2E_RESILIENCE_FULL=1`, except S4's unanswered model call: it always
+runs at 120 s because it must outlast Claude Code's request timeout.
 
 | Scenario | Phase / action | Outage | claude-native | codex-native |
 | --- | --- | --- | --- | --- |
@@ -52,23 +53,30 @@ a run happens to pass. Outages beyond the short default run only with
 | S2 | idle; tool running; tool ends during outage | 5 s / 60 s / 120 s | pass | pass |
 | S2 | approval pending | 5 s | pass | pass |
 | S2 | approval pending | 60 s | gap: [R1](#r1-approval-card-missing-after-the-link-returns) | gap: [R1](#r1-approval-card-missing-after-the-link-returns) |
-| S2 | approval pending | 120 s | gap: [R2](#r2-long-outage-moves-the-approval-to-the-terminal) | gap: [R1](#r1-approval-card-missing-after-the-link-returns) |
+| S2 | approval pending | 120 s | gap: [R1](#r1-approval-card-missing-after-the-link-returns) | gap: [R1](#r1-approval-card-missing-after-the-link-returns) |
 | S3 blackhole | idle, tool running, approval pending | 10 s / 45 s / 120 s | pass | pass, [R8](#r8-codex-status-sticks-on-running-after-a-reconnect) intermittent |
 | S3 reset | idle, tool running | 10 s / 45 s / 120 s | pass | pass, R8 intermittent |
 | S3 reset | approval pending | 10 s | pass | pass, R8 intermittent |
-| S3 reset | approval pending | 45 s / 120 s | gap: R1 / R2 | pass, R8 intermittent |
+| S3 reset | approval pending | 45 s / 120 s | gap: R1 / [R2](#r2-long-outage-moves-the-approval-to-the-terminal) | pass, R8 intermittent |
 | S3 flap (full mode only) | idle; tool running, approval pending | 40 s | pass | pass, R8 intermittent |
 | S3 flap (full mode only) | idle | 120 s | pass | pass, R8 intermittent |
 | S3 flap (full mode only) | tool running, approval pending | 120 s | gap: [R6](#r6-repeated-blips-add-up-to-a-disconnect-failure) | gap: R6 |
 | S4 | idle, tool running, approval pending | 10 s / 60 s / 300 s | pass | pass |
+| S4 | model call unanswered | 120 s | pass | not covered |
 | S5 | approve | 20 s | pass | pass |
 | S5 | approve | 150 s | gap: R2 | pass |
-| S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
+| S5 | send | 20 s / 150 s | pass | pass |
 | S5 | stop | 20 s / 150 s | pass | pass |
 | S6 | tool ends during outage, approval pending (half-open and refused) | 20 s / 120 s | gap: [R5](#r5-the-page-never-says-it-is-offline) | gap: R5 |
 | S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
 | S7 | before the first call | 180 s | pass | pass |
 | S7 | mid-stream | 180 s | gap: [R7](#r7-a-turn-that-lost-the-model-has-no-retry) | pass |
+
+Native Claude terminals retry a model request that gets no response headers
+within `RetryPolicy`'s 120 s per-request timeout. To give a slower gateway more
+time, set `API_TIMEOUT_MS` in the `env` of Claude Code's `settings.json`, or in
+the runner's environment. A host-started runner receives it only when
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` lists `API_TIMEOUT_MS`.
 
 ## Findings
 
@@ -88,20 +96,12 @@ retrying for up to a day, so for Codex this is also the 120 s outcome.
 
 ### R2: Long outage moves the approval to the terminal
 
-Claude only. After `OMNIGENT_HOOK_MAX_RETRIES` (8) consecutive failed re-POSTs, about 90 s
+Claude only. After `OMNIGENT_HOOK_MAX_RETRIES` (40) consecutive failed re-POSTs, about 17 minutes
 of backoff, the hook gives up and Claude Code falls back to its own terminal
 prompt. When the link returns, the web never shows the card again, and an
 approval the user already gave while the host was offline never reaches
 Claude. The session stays `running`, and new messages queue behind a prompt
 that only the terminal can answer.
-
-### R3: A message sent while the host is unreachable is lost
-
-Both harnesses; this is server behavior. With the host's links down for 20 s, a message sent from the browser returned
-`202` after about 10 s. The server then tried to relaunch the runner through
-the unreachable host and published `failed` with `runner_failed_to_start`. The
-message never reached the runner. The failure stayed after the host
-reconnected, because passive recovery clears only `runner_disconnected`.
 
 ### R4: Stop reports success while the host is unreachable
 
@@ -167,7 +167,7 @@ plus the blackhole and flap idle rows at 120 s.
 - Each Codex tool call made while the server is down waits on the
   evaluate-policy hook's 30 s retry budget before proceeding. A chained tool
   turn therefore slows down during an outage, but it completes.
-- In "Approve for me" (the default Codex mode), escalated commands go to
+- In the "Approve for me" Codex mode, escalated commands go to
   Codex's automatic reviewer, which makes its own model call. When that call
   returned an unusable verdict, Codex rejected the command rather than asking
   the user. A model outage at that moment would likely do the same. This is

@@ -31,12 +31,14 @@ from omnigent.runner.app import (
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
 )
+from omnigent.runner.busy_check import RunnerBusyCheck
 from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_env
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
 from tests._helpers.providers import isolate_provider_resolution
+from tests.budgets import budget
 from tests.runner.conftest import (
     _build_app_for_spec,
     _build_app_with_mcp_tool,
@@ -834,6 +836,42 @@ def _ensure_ctx(registry: _FakeEnsureRegistry, session_id: str = "conv_e") -> Na
 
 def _terminal_view(name: str, terminal_id: str = "terminal_goose_main") -> SessionResourceView:
     return SessionResourceView(id=terminal_id, type="terminal", session_id="conv_e", name=name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_attempts"),
+    [
+        ("thread 019e already has an active writer", 2),
+        ("thread-store internal error: failed to read thread", 1),
+    ],
+    ids=["active_writer_retried", "other_refusal_raised"],
+)
+async def test_launch_codex_retries_once_when_another_writer_holds_the_thread(
+    monkeypatch: pytest.MonkeyPatch, message: str, expected_attempts: int
+) -> None:
+    """A resume refused by a racing app-server is retried once; other refusals raise."""
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.runner.native import orchestration
+
+    attempts: list[str] = []
+    created = _terminal_view("codex", terminal_id="terminal_codex_main")
+
+    async def _fake_create(session_id: str, *_args: object, **_kwargs: object) -> object:
+        attempts.append(session_id)
+        if len(attempts) == 1:
+            raise CodexAppServerResponseError({"code": -32600, "message": message})
+        return created
+
+    monkeypatch.setattr(orchestration, "_auto_create_codex_terminal", _fake_create)
+    ctx = _ensure_ctx(_FakeEnsureRegistry())
+
+    if expected_attempts == 2:
+        assert await orchestration._launch_codex(ctx) is created
+    else:
+        with pytest.raises(CodexAppServerResponseError):
+            await orchestration._launch_codex(ctx)
+    assert attempts == ["conv_e"] * expected_attempts
 
 
 @pytest.mark.asyncio
@@ -2597,6 +2635,53 @@ async def test_has_active_work_reports_process_manager_turns() -> None:
     pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
 
     assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_turn_finished_between_busy_checks_still_reports_busy_once() -> None:
+    """A turn that starts and ends between two busy checks is still reported.
+
+    The sandbox keepalive samples busy on each tunnel pong, so a short turn can
+    fall entirely between two samples; its published events must still count.
+
+    :returns: None.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        server_client=_FakeFileServerClient(),  # type: ignore[arg-type]
+    )
+    busy = RunnerBusyCheck(app.state.has_sandbox_work, app.state.last_event_published_at)
+    assert busy.check() is False
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/5b0f3a9d2c7e4f1a8b6d0c9e3f2a1b4c/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        async with asyncio.timeout(budget(5)):
+            while app.state.has_active_work():
+                await asyncio.sleep(0.01)
+
+    assert busy.check() is True, "the finished turn's events must count as work"
+    assert busy.check() is False, "no further work, so the next check is idle"
+
+    # Notifications are not agent work: a tunnel reconnect republishes every status
+    # edge, and a plain shell's output publishes terminal activity.
+    registry = app.state.session_resource_registry
+    registry._session_status_publisher("5b0f3a9d2c7e4f1a8b6d0c9e3f2a1b4c", "idle", None)
+    assert busy.check() is False, "a republished status edge must not count as work"
+    registry._terminal_activity_publisher("5b0f3a9d2c7e4f1a8b6d0c9e3f2a1b4c", "terminal_bash_main")
+    assert busy.check() is False, "plain-shell terminal output must not count as work"
 
 
 @pytest.mark.asyncio

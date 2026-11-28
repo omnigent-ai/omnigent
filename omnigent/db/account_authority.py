@@ -47,6 +47,11 @@ def account_checks_scope(enabled: bool) -> Iterator[None]:
         _account_checks_enabled.reset(token)
 
 
+def account_checks_enabled() -> bool:
+    """Whether the current app enforces built-in account generations."""
+    return _account_checks_enabled.get()
+
+
 def bind_account_authority(user_id: str, generation: str) -> None:
     """Capture the identity authenticated by this request or durable job."""
     _authority.set(AccountAuthority(user_id, generation, current_workspace_id()))
@@ -74,6 +79,20 @@ def account_generation(user_id: str) -> str | None:
     ):
         return authority.generation
     return None
+
+
+def account_registration(created_at: int | None) -> str | None:
+    """Name one registration of a username, from its account row's ``created_at``.
+
+    A password change or reset rotates the account's generation to revoke its sessions but
+    keeps ``created_at``; registering the username again after a deletion sets a later one.
+    So what a registration owns outside the account row (its gadgets) keys on this, not on
+    the generation. ``None`` for identities without one (an SSO-supplied or legacy row).
+
+    :param created_at: e.g. ``1767225600``.
+    :returns: e.g. ``"r1767225600"``.
+    """
+    return None if created_at is None else f"r{created_at}"
 
 
 @contextmanager

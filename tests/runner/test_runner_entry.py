@@ -6,14 +6,17 @@ import asyncio
 import hashlib
 import importlib
 import io
+import json
 import logging
 import os
 import queue
 import signal
 import sys
 import tarfile
+import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,19 +26,36 @@ import httpx
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.datamodel import (
+    HostWritePathSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TerminalEnvSpec,
+    WritePathSpec,
+)
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
+from omnigent.policies.registry import (
+    LOCAL_SINGLE_USER_HEADER,
+    POLICY_MODULES_HEADER,
+    load_registry,
+)
+from omnigent.runner import subagent_work
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
+    AgentSpecFetchError,
     _agent_cache_dest,
     _AgentSpecCache,
     _apply_host_interactive_shells,
+    _apply_host_sandbox_grants,
     _host_interactive_shells_from_env,
+    _ignore_finish_work_signal_until_handled,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
     _load_runner_idle_timeout_s_from_config,
+    _load_runner_sandbox_grants_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
     _ManagedMintTokenFactory,
@@ -52,14 +72,18 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
+    _SessionSpecWorkdirs,
+    _work_still_active,
     main,
 )
+from omnigent.runner.app import create_runner_app
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
+from omnigent.runner.native import ResolvedSpec
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
@@ -71,9 +95,12 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.spec.tar_utils import ExtractionError
+from omnigent.spec.types import AgentSpec
 from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
+from tests.runner.helpers import make_test_terminal_instance
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -114,6 +141,90 @@ def test_apply_host_interactive_shells_only_replaces_native_wrappers(
     assert native.terminals["zsh"].command is not None
     assert native.terminals["zsh"].command.endswith("zsh")
     assert custom.terminals == {"project": custom_terminal}
+
+
+def test_apply_host_sandbox_grants_extends_every_declared_sandbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Host grants reach the agent, its terminals, and nested agents, each path once."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n"
+        "  sandbox_grants:\n"
+        "    read_paths: [/srv/example/repo/.git]\n"
+        "    write_paths: [/srv/example/cache, /srv/example/tmp]\n",
+        encoding="utf-8",
+    )
+    shared = OSEnvSandboxSpec(
+        read_paths=["docs"],
+        write_paths=[WritePathSpec("/srv/example/cache", copy_on_write=True)],
+    )
+    nested = OSEnvSandboxSpec(type="none")
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(sandbox=shared),
+        terminals={
+            "shell": TerminalEnvSpec(os_env=OSEnvSpec(sandbox=shared)),
+            "inherited": TerminalEnvSpec(os_env="inherit"),
+            "unsandboxed": TerminalEnvSpec(os_env=OSEnvSpec()),
+        },
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                sub_agents=[
+                    AgentSpec(
+                        spec_version=1,
+                        terminals={"shell": TerminalEnvSpec(os_env=OSEnvSpec(sandbox=nested))},
+                    )
+                ],
+            )
+        ],
+    )
+
+    _apply_host_sandbox_grants(spec)
+
+    assert shared.read_paths == ["docs", "/srv/example/repo/.git"]
+    assert shared.write_path_specs == [
+        WritePathSpec("/srv/example/cache", copy_on_write=True),
+        HostWritePathSpec("/srv/example/tmp"),
+    ]
+    assert shared.host_write_paths == ["/srv/example/tmp"]
+    assert nested == OSEnvSandboxSpec(
+        type="none",
+        read_paths=["/srv/example/repo/.git"],
+        write_paths=["/srv/example/cache", "/srv/example/tmp"],
+        host_write_paths=["/srv/example/cache", "/srv/example/tmp"],
+    )
+    assert spec.terminals is not None
+    assert spec.terminals["inherited"].os_env == "inherit"
+    assert spec.terminals["unsandboxed"].os_env == OSEnvSpec()
+    assert spec.sub_agents[0].os_env is None
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("read_paths", {"read_paths": ["/srv/example/repo"]}),
+        (
+            "write_paths",
+            {"write_paths": ["/srv/example/repo"], "host_write_paths": ["/srv/example/repo"]},
+        ),
+    ],
+)
+def test_apply_host_sandbox_grants_leaves_unlisted_grant_kind_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str, expected: dict[str, list[str]]
+) -> None:
+    """A grant kind the host does not list keeps its authored ``None``."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"runner:\n  sandbox_grants:\n    {field}: [/srv/example/repo]\n",
+        encoding="utf-8",
+    )
+    sandbox = OSEnvSandboxSpec()
+
+    _apply_host_sandbox_grants(AgentSpec(spec_version=1, os_env=OSEnvSpec(sandbox=sandbox)))
+
+    assert sandbox == OSEnvSandboxSpec(**expected)
 
 
 class _TrackingTerminalRegistry:
@@ -2032,6 +2143,62 @@ def test_load_runner_idle_timeout_reads_nested_runner_config(
     assert _load_runner_idle_timeout_s_from_config() == 12.5
 
 
+@pytest.mark.parametrize("timeout_s", [86400, 0])
+def test_create_app_native_pane_idle_windows_follow_runner_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout_s: int
+) -> None:
+    """Top-level native terminals survive the runner's idle window; sub-agent ones last an hour."""
+    import omnigent.runner._entry as entry_mod
+
+    class _FakeProcessManager:
+        instance_dir = tmp_path
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
+    monkeypatch.delenv("OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S", raising=False)
+    (tmp_path / "config.yaml").write_text(f"runner:\n  idle_timeout_s: {timeout_s}\n")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakeProcessManager
+    )
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _TrackingAsyncClient)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+
+    app = entry_mod.create_app(auth_resolved=True)
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    assert reaper._idle_timeout_s == timeout_s
+    if not timeout_s:
+        assert reaper._sub_agent_idle_timeout_s == 0
+        return
+    resource_registry = app.state.session_resource_registry
+    for conv in ("conv_idle", "conv_child"):
+        resource_registry.terminal_registry._by_conversation[conv] = {
+            ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path / conv)
+        }
+    monkeypatch.setattr(resource_registry, "terminal_resource_role", lambda *_args: "codex-native")
+    subagent_work.register_child_session(
+        "conv_child",
+        parent_session_id="conv_parent",
+        title="worker:child",
+        tool="worker",
+        session_name="child",
+    )
+    try:
+        panes = reaper._list_native_panes()
+
+        def reapable_at(now: float) -> set[str]:
+            return {pane.conversation_id for pane in reaper._classify(now, panes, set())}
+
+        assert reapable_at(0.0) == set()
+        assert reapable_at(3599.0) == set()
+        assert reapable_at(3600.0) == {"conv_child"}
+        assert reapable_at(float(timeout_s)) == {"conv_idle", "conv_child"}
+    finally:
+        subagent_work.unregister_child_session("conv_child")
+
+
 def test_load_runner_idle_timeout_zero_disables_watchdog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2187,6 +2354,140 @@ def test_runner_threadpool_rejects_invalid_env(
 
     with pytest.raises(RuntimeError, match="THREADPOOL_MAX_WORKERS"):
         _runner_threadpool_max_workers()
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        pytest.param(None, id="no-config"),
+        pytest.param("runner:\n  idle_timeout_s: 5\n", id="no-sandbox-grants"),
+        pytest.param("runner:\n  sandbox_grants:\n", id="empty-sandbox-grants"),
+    ],
+)
+def test_load_runner_sandbox_grants_defaults_to_no_grants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_text: str | None
+) -> None:
+    """Hosts without ``runner.sandbox_grants`` grant nothing extra."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    if config_text is not None:
+        (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    assert _load_runner_sandbox_grants_from_config() == ([], [])
+
+
+def test_load_runner_sandbox_grants_reads_absolute_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Configured grants keep their order and drop repeated entries."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n"
+        "  sandbox_grants:\n"
+        "    read_paths: [/srv/example/repo/.git, /srv/example/config, /srv/example/repo/.git]\n"
+        "    write_paths: [/srv/example/cache]\n",
+        encoding="utf-8",
+    )
+
+    assert _load_runner_sandbox_grants_from_config() == (
+        ["/srv/example/repo/.git", "/srv/example/config"],
+        ["/srv/example/cache"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("grants_yaml", "message"),
+    [
+        pytest.param(" [/srv/example]", "runner.sandbox_grants must be a mapping", id="list"),
+        pytest.param(
+            "\n    write_files: [/srv/example/file]",
+            "runner.sandbox_grants.write_files is not supported",
+            id="unknown-key",
+        ),
+        pytest.param(
+            "\n    read_paths: /srv/example",
+            "runner.sandbox_grants.read_paths must be a list",
+            id="not-a-list",
+        ),
+        pytest.param(
+            "\n    read_paths: [relative/dir]",
+            "runner.sandbox_grants.read_paths entries must be absolute paths",
+            id="relative",
+        ),
+        pytest.param(
+            "\n    write_paths: ['~/cache']",
+            "runner.sandbox_grants.write_paths entries must be absolute paths",
+            id="home",
+        ),
+        pytest.param(
+            "\n    read_paths: ['']",
+            "runner.sandbox_grants.read_paths entries must be absolute paths",
+            id="empty",
+        ),
+        pytest.param(
+            "\n    read_paths: [42]",
+            "runner.sandbox_grants.read_paths entries must be absolute paths",
+            id="non-string",
+        ),
+        pytest.param(
+            "\n    write_paths: [{path: /srv/example/cache, copy_on_write: true}]",
+            "runner.sandbox_grants.write_paths entries must be absolute paths",
+            id="copy-on-write",
+        ),
+    ],
+)
+def test_load_runner_sandbox_grants_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, grants_yaml: str, message: str
+) -> None:
+    """Invalid host sandbox grants fail loud and name the offending field."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"runner:\n  sandbox_grants:{grants_yaml}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _load_runner_sandbox_grants_from_config()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param(r"\srv\example\cache", id="no-drive"),
+        pytest.param(r"\cache\..\data", id="no-drive-parent"),
+        pytest.param(r"C:cache", id="drive-relative"),
+    ],
+)
+def test_load_runner_sandbox_grants_rejects_windows_paths_without_drive_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
+) -> None:
+    """On Windows a grant must start at a drive root or UNC share, not just a backslash."""
+    monkeypatch.setattr("omnigent.runner._entry.IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"runner:\n  sandbox_grants:\n    write_paths: ['{path}']\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="write_paths entries must be absolute paths"):
+        _load_runner_sandbox_grants_from_config()
+
+
+def test_load_runner_sandbox_grants_reads_windows_drive_and_unc_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fully qualified Windows drive and UNC paths are valid host grants."""
+    monkeypatch.setattr("omnigent.runner._entry.IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n"
+        "  sandbox_grants:\n"
+        "    read_paths: ['C:\\srv\\example\\repo\\.git']\n"
+        "    write_paths: ['\\\\example-host\\share\\cache']\n",
+        encoding="utf-8",
+    )
+
+    assert _load_runner_sandbox_grants_from_config() == (
+        [r"C:\srv\example\repo\.git"],
+        [r"\\example-host\share\cache"],
+    )
 
 
 @pytest.mark.asyncio
@@ -2499,6 +2800,155 @@ def test_run_parent_death_killer_logs_reason_before_hard_exit(
     ), f"expected a parent-death exit log line, got {[r.message for r in caplog.records]}"
 
 
+def _finish_work_killer(
+    has_active_work: Callable[[], bool],
+    *,
+    finish_work_set: bool = True,
+    finish_work_max_s: float = 5.0,
+    signal_wait_s: float = 2.0,
+) -> list[str]:
+    """Run an already-orphaned killer with the finish-work path wired; return events."""
+    import threading
+
+    events: list[str] = []
+    finish_work = threading.Event()
+    if finish_work_set:
+        finish_work.set()
+    _run_parent_death_killer(
+        os.getppid() + 100000,  # already "orphaned"
+        lambda: events.append("stop"),
+        finish_work=finish_work,
+        has_active_work=has_active_work,
+        request_idle_shutdown=lambda: events.append("idle_close"),
+        poll_interval_s=0.01,
+        grace_s=0.01,
+        idle_grace_s=0.01,
+        signal_wait_s=signal_wait_s,
+        finish_work_max_s=finish_work_max_s,
+        exit_fn=lambda code: events.append("exit"),
+    )
+    return events
+
+
+def test_run_parent_death_killer_finishes_in_flight_work_after_hangup() -> None:
+    """A hung-up host's runner closes as idle only after its turn finishes."""
+    probes: list[str] = []
+
+    def has_active_work() -> bool:
+        probes.append("probe")
+        if len(probes) == 2:
+            raise RuntimeError("dictionary changed size during iteration")
+        return len(probes) < 5
+
+    events = _finish_work_killer(has_active_work)
+
+    assert len(probes) == 5, "shutdown must wait until the work reports idle"
+    assert events == ["idle_close", "exit"]
+
+
+def test_run_parent_death_killer_without_hangup_stops_despite_active_work() -> None:
+    """A plain parent death (``host stop``) waits out only the short finish-work
+    grace window, then stops a busy runner instead of finishing its turn.
+
+    The window lets a lagging hangup signal become visible; a plain death never
+    sets it, so the runner stops once the window elapses.
+    """
+    started = time.monotonic()
+    events = _finish_work_killer(lambda: True, finish_work_set=False, signal_wait_s=0.2)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert elapsed >= 0.2, "a busy non-hangup orphan must wait out the finish-work grace window"
+    assert elapsed < 3.0, "it must stop at the grace window, not enter the finishing deadline"
+
+
+def test_run_parent_death_killer_bounds_finishing_work(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Work that never finishes is stopped once the bound passes."""
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"):
+        events = _finish_work_killer(lambda: True, finish_work_max_s=0.05)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert any("did not finish" in record.message for record in caplog.records)
+    assert elapsed < 2.0, "finishing work must stop at its bound, not run unbounded"
+
+
+def test_run_parent_death_killer_idle_runner_exits_immediately_after_hangup() -> None:
+    """An idle runner exits on a hangup exactly as on any parent death."""
+    started = time.monotonic()
+    events = _finish_work_killer(lambda: False)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert elapsed < 1.0, "an idle runner must skip the grace and finishing waits"
+
+
+def test_run_parent_death_killer_waits_for_a_late_finish_work_signal() -> None:
+    """A finish-work signal landing just after parent death still saves the turn.
+
+    The signal is delivered through the event loop, which can lag the
+    parent-death probe; the killer must not tear down a busy runner before a
+    just-delivered hangup request becomes visible.
+    """
+    import threading
+
+    events: list[str] = []
+    finish_work = threading.Event()
+    probes: list[str] = []
+
+    def has_active_work() -> bool:
+        probes.append("probe")
+        return len(probes) < 4
+
+    # The signal becomes visible only after the killer has already observed
+    # the orphaned parent and begun waiting for it.
+    threading.Timer(0.05, finish_work.set).start()
+
+    _run_parent_death_killer(
+        os.getppid() + 100000,  # already "orphaned"
+        lambda: events.append("stop"),
+        finish_work=finish_work,
+        has_active_work=has_active_work,
+        request_idle_shutdown=lambda: events.append("idle_close"),
+        poll_interval_s=0.01,
+        grace_s=0.5,
+        signal_wait_s=0.5,
+        idle_grace_s=0.01,
+        finish_work_max_s=5.0,
+        exit_fn=lambda code: events.append("exit"),
+    )
+
+    assert events == ["idle_close", "exit"], (
+        "a finish-work signal arriving after parent death must still finish the turn"
+    )
+
+
+def test_work_still_active_treats_any_exception_as_active() -> None:
+    """A probe failure of any type counts as active so the watchdog never dies."""
+
+    def boom() -> bool:
+        raise ValueError("state mutated during probe")
+
+    assert _work_still_active(boom) is True
+
+
+def test_ignore_finish_work_signal_until_handled_masks_the_default_kill() -> None:
+    """A boot-time finish-work signal is ignored so it cannot kill the runner."""
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    if RUNNER_FINISH_WORK_SIGNAL is None:
+        pytest.skip("no finish-work signal on this platform")
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    try:
+        _ignore_finish_work_signal_until_handled()
+        assert signal.getsignal(RUNNER_FINISH_WORK_SIGNAL) is signal.SIG_IGN
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
 def test_install_crash_logging_records_uncaught_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2564,6 +3014,150 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
             loop.remove_signal_handler(sig)
 
     assert reasons == ["received SIGTERM"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_finish_work_signal_sets_event() -> None:
+    """The host's hangup signal flags in-flight work to finish, without stopping."""
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    stop_event = asyncio.Event()
+    finish_work = threading.Event()
+    _install_signal_handlers(stop_event, finish_work_event=finish_work)
+    loop = asyncio.get_running_loop()
+    try:
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, RUNNER_FINISH_WORK_SIGNAL):
+            loop.remove_signal_handler(sig)
+
+    assert finish_work.is_set()
+    assert not stop_event.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_degraded_finish_work_replaces_sig_ign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded loop installs a plain finish-work handler, never leaving SIG_IGN.
+
+    SIG_IGN survives exec, so a persisted boot-time ignore would silently leak
+    into agent subprocesses. When loop registration fails, a plain handler must
+    take its place: it resets to the default on exec and still records the
+    hangup for the parent-death backstop.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    loop = asyncio.get_running_loop()
+
+    def _broken_add_signal_handler(sig: int, *args: Any) -> None:
+        raise RuntimeError("the fd 6 must be in non-blocking mode")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _broken_add_signal_handler)
+    # Boot ignores the signal; the degraded install must swap SIG_IGN out.
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    signal.signal(RUNNER_FINISH_WORK_SIGNAL, signal.SIG_IGN)
+    finish_work = threading.Event()
+    try:
+        _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+        handler = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+        assert handler is not signal.SIG_IGN
+        assert callable(handler)
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert finish_work.is_set()
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_replaces_sig_ign_when_loop_lacks_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loop that cannot register signals still swaps the boot-time SIG_IGN out.
+
+    ``add_signal_handler`` raises ``NotImplementedError`` on loops without signal
+    support. That is suppressed without marking the install degraded, so the
+    inherited SIG_IGN must still be replaced or it would survive exec and stop
+    the runner from ever observing a hangup.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    loop = asyncio.get_running_loop()
+
+    def _unsupported_add_signal_handler(sig: int, *args: Any) -> None:
+        raise NotImplementedError("signals are not supported on this loop")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _unsupported_add_signal_handler)
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    signal.signal(RUNNER_FINISH_WORK_SIGNAL, signal.SIG_IGN)
+    finish_work = threading.Event()
+    try:
+        _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+        handler = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+        assert handler is not signal.SIG_IGN
+        assert callable(handler)
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert finish_work.is_set()
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGHUP") or sys.platform == "win32",
+    reason="POSIX signal dispositions",
+)
+async def test_install_signal_handlers_leaves_sighup_alone() -> None:
+    """SIGHUP keeps its disposition, so a standalone or adopted runner still dies by it.
+
+    Host-managed runners live in their own session and learn about a hangup
+    through the host's finish-work signal instead.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    before = signal.getsignal(signal.SIGHUP)
+    finish_work = threading.Event()
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+    try:
+        assert signal.getsignal(signal.SIGHUP) is before
+        assert not finish_work.is_set()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, RUNNER_FINISH_WORK_SIGNAL):
+            if sig is not None:
+                loop.remove_signal_handler(sig)
 
 
 @pytest.mark.asyncio
@@ -2701,8 +3295,12 @@ async def test_runner_shutdown_closes_terminal_registry(
         mcp_managers.append(manager)
         return manager
 
-    def _async_client_factory(*args: Any, **kwargs: Any) -> _TrackingAsyncClient:
-        del args, kwargs
+    real_async_client = httpx.AsyncClient
+
+    def _async_client_factory(*args: Any, **kwargs: Any) -> Any:
+        if "base_url" not in kwargs:
+            # The routing transport's inner network client, which is not the runner's client.
+            return real_async_client(*args, **kwargs)
         client = _TrackingAsyncClient()
         async_clients.append(client)
         return client
@@ -2913,11 +3511,10 @@ async def test_resolve_agent_spec_keeps_loop_responsive_during_bundle_load(
 
 
 @pytest.mark.asyncio
-async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
+async def test_resolve_agent_spec_from_server_extracts_each_fetch_separately(
     tmp_path: Path,
 ) -> None:
-    """An unchanged bundle reuses its extracted directory; another bundle under the
-    same version (an agent removed and added again restarts at 1) gets its own.
+    """Each fetch extracts into its own directory, including repeated identical bundles.
 
     :param tmp_path: Temporary spec cache root.
     :returns: None.
@@ -2950,11 +3547,47 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     ]
     assert requested_paths == ["/v1/sessions/conv_test/agent/contents"] * 3
     assert resolved[0] is not None and resolved[1] is not None
-    assert resolved[0].workdir == resolved[1].workdir
+    assert resolved[0].workdir != resolved[1].workdir
     assert sorted(path.name.startswith("ag_cached-v1-") for path in tmp_path.iterdir()) == [
         True,
         True,
+        True,
     ]
+
+
+async def test_resolve_agent_spec_from_server_applies_host_sandbox_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grants from the host's config reach the sandbox of a server-fetched bundle."""
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    (config_home / "config.yaml").write_text(
+        "runner:\n  sandbox_grants:\n    read_paths: [/srv/example/repo/.git]\n",
+        encoding="utf-8",
+    )
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                b"spec_version: 1\nname: sandboxed-agent\n"
+                b"executor:\n  config:\n    harness: claude-sdk\n"
+                b"os_env:\n  type: caller_process\n"
+                b"  sandbox:\n    type: none\n    read_paths: [docs]\n"
+            )
+        }
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path / "cache"), "ag_sandboxed", session_id="conv_test"
+        )
+
+    assert resolved is not None and resolved.spec.os_env is not None
+    assert resolved.spec.os_env.sandbox is not None
+    assert resolved.spec.os_env.sandbox.read_paths == ["docs", "/srv/example/repo/.git"]
 
 
 @pytest.mark.parametrize(
@@ -2962,7 +3595,7 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     [None, b"name: truncated-agent\n", b"spec_version: [\n", b"\xff"],
     ids=["missing", "missing-version", "invalid-yaml", "invalid-encoding"],
 )
-async def test_resolve_agent_spec_rebuilds_damaged_cache(
+async def test_resolve_agent_spec_ignores_damaged_prior_extraction(
     tmp_path: Path, cached_config: bytes | None
 ) -> None:
     cache = _AgentSpecCache(tmp_path)
@@ -2995,10 +3628,10 @@ async def test_resolve_agent_spec_rebuilds_damaged_cache(
 
     assert repaired is not None
     assert repaired.spec.name == "cached-agent"
-    assert repaired.workdir == original.workdir
+    assert repaired.workdir != original.workdir
     assert (repaired.workdir / "config.yaml").is_file()
     assert not (repaired.workdir / "partial.txt").exists()
-    assert list(tmp_path.iterdir()) == [repaired.workdir]
+    assert (original.workdir / "partial.txt").exists()
 
 
 async def test_resolve_agent_spec_keeps_cache_when_downloaded_bundle_is_invalid(
@@ -3103,6 +3736,7 @@ async def test_resolve_agent_spec_serializes_concurrent_cache_publication(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
         base_url="http://server.test",
     ) as client:
+        original = None
         if repair:
             original = await _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv")
             assert original is not None
@@ -3135,13 +3769,21 @@ async def test_resolve_agent_spec_serializes_concurrent_cache_publication(
     assert second_spec is not None and not isinstance(second_spec, BaseException)
     assert (second_spec.workdir / "config.yaml").is_file()
     assert second_spec.spec.name == "cached-agent"
+    # Each resolution extracts separately; a cancelled or failed extraction leaves nothing.
     if first_outcome == "completed":
         assert first_spec is not None and not isinstance(first_spec, BaseException)
-        assert first_spec.workdir == second_spec.workdir
+        assert first_spec.workdir != second_spec.workdir
+        assert first_spec.workdir.is_dir()
     else:
         assert isinstance(first_spec, asyncio.CancelledError)
-    assert list(tmp_path.iterdir()) == [second_spec.workdir]
-    assert extractions == (2 if first_outcome == "cancelled_error" else 1)
+    retained = set(tmp_path.iterdir())
+    assert second_spec.workdir in retained
+    assert retained == (
+        {second_spec.workdir}
+        | ({first_spec.workdir} if first_outcome == "completed" else set())
+        | ({original.workdir} if repair else set())
+    )
+    assert extractions == 2
 
 
 async def test_pending_spec_loads_leave_executor_capacity_for_runner_controls(
@@ -3302,7 +3944,7 @@ async def test_resolve_agent_spec_from_server_raises_when_throttling_persists(
         transport=httpx.MockTransport(_handler),
         base_url="http://server.test",
     ) as client:
-        with pytest.raises(RuntimeError, match="HTTP 429"):
+        with pytest.raises(AgentSpecFetchError, match="HTTP 429"):
             await _resolve_agent_spec_from_server(
                 client, _AgentSpecCache(tmp_path), "ag_throttled", session_id="conv_test"
             )
@@ -3312,10 +3954,10 @@ async def test_resolve_agent_spec_from_server_raises_when_throttling_persists(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [401, 403, 500, 502])
+@pytest.mark.parametrize("status_code", [401, 403, 500, 502, None])
 async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     tmp_path: Path,
-    status_code: int,
+    status_code: int | None,
 ) -> None:
     """Auth and server failures are not reported as missing agents.
 
@@ -3333,6 +3975,8 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
         :returns: A response with ``status_code``.
         """
         assert request.url.path == "/v1/sessions/conv_test/agent/contents"
+        if status_code is None:
+            raise httpx.ConnectError("connection unavailable", request=request)
         return httpx.Response(status_code)
 
     async with httpx.AsyncClient(
@@ -3345,7 +3989,13 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
             )
 
     message = str(exc_info.value)
-    assert f"HTTP {status_code}" in message
+    assert isinstance(exc_info.value, AgentSpecFetchError) is (
+        status_code is None or status_code >= 500
+    )
+    if status_code is None:
+        assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+    else:
+        assert f"HTTP {status_code}" in message
     assert "/v1/sessions/conv_test/agent/contents" in message
 
 
@@ -3735,6 +4385,133 @@ def test_runner_global_cleanup_ownership_is_explicit(
 
 
 @pytest.mark.asyncio
+async def test_runner_hides_scheduled_task_tools_only_when_server_turns_automations_off(tmp_path):
+    from omnigent.automations_availability import AUTOMATIONS_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("automations-agent")
+    # "1" is on; no header is an older server, which keeps the tools.
+    gate_headers = [{AUTOMATIONS_HEADER: "0"}, {AUTOMATIONS_HEADER: "1"}, {}]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_automations", session_id="session"
+            )
+            for _ in range(3)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return "sys_scheduled_task_create" in names and "sys_scheduled_task_list" in names
+
+    assert [advertised(result.spec) for result in results] == [False, True, True]
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_user_inbox_tools_only_when_the_server_turns_them_on(tmp_path):
+    from omnigent.automations_availability import USER_INBOX_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    # The group is on by default, so a plain agent gets the tools where offered.
+    bundle = build_agent_bundle("inbox-agent")
+    # No header is a server without the Inbox routes, so the tools would only fail.
+    gate_headers = [{USER_INBOX_HEADER: "0"}, {USER_INBOX_HEADER: "1"}, {}]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_inbox", session_id="session"
+            )
+            for _ in range(3)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return {"sys_user_inbox_post", "sys_user_inbox_list"} <= names
+
+    assert [advertised(result.spec) for result in results] == [False, True, False]
+
+
+@pytest.mark.asyncio
+async def test_runner_offers_memory_tools_only_when_the_server_says_memory_is_available(tmp_path):
+    from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("memory-agent")
+    # "1" is on; "0" and no header (an older server, with no /v1/memory) are off.
+    # The search header adds memory_search on top of the other four.
+    gate_headers = [
+        {MEMORY_HEADER: "1", MEMORY_SEARCH_HEADER: "1"},
+        {MEMORY_HEADER: "1", MEMORY_SEARCH_HEADER: "0"},
+        {MEMORY_HEADER: "1"},
+        {MEMORY_HEADER: "0", MEMORY_SEARCH_HEADER: "1"},
+        {},
+    ]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_memory", session_id="session"
+            )
+            for _ in range(5)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return ("memory_write" in names, "memory_search" in names)
+
+    assert [advertised(result.spec) for result in results] == [
+        (True, True),
+        (True, False),
+        (True, False),
+        (False, False),
+        (False, False),
+    ]
+
+
 async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
     import json
 
@@ -3770,5 +4547,277 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
         [],
         [],
     ]
-    assert len({result.workdir for result in results}) == 1
+    assert len({result.workdir for result in results}) == 3
     assert "registry" not in (results[0].workdir / "config.yaml").read_text()
+
+
+_UNREGISTERED_HANDLER_CONFIG = (
+    "spec_version: 1\nname: handler-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    "guardrails:\n  policies:\n    custom_gate:\n      type: function\n      on: [tool_call]\n"
+    "      function:\n        path: example_org.policies.custom_gate\n        arguments: {}\n"
+)
+
+
+async def test_resolve_agent_spec_rejects_unregistered_handler_in_tenant_bundle(
+    tmp_path: Path,
+) -> None:
+    """A session-scoped (tenant) bundle may not name an unregistered policy handler."""
+    bundle = bundle_files({"config.yaml": _UNREGISTERED_HANDLER_CONFIG.encode()})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(OmnigentError, match="not a registered policy handler"):
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_tenant", session_id="conv_test"
+            )
+
+
+async def test_resolve_agent_spec_loads_operator_bundle_handler_without_module_list(
+    tmp_path: Path,
+) -> None:
+    """Operator-authored bundles keep custom handlers even when no module list is sent."""
+    bundle = bundle_files({"config.yaml": _UNREGISTERED_HANDLER_CONFIG.encode()})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, content=bundle, headers={"X-Agent-Session-Scoped": "false"}
+            )
+        ),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_operator", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.name == "handler-agent"
+
+
+async def test_resolve_agent_spec_loads_operator_callable_tools(tmp_path: Path) -> None:
+    """Operator bundles may declare server-side callable tools, as the shipped examples do."""
+    example = Path("tests/resources/examples/agent_with_tools.yaml").read_bytes()
+    bundle = bundle_files({"agent.yaml": example})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, content=bundle, headers={"X-Agent-Session-Scoped": "false"}
+            )
+        ),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_tools", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.name == "assistant_with_tools"
+
+
+async def test_resolve_agent_spec_ignores_mutated_named_cache(tmp_path: Path) -> None:
+    """A workload-writable cache directory under the bundle's name is never parsed."""
+    bundle = _spec_bundle("original")
+    digest = hashlib.sha256(bundle).hexdigest()[:16]
+    previous = _agent_cache_dest(tmp_path, "ag_mutated", f"1-{digest}")
+    previous.mkdir()
+    (previous / "config.yaml").write_text("name: [unparseable", encoding="utf-8")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=bundle, headers={"X-Agent-Version": "1"})
+        ),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_mutated", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.name == "original"
+    assert resolved.workdir != previous
+    assert (previous / "config.yaml").read_text(encoding="utf-8") == "name: [unparseable"
+
+
+async def test_session_spec_workdirs_release_only_their_session(tmp_path: Path) -> None:
+    """Releasing one session removes its extractions and leaves other sessions' alone."""
+    workdirs = _SessionSpecWorkdirs()
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    assert await workdirs.retain("first", workdirs.lease("first"), first)
+    assert await workdirs.retain("second", workdirs.lease("second"), second)
+
+    await workdirs.release("first")
+
+    assert not first.exists()
+    assert second.exists()
+    await workdirs.release("second")
+    assert not second.exists()
+
+
+async def test_stale_lease_cannot_join_a_reused_session(tmp_path: Path) -> None:
+    """A resolution finishing after its session was released discards its extraction."""
+    workdirs = _SessionSpecWorkdirs()
+    stale_lease = workdirs.lease("session")
+    await workdirs.release("session")
+    current_lease = workdirs.lease("session")
+    stale = tmp_path / "stale"
+    current = tmp_path / "current"
+    stale.mkdir()
+    current.mkdir()
+
+    assert not await workdirs.retain("session", stale_lease, stale)
+    assert await workdirs.retain("session", current_lease, current)
+    await workdirs.release("session")
+
+    assert not stale.exists()
+    assert not current.exists()
+
+
+async def test_session_resolution_is_removed_on_session_delete(tmp_path: Path) -> None:
+    """Deleting a session through the runner API removes its extracted bundle directory."""
+    workdirs = _SessionSpecWorkdirs()
+    extraction = tmp_path / "extraction"
+    extraction.mkdir()
+    assert await workdirs.retain("session", workdirs.lease("session"), extraction)
+
+    async with httpx.AsyncClient(
+        base_url="https://server.invalid",
+        transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    ) as server_client:
+        app = create_runner_app(server_client=server_client, spec_workdir_cleanup=workdirs.release)
+        async with httpx.AsyncClient(
+            base_url="https://runner.invalid", transport=httpx.ASGITransport(app=app)
+        ) as runner_client:
+            response = await runner_client.delete("/v1/sessions/session")
+
+    assert response.status_code == 200
+    assert not extraction.exists()
+
+
+async def test_invalid_bundle_leaves_no_partial_extraction(tmp_path: Path) -> None:
+    """A bundle that fails to load is removed rather than left in the extraction root."""
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=b"not a tarball")),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(ExtractionError):
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_bad", session_id="conv_test"
+            )
+    assert list(tmp_path.iterdir()) == []
+
+
+# Handlers this module declares as an operator-configured policy module.
+POLICY_REGISTRY = [{"handler": "example_org.policies.configured_gate"}]
+
+
+def _policy_bundle(handler: str) -> bytes:
+    config = (
+        "spec_version: 1\nname: policy-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        "guardrails:\n  policies:\n    gate:\n      type: function\n      on: [tool_call]\n"
+        f"      function:\n        path: {handler}\n        arguments: {{}}\n"
+    )
+    return bundle_files({"config.yaml": config.encode()})
+
+
+@pytest.fixture
+def restored_policy_registry() -> Iterator[None]:
+    yield
+    load_registry()
+
+
+def _policy_modules_header(modules: list[str]) -> dict[str, str]:
+    return {POLICY_MODULES_HEADER: json.dumps(modules)}
+
+
+async def _resolve_tenant_policy_bundle(
+    cache: _AgentSpecCache, handler: str, headers: dict[str, str] | None = None
+) -> ResolvedSpec | None:
+    bundle = _policy_bundle(handler)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=bundle, headers=headers or {})
+        ),
+        base_url="http://server.test",
+    ) as client:
+        return await _resolve_agent_spec_from_server(
+            client, cache, "ag_policy", session_id="conv_test"
+        )
+
+
+async def test_runner_accepts_tenant_handler_from_server_policy_modules(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A tenant bundle may use a handler from a module the server sends with the bundle."""
+    headers = _policy_modules_header([__name__])
+
+    resolved = await _resolve_tenant_policy_bundle(
+        _AgentSpecCache(tmp_path), "example_org.policies.configured_gate", headers
+    )
+
+    assert resolved is not None
+    assert resolved.spec.name == "policy-agent"
+
+
+async def test_runner_rejects_tenant_handler_outside_server_policy_modules(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A handler the server does not configure is rejected, even with a module list present."""
+    headers = _policy_modules_header([__name__])
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        await _resolve_tenant_policy_bundle(
+            _AgentSpecCache(tmp_path), "example_org.policies.unconfigured_gate", headers
+        )
+
+
+async def test_runner_rejects_tenant_handler_without_module_list(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A tenant bundle with a custom handler is rejected when the server sends no module list."""
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        await _resolve_tenant_policy_bundle(
+            _AgentSpecCache(tmp_path), "example_org.policies.configured_gate"
+        )
+
+
+async def test_runner_drops_previous_policy_modules_when_server_omits_them(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """Registration follows the latest response: a later list without the module rejects it."""
+    cache = _AgentSpecCache(tmp_path)
+    handler = "example_org.policies.configured_gate"
+    await _resolve_tenant_policy_bundle(cache, handler, _policy_modules_header([__name__]))
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        await _resolve_tenant_policy_bundle(cache, handler)
+
+
+async def test_runner_accepts_tenant_handler_on_local_single_user_server(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A local single-user server keeps its operator's custom handlers for tenant bundles."""
+    resolved = await _resolve_tenant_policy_bundle(
+        _AgentSpecCache(tmp_path),
+        "example_org.policies.unconfigured_gate",
+        {LOCAL_SINGLE_USER_HEADER: "1"},
+    )
+
+    assert resolved is not None
+    assert resolved.spec.name == "policy-agent"
+
+
+@pytest.mark.parametrize("raw", ["not json", '"a string"', '["ok", 3]'])
+async def test_runner_rejects_malformed_policy_modules_header(tmp_path: Path, raw: str) -> None:
+    """A malformed module list fails the resolution instead of registering nothing silently."""
+    with pytest.raises(RuntimeError, match="malformed policy modules header"):
+        await _resolve_tenant_policy_bundle(
+            _AgentSpecCache(tmp_path),
+            "example_org.policies.configured_gate",
+            {POLICY_MODULES_HEADER: raw},
+        )

@@ -8,29 +8,48 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 
 - `summary`: organization/project/repository, request title, description and status.
 - `comments`: request comments on their own tab, whose label shows the count.
-- `changes`: local file diff and expanded context pinned to displayed revisions.
+- `changes`: local file diff and expanded context pinned to displayed revisions, with a path filter and copy-path and open actions. Find searches the fetched patch from the toolbar search button, or Cmd/Ctrl+F while focus is in the Changes tab.
+- `local-review`: submit session-local Agent comments from Changes and send their
+  context chips together through chat; hover to preview and click to return.
 - `associations`: link, select and unlink a request from another repository.
 - `partial`: retain loaded results and explain incomplete data or unavailable diffs.
 - `auth`: an authenticated PAT works without the Azure CLI; account switching is absent.
 - `tracking`: supported successful agent mutations associate their resulting request.
+- `render-recovery`: Panel render failures offer **Try again** without removing
+  chat, Workspace tabs or mobile Close.
 
 ## How to get to it (user POV)
 
 - `desktop-rail`: open Workspace and choose Pull Requests.
 - `desktop-composer`: click the request number beside the session composer.
+  Hover it to open a request in a new tab from the status preview; see
+  [pull-request-conversations.md](pull-request-conversations.md).
 - `mobile-composer`: tap the request number to open the full-screen panel.
 - `canvas`: when Canvas is enabled, follow a request link on a session card.
 - `agent-tool`: create or update a request through the session's agent tools.
 
-Select a row in the PR list to open its details; **All pull requests** returns
-to the list. Stored metadata and row actions remain available while the host
-is offline; checks and merge controls resume after reconnection.
+A session with one PR opens its details directly under **Pull Requests**.
+With multiple PRs, select a row in the list to open its details;
+**All pull requests** returns to the list. Stored metadata and unlinking remain
+available while the host is offline; checks and merge controls resume after
+reconnection.
+On desktop, mobile and Canvas, **Try again** retries failed panel content;
+switching sessions also clears a failed panel. Healthy chat drafts stay mounted.
+All four panel entry points also offer local Agent review in **Changes**; see
+the [local-review flow](pull-request-conversations.md#driving-it-with-the-repro-environment).
 
 ## Driving it with the repro environment
 
 Preconditions: use the [Verify Omnigent skill](skills/verify-omnigent/SKILL.md)
 and an isolated instance. Browser fixtures replace provider responses and do
 not contact Azure DevOps or invoke the Azure CLI.
+
+Shared render recovery has component coverage in
+`web/src/components/RenderErrorBoundary.test.tsx` and
+`web/src/shell/AppShell.pullRequestTabVisibility.test.tsx`. For each panel entry
+above, inject a panel render exception, confirm chat and tab/Close controls
+remain usable, clear the fault, and choose **Try again**. Switching sessions
+should also recover. This is separate from provider authentication failures.
 
 - `desktop-rail`, `desktop-composer`, and `mobile-composer`:
   `tests/e2e_ui/azure_devops/test_azure_devops_tab.py::test_azure_devops_tab_shows_provider_repo_and_pull_request`
@@ -53,11 +72,17 @@ not contact Azure DevOps or invoke the Azure CLI.
   test repository and the [observer instructions](../docs/AZURE_DEVOPS.md#observer-limits);
   after a successful supported creation or update, confirm the resulting request
   appears in the panel. Reads and comments must not add an association.
+- Local review on `desktop-rail`, `desktop-composer`, `mobile-composer`, and
+  `canvas`: follow the linked local-review flow with a readable diff. Submit an
+  Agent comment, preview its chip, navigate back, edit or delete it, and send
+  attached comments with the chat draft. Confirm no Azure comment is published.
 
 ## Gotchas
 
 - The tab retains the generic Pull Requests label; its provider heading, number
   and Canvas link use Azure DevOps metadata.
+- Agent comments belong to the session. Publishing inline reviews to Azure
+  DevOps is unsupported; the GitHub destination is unavailable for these requests.
 - An authenticated PAT does not require the Azure CLI. Managed sandbox credential
   provisioning and Azure DevOps Server on premises are separate features.
 - Linked requests outside the checkout can show a summary but have no local

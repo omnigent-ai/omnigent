@@ -1,27 +1,32 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { CheckIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { INLINE_RENAME_FIELD_PROPS } from "@/lib/inlineRename";
 
 interface SidebarEditRowProps {
   initialTitle: string;
   onCommit: (title: string) => void;
   onCancel: () => void;
   label?: string;
+  /** Omit to leave length validation to the server. */
+  maxLength?: number;
+  inputTestId?: string;
 }
 
-/** Shared inline rename: Enter or blur saves; Escape cancels. */
+/** Shared inline rename: Enter or blur saves once; Escape cancels. */
 export function SidebarEditRow({
   initialTitle,
   onCommit,
   onCancel,
   label = "Rename session",
+  maxLength,
+  inputTestId = "rename-conversation-input",
 }: SidebarEditRowProps) {
   const [value, setValue] = useState(initialTitle);
   const inputRef = useRef<HTMLInputElement>(null);
-  // Cancelling must not commit on the subsequent blur.
-  const cancelledRef = useRef(false);
+  // Saving or cancelling ends the edit; a later blur must not save again.
+  const settledRef = useRef(false);
   // Enter confirming an IME candidate must not save the rename.
   const isComposingRef = useRef(false);
 
@@ -34,19 +39,25 @@ export function SidebarEditRow({
     if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
     if (e.key === "Enter") {
       e.preventDefault();
-      onCommit(value);
+      commit();
       return;
     }
     if (e.key === "Escape") {
       e.preventDefault();
-      cancelledRef.current = true;
-      onCancel();
+      cancel();
     }
   }
 
-  function handleBlur() {
-    if (cancelledRef.current) return;
+  function commit() {
+    if (settledRef.current) return;
+    settledRef.current = true;
     onCommit(value);
+  }
+
+  function cancel() {
+    if (settledRef.current) return;
+    settledRef.current = true;
+    onCancel();
   }
 
   return (
@@ -55,9 +66,10 @@ export function SidebarEditRow({
     <div className="sidebar-compact-text flex h-8 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1 md:h-7">
       <input
         ref={inputRef}
+        {...INLINE_RENAME_FIELD_PROPS}
         type="text"
         aria-label={label}
-        maxLength={USER_SESSION_TITLE_MAX_CHARS}
+        maxLength={maxLength}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onCompositionStart={() => {
@@ -67,9 +79,9 @@ export function SidebarEditRow({
           isComposingRef.current = false;
         }}
         onKeyDown={handleKeyDown}
-        onBlur={handleBlur}
-        data-testid="rename-conversation-input"
-        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
+        onBlur={commit}
+        data-testid={inputTestId}
+        className="sidebar-compact-text min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
       />
       <Button
         type="button"
@@ -80,7 +92,7 @@ export function SidebarEditRow({
           // Prevent the input's blur from firing before the commit.
           e.preventDefault();
         }}
-        onClick={() => onCommit(value)}
+        onClick={commit}
       >
         <CheckIcon className="size-3.5" />
       </Button>
@@ -90,10 +102,7 @@ export function SidebarEditRow({
         size="icon-xs"
         aria-label="Cancel rename"
         onMouseDown={(e) => e.preventDefault()}
-        onClick={() => {
-          cancelledRef.current = true;
-          onCancel();
-        }}
+        onClick={cancel}
       >
         <XIcon className="size-3.5" />
       </Button>

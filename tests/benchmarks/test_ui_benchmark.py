@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import base64
 import contextlib
 import copy
 import json
@@ -13,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -27,6 +29,7 @@ from dev.benchmarks.ui.run import (
     parse_args,
     required_journeys,
 )
+from tests._image_fixtures import _TINY_PNG_BASE64
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -67,6 +70,188 @@ def _report() -> dict:
         for mode in ("browser", "mac_css")
     }
     return make_report(samples, _args(), "ui-revision", "test-chromium")
+
+
+@pytest.mark.parametrize("first_capture_fails", [False, True])
+async def test_failed_scenario_saves_screenshot(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, first_capture_fails: bool
+) -> None:
+    measurement_error = RuntimeError("measurement failed")
+    capture_error = ui_run.PlaywrightError(
+        "CDPSession.send: Protocol error (Page.captureScreenshot): Unable to capture screenshot"
+    )
+    page = SimpleNamespace(
+        on=lambda *_args: None,
+        goto=AsyncMock(side_effect=measurement_error),
+        evaluate=AsyncMock(),
+    )
+    captures = [capture_error] if first_capture_fails else []
+    session = SimpleNamespace(
+        send=AsyncMock(side_effect=[{}, {}, *captures, {"data": _TINY_PNG_BASE64}])
+    )
+    context = SimpleNamespace(
+        new_page=AsyncMock(return_value=page),
+        new_cdp_session=AsyncMock(return_value=session),
+        close=AsyncMock(),
+    )
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
+
+    with pytest.raises(RuntimeError, match="measurement failed") as raised:
+        async with asyncio.timeout(10):
+            await ui_run.measure_scenario(
+                browser,
+                SimpleNamespace(base_url="http://example.test"),
+                "session",
+                "browser",
+                _args(),
+                tmp_path / "page-error",
+            )
+    assert raised.value is measurement_error
+    assert (tmp_path / "page-error.failed.png").read_bytes() == base64.b64decode(_TINY_PNG_BASE64)
+    context.close.assert_awaited_once()
+    page.evaluate.assert_not_awaited()
+    assert session.send.await_args_list[2:] == [call("Page.captureScreenshot")] * (
+        2 if first_capture_fails else 1
+    )
+    records = [record for record in caplog.records if record.name == ui_run.__name__]
+    assert len(records) == int(first_capture_fails)
+    if first_capture_fails:
+        assert records[0].exc_info and records[0].exc_info[1] is capture_error
+        assert "retrying" in records[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "document_state",
+    ["available", "closed", "timeout", "unavailable", "deadline", "retry-deadline"],
+)
+async def test_failed_screenshot_retains_error_and_document_state(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    document_state: str,
+) -> None:
+    measurement_error = RuntimeError("measurement failed")
+    capture_error = ui_run.PlaywrightError(
+        "CDPSession.send: Protocol error (Page.captureScreenshot): Unable to capture screenshot"
+    )
+    retry_error = ui_run.PlaywrightError("retry capture failed")
+    state_error = {
+        "timeout": TimeoutError("document state timed out"),
+        "unavailable": ui_run.PlaywrightError("document state unavailable"),
+    }.get(document_state)
+    state = {
+        "readyState": "interactive",
+        "viewport": {"width": 1440, "height": 900},
+        "documentElement": {"width": 1440, "height": 900},
+        "paints": [],
+        "observedAt": 15.0,
+    }
+    page = SimpleNamespace(
+        on=lambda *_args: None,
+        goto=AsyncMock(side_effect=measurement_error),
+        is_closed=lambda: document_state == "closed",
+        evaluate=AsyncMock(return_value=state, side_effect=state_error),
+    )
+    pending_document: asyncio.Future[None] = asyncio.Future()
+    pending_capture: asyncio.Future[dict] = asyncio.Future()
+    if document_state == "deadline":
+
+        async def evaluate_document(_expression: str) -> None:
+            await pending_document
+
+        page.evaluate.side_effect = evaluate_document
+    if document_state in {"deadline", "retry-deadline"}:
+
+        def short_timeout(delay: float) -> asyncio.Timeout:
+            assert delay in {2, 30}
+            if (delay == 30 and document_state == "deadline") or (
+                delay == 2 and document_state == "retry-deadline"
+            ):
+                return asyncio.timeout(0.01)
+            return asyncio.timeout(delay)
+
+        async def retry_sleep(delay: float) -> None:
+            assert delay == 0.1
+            await asyncio.sleep(0 if document_state == "retry-deadline" else delay)
+
+        monkeypatch.setattr(
+            ui_run, "asyncio", SimpleNamespace(timeout=short_timeout, sleep=retry_sleep)
+        )
+    capture_attempts = 0
+
+    async def send(method: str, _params: dict | None = None) -> dict:
+        nonlocal capture_attempts
+        if method != "Page.captureScreenshot":
+            return {}
+        capture_attempts += 1
+        if capture_attempts == 1:
+            raise capture_error
+        if document_state == "retry-deadline":
+            return await pending_capture
+        raise retry_error
+
+    session = SimpleNamespace(send=AsyncMock(side_effect=send))
+    context = SimpleNamespace(
+        new_page=AsyncMock(return_value=page),
+        new_cdp_session=AsyncMock(return_value=session),
+        close=AsyncMock(),
+    )
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
+    with pytest.raises(RuntimeError, match="measurement failed") as raised:
+        async with asyncio.timeout(10):
+            await ui_run.measure_scenario(
+                browser,
+                SimpleNamespace(base_url="http://example.test"),
+                "session",
+                "browser",
+                _args(),
+                tmp_path / "page-error",
+            )
+    assert raised.value is measurement_error
+    context.close.assert_awaited_once()
+    screenshot = tmp_path / "page-error.failed.png"
+    assert not screenshot.exists()
+    records = [
+        record for record in caplog.records if record.name == ui_run.__name__ and record.exc_info
+    ]
+    assert len(records) == 2
+    first_record, record = records
+    assert first_record.exc_info[1] is capture_error
+    assert (
+        first_record.getMessage() == f"Failure screenshot capture failed at {screenshot}; retrying"
+    )
+    if document_state == "retry-deadline":
+        assert isinstance(record.exc_info[1], TimeoutError)
+        assert pending_capture.cancelled()
+    else:
+        assert record.exc_info[1] is retry_error
+    assert record.getMessage() == f"Failure screenshot could not be saved at {screenshot}"
+    assert caplog.records.index(first_record) < caplog.records.index(record)
+    states = [
+        entry
+        for entry in caplog.records
+        if "Document state after failed screenshot capture" in entry.getMessage()
+    ]
+    assert len(states) == 1
+    assert (
+        states[0]
+        .getMessage()
+        .startswith(f"Document state after failed screenshot capture at {screenshot}: ")
+    )
+    assert caplog.records.index(record) < caplog.records.index(states[0])
+    observed = states[0].args[1]
+    assert observed["page_closed"] == (document_state == "closed")
+    if document_state in {"available", "retry-deadline"}:
+        assert observed["document"] == state
+    elif document_state == "closed":
+        page.evaluate.assert_not_awaited()
+    elif document_state == "deadline":
+        page.evaluate.assert_awaited_once()
+        assert pending_document.cancelled()
+        assert observed["state_error"] == "TimeoutError()"
+    else:
+        assert str(state_error) in observed["state_error"]
+    assert session.send.await_args_list[2:] == [call("Page.captureScreenshot")] * 2
 
 
 def test_ui_report_preserves_raw_samples_and_revision(monkeypatch: pytest.MonkeyPatch) -> None:

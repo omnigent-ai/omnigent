@@ -9,13 +9,15 @@ caller-supplied IANA timezone so a preset such as "Daily at 9:00 AM" fires at
 The rule is anchored at midnight of the reference day (localized to the task
 timezone), so occurrence phase is deterministic: an hourly rule fires on the
 hour, a daily rule at its ``BYHOUR``/``BYMINUTE``. :func:`validate_rrule`
-additionally enforces a minimum interval (:data:`MIN_INTERVAL_SECONDS`) and
+additionally enforces a ten-minute minimum interval and
 rejects rules that never fire or fire only once within the search window — each
-fire spawns a real agent session, so a runaway cadence is expensive.
+fire starts or continues real agent work, so a runaway cadence is expensive. A
+caller whose scheduler counts ``COUNT`` from the task's creation can opt in to
+one-time schedules, which must say so with an explicit ``COUNT=1``.
 
 Schedules use a single rule, at most 24 distinct values per BY field and 24 time
 combinations, an eight-year occurrence horizon, and work and elapsed-time limits.
-Hourly-equivalent minute and second rules remain supported for persisted schedules.
+Minute and second rules are subject to the same minimum-gap policy.
 """
 
 from __future__ import annotations
@@ -32,10 +34,8 @@ from dateutil.rrule import rrule, rrulestr  # type: ignore[import-untyped]
 
 from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter_bounded
 
-# Reject anything more frequent than this. Each fire spawns a real agent
-# session, so a tight cadence gets expensive fast. One hour is the tightest
-# cadence we allow: hourly is a useful ceiling with a hard bound on runaway cost.
-MIN_INTERVAL_SECONDS = 60 * 60
+# The same floor applies to every execution target and session mode.
+MIN_INTERVAL_SECONDS = 10 * 60
 
 _UTC = ZoneInfo("UTC")
 
@@ -164,11 +164,8 @@ def get_next_fire_time(
         horizon_from=after.astimezone(tz) if anchor is not None else None,
         count_after=anchor.astimezone(tz) if anchor is not None else None,
     )
-    # `rule.after` compares in dtstart's timezone, so localize `after` too. A
-    # spring-forward "imaginary" wall time maps to some instant via zoneinfo and
-    # a fall-back duplicated time picks the earlier of the two; both are
-    # acceptable at an hourly floor — the schedule slips by at most an hour
-    # across a DST edge.
+    # Localize `after` for dtstart comparisons. Zoneinfo resolves DST gaps/folds
+    # (earlier fold), so cadences follow local wall time rather than elapsed UTC.
     return rule.after(after.astimezone(tz), inc=False)
 
 
@@ -271,12 +268,34 @@ def _parse(
         raise RRuleValidationError(f"Invalid RRULE {rule_str!r}: {exc}") from exc
 
 
-def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  # noqa: ARG001
+_COUNT_ONE_RE = re.compile(r"(?:^|;)COUNT=0*1(?:;|$)")
+
+
+def is_one_time_rule(rule_str: str) -> bool:
+    """Whether a rule asks for exactly one occurrence with an explicit ``COUNT=1``.
+
+    A rule that fires once only because of a tight ``UNTIL`` is not one: requiring
+    ``COUNT=1`` keeps the "fires only once" check for misconfigured recurrences.
+
+    :param rule_str: An RFC 5545 recurrence rule, e.g.
+        ``"FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=15;BYMINUTE=0;COUNT=1"``.
+    :returns: ``True`` when the rule carries ``COUNT=1``.
+    """
+    text = rule_str.strip().upper().removeprefix("RRULE:").replace(" ", "")
+    return _COUNT_ONE_RE.search(text) is not None
+
+
+def validate_rrule(
+    rule_str: str,
+    tz: ZoneInfo | None = None,  # noqa: ARG001
+    *,
+    allow_single_fire: bool = False,
+) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
     Beyond syntax, enforces that the rule (a) fires at least twice within the
-    search window and (b) has a minimum gap of at least
-    :data:`MIN_INTERVAL_SECONDS` between *any* two consecutive fires.
+    search window and (b) has a minimum gap of at least ten minutes between
+    sampled consecutive fires.
 
     The interval check samples fires from a fixed UTC anchor, so the verdict is
     deterministic (independent of the wall-clock instant it runs at) and immune
@@ -285,6 +304,10 @@ def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  
     :param rule_str: The RFC 5545 recurrence rule string.
     :param tz: Accepted for API compatibility but not used by the interval
         check, which is timezone-agnostic for the cadences we allow.
+    :param allow_single_fire: Accept a rule with an explicit ``COUNT=1``, e.g. a
+        reminder. Only the database scheduler, which counts ``COUNT`` from the
+        task's creation, may pass ``True``: the legacy timer counts from midnight
+        of each re-arm, so a one-time rule would fire again after a restart.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
@@ -314,7 +337,9 @@ def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  
     if count == 0:
         raise RRuleValidationError("RRULE never fires")
     if count == 1:
-        raise RRuleValidationError("RRULE fires only once")
+        if not (allow_single_fire and is_one_time_rule(rule_str)):
+            raise RRuleValidationError("RRULE fires only once")
+        return RRuleTrigger(rule=rule_str)
     if min_gap < MIN_INTERVAL_SECONDS:
         raise RRuleValidationError(
             f"Minimum interval is {MIN_INTERVAL_SECONDS // 60} minutes "

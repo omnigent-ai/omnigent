@@ -22,6 +22,12 @@ import httpx
 
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.host.launch_audit import launch_audit_headers
+from omnigent.host.session_env import (
+    SESSION_ENV_PASSTHROUGH_ENV_VAR,
+    requested_session_env,
+    session_env_handoff,
+    session_env_handoff_pending,
+)
 from omnigent.process_logging import display_log_path, process_log_dir
 
 # Steady-state poll cadence while waiting for a daemon-spawned runner to
@@ -99,24 +105,39 @@ def open_daemon_client(
     :param headers: Base HTTP headers (auth bearer, workspace routing); not
         mutated — a fresh dict carries the merged routing headers.
     :param host_id: The host to pin to, e.g. ``"host_abc123"``; ``None`` (a
-        hostless / local session) leaves routing to the default fallback.
+        hostless / local session) uses this machine's own routing key.
     :param auth: Optional per-request ``httpx.Auth`` (e.g. token refresh).
     :param timeout: Optional httpx timeout for the client.
     :returns: An ``httpx.AsyncClient`` whose requests all name *host_id*.
     """
     from omnigent_client._http import is_loopback_url
 
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli_auth import (
+        OMNIGENT_SLICE_KEY_HEADER,
+        UNKEYED_REQUEST_EXTENSION,
+        databricks_request_headers,
+    )
 
-    pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
+    # httpx.Headers so a caller's lowercase header name replaces the builder's, not duplicates it.
+    pinned = httpx.Headers(headers)
+    pinned.update(databricks_request_headers(base_url, host_id=host_id))
+
+    async def pin_request(request: httpx.Request) -> None:
+        # Auth refresh may inject this machine's key; the selected host wins.
+        key = client.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        if key is not None and not request.extensions.get(UNKEYED_REQUEST_EXTENSION):
+            request.headers[OMNIGENT_SLICE_KEY_HEADER] = key
+
     # A proxy cannot reach a loopback server, so local targets bypass it.
-    return httpx.AsyncClient(
+    client = httpx.AsyncClient(
         base_url=base_url,
         headers=pinned,
         auth=auth,
         timeout=timeout,
         trust_env=not is_loopback_url(base_url),
+        event_hooks={"request": [pin_request]},
     )
+    return client
 
 
 async def wait_for_host_online(
@@ -250,7 +271,10 @@ async def launch_or_reuse_daemon_runner(
     Reuses the session's currently-bound runner when it is still online
     (resume into a live session). Otherwise clears any stale binding and
     asks the server to launch a fresh runner on the host via
-    ``POST /v1/hosts/{host_id}/runners`` (which atomically binds it).
+    ``POST /v1/hosts/{host_id}/runners`` (which atomically binds it). A fresh
+    runner receives the variables named in
+    :data:`~omnigent.host.session_env.SESSION_ENV_PASSTHROUGH_ENV_VAR`; a
+    reused runner keeps the environment it was launched with.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param host_id: This machine's host id, e.g. ``"host_abc123"``.
@@ -265,15 +289,29 @@ async def launch_or_reuse_daemon_runner(
     :returns: The bound runner id, e.g. ``"runner_abc123"``.
     :raises click.ClickException: If the launch request fails.
     """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.session_host import set_session_host
+
+    session_env = requested_session_env()
     headers = launch_audit_headers(host_id=host_id, fresh=fresh)
+    owner_host = host_id
     if fresh:
         existing = None
     else:
         snap = await client.get(f"/v1/sessions/{url_component(session_id)}", headers=headers)
-        existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
+        snapshot = _json_body(snap) if snap.status_code == 200 else {}
+        existing = snapshot.get("runner_id")
+        saved_host = snapshot.get("host_id")
+        if isinstance(saved_host, str) and saved_host:
+            owner_host = saved_host
     if isinstance(existing, str) and existing:
+        # Runner status is replica-local; probe the existing owner's replica.
+        client.headers.update(databricks_request_headers(str(client.base_url), host_id=owner_host))
         if await runner_is_online(client, existing, headers=headers):
+            set_session_host(session_id, owner_host)
             return existing
+        # Offline recovery keeps the caller's requested destination and workspace.
+        client.headers.update(databricks_request_headers(str(client.base_url), host_id=host_id))
         # Stale binding (offline runner): clear it so the launch
         # endpoint's atomic ``UPDATE ... WHERE runner_id IS NULL`` can
         # bind the freshly-spawned runner. "" is the clear sentinel.
@@ -291,26 +329,39 @@ async def launch_or_reuse_daemon_runner(
     # high-latency / reconnecting setups start reliably. Bounded, so a
     # genuinely-offline host still fails reasonably fast.
     _RETRY_DELAYS_S = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.0, 3.0)  # ~16.5s budget
-    for attempt in range(len(_RETRY_DELAYS_S) + 1):
-        if attempt:
-            await asyncio.sleep(_RETRY_DELAYS_S[attempt - 1])
-        resp = await client.post(
-            f"/v1/hosts/{url_component(host_id)}/runners",
-            json={"session_id": session_id, "workspace": workspace},
-            headers=headers,
-            timeout=60.0,
-        )
-        if resp.status_code < 400:
-            break
-        transient = resp.status_code == 409 and "offline" in error_text(resp).lower()
-        if not (transient and attempt < len(_RETRY_DELAYS_S)):
-            raise click.ClickException(
-                f"Failed to launch a runner on host {host_id!r} "
-                f"({resp.status_code}): {error_text(resp)}"
+    with session_env_handoff(session_id, session_env) as handoff_id:
+        launch_body = {"session_id": session_id, "workspace": workspace}
+        if handoff_id is not None:
+            launch_body["session_env_handoff_id"] = handoff_id
+        for attempt in range(len(_RETRY_DELAYS_S) + 1):
+            if attempt:
+                await asyncio.sleep(_RETRY_DELAYS_S[attempt - 1])
+            resp = await client.post(
+                f"/v1/hosts/{url_component(host_id)}/runners",
+                json=launch_body,
+                headers=headers,
+                timeout=60.0,
             )
+            if resp.status_code < 400:
+                if handoff_id is not None and session_env_handoff_pending(session_id, handoff_id):
+                    click.echo(
+                        f"Warning: the host daemon did not receive the "
+                        f"{SESSION_ENV_PASSTHROUGH_ENV_VAR} variables, so the runner "
+                        f"started without them. The server or daemon may be older than "
+                        f"this CLI, or the daemon may use a different data directory.",
+                        err=True,
+                    )
+                break
+            transient = resp.status_code == 409 and "offline" in error_text(resp).lower()
+            if not (transient and attempt < len(_RETRY_DELAYS_S)):
+                raise click.ClickException(
+                    f"Failed to launch a runner on host {host_id!r} "
+                    f"({resp.status_code}): {error_text(resp)}"
+                )
     runner_id = resp.json().get("runner_id")
     if not isinstance(runner_id, str) or not runner_id:
         raise click.ClickException("Host launch response did not include a runner_id.")
+    set_session_host(session_id, host_id)
     return runner_id
 
 

@@ -1,4 +1,4 @@
-// ⌘⌥[ toggles the left sidebar, ⌘⌥] the right (Ctrl+Alt on Win/Linux); matches
+// In a browser ⌘⌥[ toggles the left sidebar, ⌘⌥] the right (Ctrl+Alt on Win/Linux); matches
 // the physical bracket keys (not the glyph ⌥ produces), is platform-aware (only
 // ⌘ fires on macOS, only Ctrl on Win/Linux), ignores the bare keys / missing-Alt
 // / Shift variants / auto-repeat / AltGraph, fully claims the event, and unbinds
@@ -191,5 +191,72 @@ describe("useSidebarToggleHotkeys", () => {
     unmount();
     press({ ctrlKey: true, altKey: true }, "BracketLeft");
     expect(onToggleLeft).not.toHaveBeenCalled();
+  });
+});
+
+describe("useSidebarToggleHotkeys in the desktop app", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    document.body.replaceChildren();
+  });
+
+  function setupNative(isMac = false) {
+    vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+    return setup(isMac);
+  }
+
+  function pressB(init: KeyboardEventInit, target: Element = document.body): void {
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "b", code: "KeyB", bubbles: true, ...init }),
+    );
+  }
+
+  it.each([
+    { platform: "macOS", isMac: true, modifier: { metaKey: true } },
+    { platform: "Win/Linux", isMac: false, modifier: { ctrlKey: true } },
+  ])(
+    "toggles the left sidebar with Cmd/Ctrl+B and the right with Shift added on $platform",
+    ({ isMac, modifier }) => {
+      const { onToggleLeft, onToggleRight } = setupNative(isMac);
+      pressB(modifier);
+      pressB({ ...modifier, shiftKey: true, key: "B" });
+      expect(onToggleLeft).toHaveBeenCalledTimes(1);
+      expect(onToggleRight).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("drops the browser's Cmd/Ctrl+Alt chords", () => {
+    const { onToggleLeft, onToggleRight } = setupNative(false);
+    press({ ctrlKey: true, altKey: true }, "BracketLeft");
+    press({ ctrlKey: true, altKey: true }, "BracketRight");
+    expect(onToggleLeft).not.toHaveBeenCalled();
+    expect(onToggleRight).not.toHaveBeenCalled();
+  });
+
+  it("leaves Cmd+B to a rich-text editor, where it means Bold", () => {
+    const { onToggleLeft, onToggleRight } = setupNative(true);
+    const editor = document.createElement("div");
+    editor.setAttribute("contenteditable", "true");
+    editor.tabIndex = 0;
+    document.body.append(editor);
+    editor.focus();
+    pressB({ metaKey: true }, editor);
+    expect(onToggleLeft).not.toHaveBeenCalled();
+    pressB({ metaKey: true, shiftKey: true, key: "B" }, editor);
+    expect(onToggleRight).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves Ctrl+B to a terminal off macOS, where tmux uses it", () => {
+    const { onToggleLeft, onToggleRight } = setupNative(false);
+    const terminal = document.createElement("div");
+    terminal.className = "xterm";
+    const input = document.createElement("textarea");
+    terminal.append(input);
+    document.body.append(terminal);
+    input.focus();
+    pressB({ ctrlKey: true }, input);
+    expect(onToggleLeft).not.toHaveBeenCalled();
+    pressB({ ctrlKey: true, shiftKey: true, key: "B" }, input);
+    expect(onToggleRight).toHaveBeenCalledTimes(1);
   });
 });

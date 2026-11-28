@@ -31,7 +31,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import WrongReplicaError
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -45,6 +45,7 @@ from omnigent.harness_plugins import (
     PI_NATIVE_CODING_AGENT,
     harness_capabilities,
 )
+from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
@@ -56,7 +57,10 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
+)
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -129,6 +133,11 @@ _SUBAGENT_STATUS_TYPE: str = "subagent.status"
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
     {"idle", "running", "waiting", "failed"}
 )
+
+
+# Work that outlives the ended turn (a background shell, a Codex goal running
+# between turns). Sidebar-only: it publishes no status edge.
+_EXTERNAL_BACKGROUND_WORK_TYPE: str = "external_background_work"
 
 
 _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT: int = 1000
@@ -225,7 +234,7 @@ _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nicknam
 _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 
 
-_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 
 
 # Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
@@ -298,6 +307,9 @@ _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 
 
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
+
+
+_LAST_TASK_ERROR_AT_LABEL_KEY: str = "omnigent.last_task_error_at"
 
 
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
@@ -433,6 +445,16 @@ _HOST_RECONNECT_GRACE_S = 30.0
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 
 
+# A host that confirmed the spawn has a runner process that may still be
+# booting (slow imports on a busy machine), so it earns a longer connect wait.
+_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
+
+
+# A launch stops following runners that messages relaunch after this long, so a
+# host that keeps failing to start one still settles the launch and its rollback.
+_MANAGED_RUNNER_REPLACEMENT_WAIT_S = 15 * 60.0
+
+
 _HOST_RUNNER_STATUS_TIMEOUT_S = 3.0
 
 
@@ -513,7 +535,7 @@ _NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 _PI_EXTENSION_UI_HOOK_TIMEOUT_S = 86400.0
 
 
-_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = 300.0
+_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = PRE_RESOLVED_ELICITATION_TTL_S
 
 
 _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
@@ -589,6 +611,7 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_BTW_SIDECHAT_TYPE,
         _EXTERNAL_ELICITATION_RESOLVED_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_BACKGROUND_WORK_TYPE,
         _SUBAGENT_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
         _EXTERNAL_PULL_REQUESTS_TYPE,
@@ -663,6 +686,19 @@ _session_background_task_count_cache: WorkspaceScopedCache[str, int] = Workspace
 _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
     WorkspaceScopedCache()
 )
+
+
+# Background agents a finished claude-native turn left running, as of this
+# replica's last ``waiting`` edge. Any other status edge drops the entry.
+_session_background_agents_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
+    WorkspaceScopedCache()
+)
+
+
+# Why a running session's agent is parked on a terminal prompt, as of the last
+# status edge this replica published; ``""`` when that edge was not parked.
+# Absent when this replica has no edge, in which case the list reads the row.
+_session_blocked_on_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
@@ -1063,10 +1099,7 @@ def host_interactive_shells_for_request(
         and runner_router is not None
         and runner_router.host_is_on_another_replica(host_id)
     ):
-        raise OmnigentError(
-            "host shell inventory is on another replica",
-            code=ErrorCode.WRONG_REPLICA,
-        )
+        raise WrongReplicaError("host shell inventory is on another replica", host_id=host_id)
     return normalize_interactive_shells(host_registry.interactive_shells(host_id))
 
 
@@ -1094,6 +1127,7 @@ __all__ = [
     "CLIENT_SESSION_EVENT_TYPES",
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
+    "_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_ANTIGRAVITY_NATIVE_HARNESS",
@@ -1157,6 +1191,7 @@ __all__ = [
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
+    "_EXTERNAL_BACKGROUND_WORK_TYPE",
     "_EXTERNAL_BTW_DISMISS_TYPE",
     "_EXTERNAL_BTW_SIDECHAT_TYPE",
     "_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE",
@@ -1210,6 +1245,7 @@ __all__ = [
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
+    "_MANAGED_RUNNER_REPLACEMENT_WAIT_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
     "_MCP_ELICITATION_TYPE",
@@ -1281,8 +1317,10 @@ __all__ = [
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
+    "_session_background_agents_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
+    "_session_blocked_on_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

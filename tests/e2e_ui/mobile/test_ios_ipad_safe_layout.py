@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from playwright.sync_api import Page, expect
 
-_IPAD_VIEWPORT = {"width": 1024, "height": 768}
+_IPAD_VIEWPORT = {"width": 1366, "height": 1024}
 _IPAD_SAFE_AREA = {"top": 24, "left": 0, "bottom": 20, "right": 0}
 _KEYBOARD_TOP = 500
 

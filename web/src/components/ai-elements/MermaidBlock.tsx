@@ -1,5 +1,7 @@
 import { Button } from "@/components/ui/button";
+import { useMarkFullscreenOverlayOpen } from "@/hooks/useMarkFullscreenOverlayOpen";
 import { getEmbedRoot } from "@/lib/host";
+import { cn } from "@/lib/utils";
 import type { ComponentProps, ReactNode, RefObject } from "react";
 import { cloneElement, isValidElement, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -31,6 +33,7 @@ export function isMermaidPre(children: ReactNode): boolean {
 function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
   const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
   const close = useCallback(() => setSvgMarkup(null), []);
+  useMarkFullscreenOverlayOpen(svgMarkup != null);
 
   const openFullscreen = useCallback(() => {
     // The rendered diagram is Mermaid's own <svg id="mermaid-…"> — scope to it so
@@ -57,11 +60,14 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
             onClick={(e) => {
               if (e.target === e.currentTarget) close();
             }}
+            // Page-wide shortcuts (a pending question's keys) leave Escape to this view.
+            data-fullscreen-overlay=""
             role="presentation"
           >
             <Button
               aria-label="Exit fullscreen"
-              className="absolute top-4 right-4"
+              className="absolute right-4"
+              style={{ top: "calc(var(--fullscreen-overlay-inset-top, 0px) + 1rem)" }}
               onClick={close}
               size="icon-sm"
               title="Exit fullscreen"
@@ -102,11 +108,43 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
   );
 }
 
+// Mermaid's own <svg id="mermaid-…">, or the card that explains why it couldn't draw.
+const DRAWN_DIAGRAM = 'svg[id^="mermaid-"], [data-testid="mermaid-error"]';
+
+/** Calls `onDrawn` once `ref` holds a drawn diagram or its error card. */
+export function useMermaidDrawn(
+  ref: RefObject<HTMLElement | null>,
+  onDrawn: (() => void) | undefined,
+) {
+  useEffect(() => {
+    const root = ref.current;
+    if (!root || !onDrawn) return;
+    if (root.querySelector(DRAWN_DIAGRAM)) {
+      onDrawn();
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      if (root.querySelector(DRAWN_DIAGRAM)) onDrawn();
+    });
+    observer.observe(root, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [ref, onDrawn]);
+}
+
 // The .chat-mermaid rule reserves a slot beside Streamdown's download/copy toolbar.
-export function MermaidBlock({ block }: { block: ReactNode }) {
+export function MermaidBlock({
+  block,
+  className,
+  onDrawn,
+}: {
+  block: ReactNode;
+  className?: string;
+  onDrawn?: () => void;
+}) {
   const blockRef = useRef<HTMLDivElement>(null);
+  useMermaidDrawn(blockRef, onDrawn);
   return (
-    <div ref={blockRef} className="chat-mermaid relative">
+    <div ref={blockRef} className={cn("chat-mermaid relative", className)}>
       {block}
       <div className="absolute top-2 right-2 z-20 flex items-center rounded-md border border-sidebar bg-sidebar/80 px-1.5 py-1 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur">
         <MermaidFullscreen blockRef={blockRef} />

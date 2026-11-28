@@ -95,6 +95,48 @@ describe("useResizableInlinePanel persistence", () => {
   });
 });
 
+describe("useResizableInlinePanel width in a wider window", () => {
+  it("gives the default width the panel takes once the window grows by it", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    // 900px wide: 506px more makes 1406px, whose default is 0.36 * 1406 = 506.
+    setInnerWidth(900);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(result.current.widthInWiderWindow()).toBe(506);
+    // The default stays in its [420, 600] band.
+    setInnerWidth(2000);
+    expect(result.current.widthInWiderWindow()).toBe(600);
+    setInnerWidth(600);
+    expect(result.current.widthInWiderWindow()).toBe(420);
+  });
+
+  it("renders the reported width on every open of a window that grows and shrinks back", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const resizeTo = (px: number) => {
+      setInnerWidth(px);
+      act(() => window.dispatchEvent(new Event("resize")));
+    };
+    resizeTo(960);
+    for (let open = 0; open < 2; open += 1) {
+      const reported = result.current.widthInWiderWindow();
+      expect(reported).toBe(540);
+      resizeTo(960 + reported);
+      expect(result.current.panelWidth).toBe(reported);
+      resizeTo(960);
+      expect(result.current.panelWidth).toBe(420);
+    }
+  });
+
+  it("gives the user's width, even while a narrow window squeezes the panel", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    expect(nudgeWiderOnce(result)).toBe(620);
+
+    setInnerWidth(1000);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(result.current.panelWidth).toBe(512);
+    expect(result.current.widthInWiderWindow()).toBe(620);
+  });
+});
+
 describe("useResizableInlinePanel reserved width (sidebar)", () => {
   it("fits beside a Canvas conversation without losing the preferred panel width", () => {
     setInnerWidth(1440);

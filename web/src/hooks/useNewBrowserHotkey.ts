@@ -1,23 +1,19 @@
 import { useEffect, useRef } from "react";
+import { GlobeIcon } from "lucide-react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { hotkeyAvailability, useHotkeyCommand } from "@/hooks/useHotkeyCommand";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
-const TEXT_ENTRY_SURFACE = ".monaco-editor, .xterm";
+// Terminals and code editors bind their own chords, so they keep this one.
+const TEXT_ENTRY_SURFACE = ".xterm, .monaco-editor, .cm-editor";
 
 /** True for Cmd+Alt+B on Apple platforms or Ctrl+Alt+B elsewhere. */
 export function isNewBrowserHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): boolean {
-  if (
-    !hasCommandModifier(event, isMac) ||
-    !event.altKey ||
-    event.shiftKey ||
-    event.getModifierState("AltGraph")
-  ) {
-    return false;
-  }
-  return event.code === "KeyB";
+  return matchesShortcut(event, "browser.new", { mac: isMac });
 }
 
 /** Bind the new-browser-tab shortcut while the workspace supports Browser. */
@@ -28,6 +24,14 @@ export function useNewBrowserHotkey(
 ): void {
   const latest = useRef(onOpen);
   latest.current = onOpen;
+  useHotkeyCommand("browser.new", {
+    icon: GlobeIcon,
+    keywords: ["browser", "web", "tab", "url", "preview"],
+    run: () => latest.current(),
+    availability: hotkeyAvailability(enabled),
+    // The new browser tab takes focus once the palette has closed.
+    movesFocus: true,
+  });
 
   useEffect(() => {
     if (!enabled) return;

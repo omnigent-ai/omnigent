@@ -6,12 +6,15 @@ import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { SessionState } from "@/hooks/useSessionState";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
-import { CircleAlertIcon } from "lucide-react";
+import { CircleAlertIcon, SquareTerminalIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
+  /** In the sidebar, the tag takes the row highlight's color instead of clashing with it. */
+  inSidebar?: boolean;
 }
 
 interface Visual {
@@ -21,29 +24,63 @@ interface Visual {
   render: () => ReactElement;
 }
 
-function describe(state: SessionState): Visual {
+function awaitingTooltip(count: number, terminalReason: string | undefined): string {
+  if (terminalReason === TERMINAL_PROMPT_BLOCKED_ON) {
+    return "May need your input in the agent's terminal";
+  }
+  if (terminalReason) return `Waiting for you in the agent's terminal (${terminalReason})`;
+  return count === 1 ? "1 approval prompt waiting" : `${count} approval prompts waiting`;
+}
+
+function describe(state: SessionState, inSidebar: boolean): Visual {
   switch (state.kind) {
     case "awaiting": {
-      const tooltip =
-        state.count === 1 ? "1 approval prompt waiting" : `${state.count} approval prompts waiting`;
+      const tooltip = awaitingTooltip(state.count, state.terminalReason);
+      // The runner infers this reason from the terminal's screen, so stay tentative.
+      const label =
+        state.terminalReason === TERMINAL_PROMPT_BLOCKED_ON ? "May need input" : "Needs response";
       return {
         kind: state.kind,
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">
-            Needs response
+          <Badge
+            className={cn(
+              "border-transparent",
+              inSidebar
+                ? "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]"
+                : "bg-warning/15 text-warning",
+            )}
+          >
+            {label}
           </Badge>
         ),
       };
     }
-    case "running":
+    case "running": {
+      if (state.background) {
+        // Static terminal glyph (as on the composer's background-task pill): a
+        // dev server left running between turns must not read as a busy turn.
+        return {
+          kind: state.kind,
+          ariaLabel: "Working in the background",
+          tooltip: "Working in the background",
+          render: () => (
+            <SquareTerminalIcon
+              aria-hidden
+              strokeWidth={1.5}
+              className="size-3.5 shrink-0 text-muted-foreground"
+            />
+          ),
+        };
+      }
       return {
         kind: state.kind,
         ariaLabel: "Session running",
         tooltip: "Session running",
         render: () => <RunningDot className="size-3" />,
       };
+    }
     case "starting":
       // Same spinner as running — the session is coming up, not yet working.
       return {
@@ -89,8 +126,8 @@ function Dot({ tone }: { tone: string }) {
   return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
 }
 
-export function SessionStateBadge({ state }: SessionStateBadgeProps) {
-  const visual = describe(state);
+export function SessionStateBadge({ state, inSidebar = false }: SessionStateBadgeProps) {
+  const visual = describe(state, inSidebar);
   return (
     <Tooltip>
       <TooltipTrigger asChild>

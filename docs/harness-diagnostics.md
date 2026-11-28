@@ -16,6 +16,7 @@ Codex exit-screen telemetry.
 | --- | --- | --- |
 | Codex native | App-server stderr pipe; bounded terminal output on startup exit | Stderr continuously throughout the app-server lifetime; terminal evidence before startup cleanup |
 | Claude native | An Omnigent-owned Claude `--debug-file` | Continuously while the transcript forwarder runs, plus a bounded final drain on shutdown or launch failure |
+| OpenCode native | `opencode serve` stderr, with `--print-logs` added | Continuously throughout the server lifetime; the last lines are quoted in startup errors |
 
 The flag is shared across harnesses and lifecycle phases. Codex captures the
 app-server's stderr, including startup and runtime diagnostics. A separate
@@ -147,6 +148,17 @@ the launched `command`, the probed `codex_cli_version`, whether the launch is a
 are merged. Values are redacted before logging: `NAME=value` environment
 assignments and every `-c` override outside the permission and model keys are
 masked, and URLs lose their userinfo and query string.
+
+With a configured `harness.codex-native.command`, a resume probes
+`<command> <args> --version` instead of the app-server's binary. The wrapper
+can pass `--version` through to Codex so it prints `codex-cli X.Y.Z`. When the
+version cannot be identified, the runner retains the previous app-server-based
+decision. An unprobeable wrapper can still differ from that binary; this legacy
+ambiguity remains unresolved.
+
+A configured command keeps its arguments opaque. An alternate executable combined
+with permission arguments retains prior behavior and can still be rejected on a
+modern remote resume; only argument-only configuration is filtered automatically.
 
 The TUI's private tmux server keeps its pane after the process exits
 (`keep_alive_after_exit`), so once the terminal has started, its exit is
@@ -487,6 +499,19 @@ quota. The next enabled launch in the same bridge directory removes the prior
 owned file and its rotated predecessor. Other user debug files are never read
 or deleted.
 
+## OpenCode continuous diagnostics
+
+`opencode serve` writes its logs to its own file,
+`<bridge_dir>/xdg-data/opencode/log/opencode.log`, and leaves stderr empty.
+Enabled capture adds `--print-logs` to the server's arguments so those log lines
+reach stderr; a user-supplied `--print-logs` is kept as is. Omnigent drains the
+pipe and exports the redacted lines through the same batched INFO path as Codex,
+as `harness_diagnostic_output` events with `harness=opencode-native` and
+`source_kind=opencode_serve_stderr`. If the server exits or never becomes ready,
+the startup error quotes a redacted excerpt of its last lines.
+
+When disabled, the server's stderr goes to `/dev/null` and Omnigent reads
+nothing. OpenCode's own log file is written either way; Omnigent never reads it.
 ## Codex bridge availability
 
 When an input cannot be delivered because bridge state is unavailable, the
@@ -534,6 +559,7 @@ uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e_ui/chat/test_codex_early_tui_startup_error.py
 uv run --no-sync pytest -q tests/harnesses/claude_native/test_claude_native_diagnostics.py tests/harnesses/claude_native/test_claude_native_diagnostics_integration.py
+uv run --no-sync pytest -q tests/test_opencode_native_app_server.py -k stderr
 ```
 
 These tests inject a startup timeout and an ended event stream, inspect the

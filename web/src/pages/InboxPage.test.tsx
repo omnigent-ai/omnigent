@@ -15,14 +15,29 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // tests also use the real ApprovalCard; other prompts use an Accept-button stub.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as approvalCard from "@/components/blocks/ApprovalCard";
+import type * as InboxPaletteCommandsModule from "./inboxPaletteCommands";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import {
+  chooseSettingValue,
+  expectSetting,
+  registeredPaletteCommands,
+} from "@/test/paletteCommands";
 import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
+import * as automationInboxHook from "@/hooks/useAutomationInbox";
+import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
+import type { Suggestion } from "@/lib/proactiveInbox";
+import * as proactiveInboxApi from "@/lib/proactiveInbox";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
+import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
 import * as sessionsApi from "@/lib/sessionsApi";
 import {
   type AskUserQuestionDraft,
@@ -39,6 +54,7 @@ import {
   resetReadStateForTests,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
+import { getSeenCommentIds } from "@/hooks/useSeenComments";
 
 // Keep real controls for native delivery and directory grants.
 vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
@@ -77,7 +93,45 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
 }));
+vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
+// Counts renders of the Inbox's ⌘K commands, which render nothing themselves.
+const inboxPaletteCommands = vi.hoisted(() => ({ renders: 0 }));
+vi.mock("./inboxPaletteCommands", async (importOriginal) => {
+  const original = await importOriginal<typeof InboxPaletteCommandsModule>();
+  return {
+    ...original,
+    InboxPaletteCommands: (props: Parameters<typeof original.InboxPaletteCommands>[0]) => {
+      inboxPaletteCommands.renders += 1;
+      return original.InboxPaletteCommands(props);
+    },
+  };
+});
+vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
+// The settings query: `settings` undefined with `available` means still loading
+// or failed, which the page must not read as "no suggestions".
+const advisor = vi.hoisted(() => ({
+  available: true,
+  settings: { enabled: true, agent_id: "agent_advisor" } as
+    { enabled: boolean; agent_id?: string } | undefined,
+  failed: false,
+  refetch: (() => {}) as () => void,
+}));
+vi.mock("@/hooks/useProactiveAgentSettings", () => ({
+  useProactiveAgentSettings: () => ({
+    available: advisor.available,
+    settings: advisor.available ? advisor.settings : undefined,
+    query: {
+      isPending: advisor.available && advisor.settings === undefined && !advisor.failed,
+      isError: advisor.available && advisor.failed,
+      refetch: advisor.refetch,
+    },
+  }),
+}));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
+vi.mock("@/lib/proactiveInbox", async (importActual) => ({
+  ...(await importActual<typeof proactiveInboxApi>()),
+  listSuggestions: vi.fn(),
+}));
 // Real exports (ApiError, codes) so failure handling sees genuine error types.
 vi.mock("@/lib/sessionsApi", async (importActual) => ({
   ...(await importActual<typeof sessionsApi>()),
@@ -144,20 +198,79 @@ function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
 
 function renderPage(
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  taskDetailsEnabled = false,
+  features: Record<string, boolean> = {},
 ) {
-  // Fresh client per render so cached queries never leak between tests.
-  return render(
+  // Fresh client per render so cached queries never leak between tests. A
+  // fresh element per render too: React skips an identical element object.
+  const tree = () => (
     <QueryClientProvider client={queryClient}>
-      <SidebarDataProvider>
-        <MemoryRouter>
-          <InboxPage />
-        </MemoryRouter>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          features: { automations_v2: taskDetailsEnabled, ...features },
+        }}
+      >
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+            <LocationProbe />
+          </MemoryRouter>
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
+    </QueryClientProvider>
   );
+  const result = render(tree());
+  return { ...result, rerenderPage: () => result.rerender(tree()) };
+}
+
+let lastLocation = { pathname: "", search: "" };
+
+/** Records where the page navigated, e.g. to the new-session composer. */
+function LocationProbe() {
+  const location = useLocation();
+  lastLocation = { pathname: location.pathname, search: location.search };
+  return null;
+}
+
+function automationInboxStub(overrides: Record<string, unknown> = {}) {
+  return {
+    items: [],
+    isLoading: false,
+    isError: false,
+    hasNextPage: false,
+    markRead: vi.fn(),
+    refetch: vi.fn(),
+    fetchNextPage: vi.fn(),
+    ...overrides,
+  } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
+}
+
+function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
+  return {
+    enabled: true,
+    items: [],
+    unreadCount: 0,
+    unreadCountCapped: false,
+    isLoading: false,
+    isError: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+    refetch: vi.fn(),
+    update: vi.fn().mockResolvedValue(true),
+    ...overrides,
+  } as unknown as ReturnType<typeof proactiveInboxHook.useProactiveInbox>;
 }
 
 beforeEach(() => {
+  advisor.available = true;
+  advisor.settings = { enabled: true, agent_id: "agent_advisor" };
+  advisor.failed = false;
+  advisor.refetch = vi.fn();
+  window.localStorage.removeItem("omnigent:inbox-filter");
+  vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(automationInboxStub());
+  vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub());
   vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
   vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(commentInboxStub());
   vi.mocked(sessionsApi.getSession).mockResolvedValue({
@@ -174,6 +287,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   resetReadStateForTests();
+  resetLocalElicitationResolutionsForTests();
   localStorage.clear();
   clearAskUserQuestionDraft("eli_1");
   clearAskUserQuestionDraft("eli_question");
@@ -369,6 +483,25 @@ describe("InboxPage approval items", () => {
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
     expect(getAskUserQuestionDraft("eli_1", draftSignature)).toBeUndefined();
+  });
+
+  it("keeps an answered approval of an unseen idle session out of the unread list", async () => {
+    // WHY: answering lowers the sidebar's count at once, but the card stays listed
+    // until the server drops the prompt, so the session must not also read as unread.
+    const row = unreadConversation({ pending_elicitations_count: 1 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(sessionsApi.approve).mockReturnValue(new Promise(() => {}));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
+    );
+    expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument();
   });
 
   it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
@@ -1068,10 +1201,10 @@ describe("InboxPage replies", () => {
     await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
   });
 
-  it("never sends on Enter with a touch pointer", async () => {
+  it("never sends on Enter in the mobile layout", async () => {
     const realMatchMedia = window.matchMedia;
     window.matchMedia = ((query: string) => ({
-      matches: query === "(pointer: coarse)",
+      matches: query.includes("max-width"),
       media: query,
       onchange: null,
       addListener: () => {},
@@ -1168,6 +1301,50 @@ describe("InboxPage replies", () => {
     expect(box).toHaveValue("Ship it");
     expect(send).toBeDisabled();
     expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a sending reply's row and draft to Mark all as read, so a refusal can hand it back", async () => {
+    // WHY: the bulk action must not drop text whose POST may still fail.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
+      commentInboxStub({
+        items: [
+          {
+            row: conversation({ id: "sess_1", pending_elicitations_count: 0 }),
+            comment: {
+              id: "cm_1",
+              path: "src/app.ts",
+              body: "Please reconsider this line.",
+              created_by: "alice",
+              created_at: 1_700_000_000,
+              updated_at: 1_700_000_000_000,
+              status: "draft",
+            } as CommentInbox["items"][number]["comment"],
+          },
+        ],
+      }),
+    );
+    let refuse: (error: Error) => void = () => {};
+    vi.mocked(sessionsApi.postEvent).mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        refuse = reject;
+      }),
+    );
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = await typeAndSend(item, "Ship it");
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    expect(getSeenCommentIds().has("cm_1")).toBe(true);
+    expect(screen.getByTestId("inbox-unread")).toBe(item);
+    expect(box).toHaveValue("Ship it");
+    await act(async () => refuse(new Error("Policy denied the message.")));
+    expect(await within(item).findByRole("alert")).toHaveTextContent("Policy denied the message.");
+    expect(within(item).getByRole("textbox", { name: /Reply to/ })).toHaveValue("Ship it");
+    expect(isConversationUnseen(row.id, row.updated_at, row.status)).toBe(true);
   });
 
   it("keeps the draft and the row when the reply is refused", async () => {
@@ -1561,4 +1738,736 @@ it("recovers a native request after an empty snapshot without reloading", async 
     queryClient.clear();
     vi.useRealTimers();
   }
+});
+
+describe("automation failures", () => {
+  it.each([false, true])(
+    "renders and dismisses failures with task details enabled=%s",
+    (taskDetailsEnabled) => {
+      const markRead = vi.fn();
+      vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+        automationInboxStub({
+          markRead,
+          items: [
+            {
+              taskId: "task",
+              taskName: "Daily report",
+              runId: "run",
+              scheduledAt: 1_700_000_000,
+              finishedAt: 1_700_000_010,
+              errorCode: "host_offline",
+            },
+          ],
+        }),
+      );
+      renderPage(undefined, taskDetailsEnabled);
+      fireEvent.click(screen.getByRole("button", { name: "Automation failed: Daily report" }));
+      expect(screen.getByText("Host · The host was offline.")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /Open automation/ })).toHaveAttribute(
+        "href",
+        taskDetailsEnabled ? "/tasks/task" : "/tasks",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Mark as read" }));
+      expect(markRead).toHaveBeenCalledWith("run");
+      selectTab("Awaiting response");
+      expect(screen.queryByTestId("inbox-automation-item")).toBeNull();
+      selectTab("Unread");
+      expect(screen.getByTestId("inbox-automation-item")).toBeInTheDocument();
+    },
+  );
+
+  it.each(["loading", "error", "continuation"])("renders an independent %s feed state", (state) => {
+    const fetchNextPage = vi.fn();
+    const refetch = vi.fn();
+    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+      automationInboxStub({
+        hasNextPage: state === "continuation",
+        fetchNextPage,
+        isLoading: state === "loading",
+        isError: state === "error",
+        refetch,
+      }),
+    );
+    renderPage();
+    if (state === "loading") {
+      expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).toBeNull();
+    } else if (state === "error") {
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load automation failures.");
+      fireEvent.click(screen.getByRole("button", { name: "Retry automations" }));
+      expect(refetch).toHaveBeenCalledOnce();
+    } else {
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByText("Nothing waiting in the loaded items")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Check more automations" }));
+      expect(fetchNextPage).toHaveBeenCalledOnce();
+    }
+    if (state !== "continuation") expect(screen.queryByText(/Nothing waiting/)).toBeNull();
+  });
+});
+
+describe("agent suggestions", () => {
+  function suggestion(overrides: Partial<Suggestion> = {}): Suggestion {
+    return {
+      id: "sug_1",
+      kind: "followup",
+      title: "Ramp up the flag",
+      bodyMd: "The PR merged yesterday.",
+      links: [
+        { type: "pr", ref: "https://github.com/acme/app/pull/7", label: "PR 7" },
+        { type: "session", ref: "sess_src" },
+      ],
+      actions: [
+        { label: "Ramp to 50%", prompt: "Ramp the flag to 50%" },
+        { label: "Check metrics", prompt: "Check the flag's metrics" },
+      ],
+      media: [],
+      sourceSessionId: "sess_src",
+      agentId: "agent_advisor",
+      status: "unread",
+      resolution: "none",
+      createdAt: 1_700_000_000,
+      ...overrides,
+    };
+  }
+
+  function stub(overrides: Record<string, unknown>) {
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub(overrides));
+  }
+
+  it("summarizes listed suggestions, so one read suggestion is counted like it is shown", () => {
+    stub({ items: [suggestion({ status: "read" })], unreadCount: 0 });
+    renderPage();
+    expect(screen.getByText(/1 suggestion\b/)).toBeInTheDocument();
+    expect(screen.queryByText(/unread/)).toBeNull();
+    cleanup();
+
+    stub({ items: [suggestion(), suggestion({ id: "sug_2" })], unreadCount: 2 });
+    renderPage();
+    expect(screen.getByText(/2 suggestions \(2 unread\)/)).toBeInTheDocument();
+  });
+
+  it("marks a suggestion read on expand and shows its evidence", () => {
+    const update = vi.fn().mockResolvedValue(true);
+    stub({ items: [suggestion()], unreadCount: 1, update });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+
+    expect(update).toHaveBeenCalledWith("sug_1", { status: "read" });
+    expect(screen.getByRole("link", { name: "PR 7" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/7",
+    );
+    expect(screen.getByRole("link", { name: "Open session" })).toHaveAttribute(
+      "href",
+      "/c/sess_src",
+    );
+  });
+
+  it("lists a suggestion's links under Source", () => {
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+
+    const source = screen.getByRole("region", { name: "Source" });
+    expect(within(source).getByRole("link", { name: "PR 7" })).toBeInTheDocument();
+  });
+
+  it("filters to Omni Advisor suggestions only", () => {
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+
+    selectTab("Omni Advisor");
+
+    expect(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    ).toBeInTheDocument();
+    expect(vi.mocked(proactiveInboxHook.useProactiveInbox).mock.lastCall?.[1]).toEqual([
+      "unread",
+      "read",
+    ]);
+    stub({ items: [] });
+    selectTab("All");
+    selectTab("Omni Advisor");
+    expect(screen.getByText("No suggestions from Omni Advisor")).toBeInTheDocument();
+  });
+
+  it("names the session behind another agent's item and keeps it off the Omni Advisor tab", () => {
+    advisor.settings = { enabled: true, agent_id: "agent_advisor" };
+    const other = suggestion({
+      id: "sug_2",
+      title: "Check the deploy",
+      agentId: "agent_other",
+      sourceSessionId: "sess_other",
+      createdAt: 1_700_000_100,
+    });
+    stub({ items: [other, suggestion()], unreadCount: 2 });
+    renderPage();
+
+    expect(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Check the deploy" }));
+    const origin = screen.getByTestId("inbox-suggestion-origin");
+    expect(within(origin).getByRole("link", { name: "its session" })).toHaveAttribute(
+      "href",
+      "/c/sess_other",
+    );
+
+    selectTab("Omni Advisor");
+    expect(screen.queryByRole("button", { name: /Check the deploy/ })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows other agents' items where the deployment does not offer Omni Advisor", () => {
+    advisor.available = false;
+    stub({ items: [suggestion({ agentId: "agent_other" })], unreadCount: 1 });
+    renderPage();
+
+    expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+    expect(screen.getByTestId("inbox-suggestion-origin")).toHaveTextContent("Posted from");
+  });
+
+  it("has no Omni Advisor tab while it is off for the viewer", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.settings = { enabled: false };
+    renderPage();
+
+    expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("drops an expanded suggestion once Omni Advisor is turned off", () => {
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    expect(screen.getByRole("region", { name: "Source" })).toBeInTheDocument();
+
+    // Another client turned the agent off; the next settings refresh disables the hook.
+    advisor.settings = { enabled: false };
+    stub({ items: [], enabled: false });
+    selectTab("Unread");
+    selectTab("All");
+
+    expect(screen.queryByText("Ramp up the flag")).toBeNull();
+  });
+
+  it("keeps an expanded suggestion on the Unread tab after it is marked read", () => {
+    const item = suggestion();
+    const update = vi.fn().mockResolvedValue(true);
+    stub({ items: [item], unreadCount: 1, update });
+    renderPage();
+    selectTab("Unread");
+    expect(vi.mocked(proactiveInboxHook.useProactiveInbox).mock.lastCall?.[1]).toEqual(["unread"]);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    // The hook drops the read item from the unread-only list.
+    stub({ items: [], unreadCount: 0, update });
+    selectTab("All");
+    selectTab("Unread");
+
+    expect(screen.getByText("The PR merged yesterday.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ramp to 50%" })).toBeInTheDocument();
+
+    // Collapsing lets it go while the unread-only list is still reloading.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+  });
+
+  it("shows a suggestion load failure instead of an empty Inbox", () => {
+    const refetch = vi.fn();
+    stub({ isError: true, refetch });
+    renderPage();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load suggestions.");
+    expect(screen.queryByText("Nothing waiting on you")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry suggestions" }));
+    expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  it("does not show the Omni Advisor tab while the settings are unknown, unless it was selected", () => {
+    advisor.settings = undefined;
+    stub({ items: [], enabled: true });
+    renderPage();
+    expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
+    // Other agents' items do not wait on Omni Advisor's settings.
+    expect(screen.queryByText("Loading inbox…")).toBeNull();
+  });
+
+  it("keeps loading while the Omni Advisor settings are unknown", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.settings = undefined;
+    stub({ items: [], enabled: false });
+    renderPage();
+
+    expect(screen.getByRole("tab", { name: "Omni Advisor" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+    expect(screen.queryByText("No suggestions from Omni Advisor")).toBeNull();
+  });
+
+  it("shows a settings load failure instead of an empty Omni Advisor tab", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.settings = undefined;
+    advisor.failed = true;
+    stub({ items: [], enabled: false });
+    renderPage();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load Omni Advisor settings");
+    expect(screen.queryByText("No suggestions from Omni Advisor")).toBeNull();
+    expect(screen.queryByText("Loading inbox…")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry settings" }));
+    expect(advisor.refetch).toHaveBeenCalledOnce();
+  });
+
+  it("keeps showing suggestions when a settings refetch fails but the settings are cached", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.failed = true;
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+
+    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry settings" })).toBeNull();
+  });
+
+  it("takes an agent action and opens the composer with its prompt", () => {
+    const update = vi.fn().mockResolvedValue(true);
+    stub({ items: [suggestion({ status: "read" })], update });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Check metrics" }));
+
+    expect(update).toHaveBeenCalledWith("sug_1", {
+      resolution: "action_taken",
+      resolutionAction: 1,
+    });
+    const token = new URLSearchParams(lastLocation.search).get(NEW_SESSION_HANDOFF_PARAM);
+    expect(lastLocation.pathname).toBe("/");
+    expect(peekNewSessionHandoff(token)).toEqual({ text: "Check the flag's metrics", files: [] });
+  });
+
+  it("keeps an expanded suggestion pinned on Unread until the server accepts its dismissal", async () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "unread");
+    const update = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    stub({ items: [suggestion()], unreadCount: 1, update });
+    const page = renderPage();
+    // Expanding marks it read; the Unread list no longer lists it, so the pin shows it.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    stub({ items: [], unreadCount: 0, update });
+    page.rerenderPage();
+    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
+
+    // The dismissal fails: the card stays, so the viewer can retry.
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Not now" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith("sug_1", { resolution: "not_now" }));
+    await act(async () => {});
+    page.rerenderPage();
+    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
+
+    // The retry is accepted: the pin goes with it.
+    update.mockResolvedValueOnce(true);
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Not now" }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-suggestion")).toBeNull());
+  });
+
+  it("hides a dismissed suggestion at once outside Unread, where no pin holds it", async () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "all");
+    const update = vi.fn().mockReturnValue(new Promise<boolean>(() => {}));
+    stub({ items: [suggestion()], unreadCount: 1, update });
+    const page = renderPage();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Not now" }));
+
+    // The hook drops the card from its list while the PATCH is in flight.
+    stub({ items: [], unreadCount: 0, update });
+    page.rerenderPage();
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+  });
+
+  it("dismisses with a reason from the menu", async () => {
+    const update = vi.fn().mockResolvedValue(true);
+    stub({ items: [suggestion({ status: "read" })], update });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Useful, no action needed" }));
+
+    expect(update).toHaveBeenCalledWith("sug_1", { resolution: "useful" });
+  });
+
+  it("offers the next page of suggestions", () => {
+    const fetchNextPage = vi.fn();
+    stub({ items: [suggestion({ status: "read" })], hasNextPage: true, fetchNextPage });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more suggestions" }));
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps suggestions off the Awaiting response tab", () => {
+    stub({ items: [suggestion()] });
+    renderPage();
+
+    selectTab("Awaiting response");
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+  });
+});
+
+describe("InboxPage mark all as read", () => {
+  function suggestionItem(overrides: Partial<Suggestion>): Suggestion {
+    return {
+      id: "sug_unread",
+      kind: "followup",
+      title: "Ramp up the flag",
+      bodyMd: "",
+      links: [],
+      actions: [],
+      media: [],
+      sourceSessionId: "sess_src",
+      agentId: "agent_advisor",
+      status: "unread",
+      resolution: "none",
+      createdAt: 1_700_000_000,
+      ...overrides,
+    };
+  }
+
+  it("clears every unread kind in one click and leaves approvals for an answer", async () => {
+    // WHY: each kind keeps its own read state; one click must reach all of them.
+    const unread = unreadConversation();
+    const approval = conversation({ id: "sess_approval", title: "Approval Session" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unread, approval]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Run the migration?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
+      commentInboxStub({
+        items: [
+          {
+            row: conversation({ id: "sess_1", pending_elicitations_count: 0 }),
+            comment: {
+              id: "cm_1",
+              path: "src/app.ts",
+              body: "Please reconsider this line.",
+              created_by: "alice",
+              created_at: 1_700_000_000,
+              updated_at: 1_700_000_000_000,
+              status: "draft",
+            } as CommentInbox["items"][number]["comment"],
+          },
+        ],
+      }),
+    );
+    const markRead = vi.fn();
+    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+      automationInboxStub({
+        markRead,
+        items: [
+          {
+            taskId: "task",
+            taskName: "Daily report",
+            runId: "run",
+            scheduledAt: 1_700_000_000,
+            finishedAt: 1_700_000_010,
+            errorCode: "host_offline",
+          },
+        ],
+      }),
+    );
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({}), suggestionItem({ id: "sug_read", status: "read" })],
+        unreadCount: 1,
+        update,
+      }),
+    );
+    renderPage();
+    await screen.findByTestId("inbox-unread");
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+    expect(isConversationUnseen(unread.id, unread.updated_at, unread.status)).toBe(false);
+    expect(getSeenCommentIds().has("cm_1")).toBe(true);
+    expect(markRead).toHaveBeenCalledWith("run");
+    expect(update).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledWith("sug_unread", { status: "read" }, expect.anything());
+    expect(await screen.findByTestId("inbox-item")).toBeInTheDocument();
+  });
+
+  it("on the advisor tab marks only that agent's unread suggestions", () => {
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [
+          suggestionItem({ id: "sug_advisor" }),
+          suggestionItem({ id: "sug_other", agentId: "agent_other", title: "Other agent" }),
+        ],
+        unreadCount: 2,
+        update,
+      }),
+    );
+    renderPage();
+    selectTab("Omni Advisor");
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    expect(update).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledWith("sug_advisor", { status: "read" }, expect.anything());
+  });
+
+  it("reaches unread suggestions past the loaded pages", async () => {
+    // WHY: the header's unread total counts suggestions no page has loaded yet.
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({ id: "sug_read", status: "read" })],
+        unreadCount: 2,
+        hasNextPage: true,
+        update,
+      }),
+    );
+    vi.mocked(proactiveInboxApi.listSuggestions)
+      .mockResolvedValueOnce({
+        data: [suggestionItem({ id: "sug_older" })],
+        nextCursor: "cursor_1",
+        unreadCount: 2,
+        unreadCountCapped: false,
+      })
+      .mockResolvedValueOnce({
+        data: [suggestionItem({ id: "sug_oldest" })],
+        nextCursor: null,
+        unreadCount: 2,
+        unreadCountCapped: false,
+      });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(proactiveInboxApi.listSuggestions).toHaveBeenNthCalledWith(1, null, ["unread"]);
+    expect(proactiveInboxApi.listSuggestions).toHaveBeenNthCalledWith(2, "cursor_1", ["unread"]);
+    expect(update).toHaveBeenCalledWith("sug_older", { status: "read" }, expect.anything());
+    expect(update).toHaveBeenCalledWith("sug_oldest", { status: "read" }, expect.anything());
+  });
+
+  it("reports failed suggestions in one toast", async () => {
+    const toasts: unknown[] = [];
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    const update = vi.fn((_id: string, _change: unknown, options?: { onError?: () => void }) => {
+      options?.onError?.();
+      return Promise.resolve(false);
+    });
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: ["sug_a", "sug_b", "sug_c"].map((id) => suggestionItem({ id })),
+        unreadCount: 3,
+        update,
+      }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() =>
+      expect(toasts).toEqual(["Couldn’t mark 3 suggestions as read. Try again."]),
+    );
+    expect(update).toHaveBeenCalledTimes(3);
+  });
+
+  it("still marks the loaded suggestions when listing the rest fails", async () => {
+    const toasts: unknown[] = [];
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({})],
+        unreadCount: 5,
+        hasNextPage: true,
+        update,
+      }),
+    );
+    vi.mocked(proactiveInboxApi.listSuggestions).mockRejectedValueOnce(new Error("offline"));
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() =>
+      expect(toasts).toEqual([
+        "Couldn’t load every unread suggestion, so some are still unread. Try again.",
+      ]),
+    );
+    expect(update).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledWith("sug_unread", { status: "read" }, expect.anything());
+  });
+
+  it("is offered only while the tab lists something unread", async () => {
+    renderPage();
+    expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();
+    cleanup();
+
+    const unread = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([unread]));
+    renderPage();
+    await screen.findByTestId("inbox-unread");
+    expect(screen.getByRole("button", { name: "Mark all as read" })).toBeInTheDocument();
+    selectTab("Awaiting response");
+    expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();
+  });
+
+  it("stays off Awaiting response while an earlier click is still marking", async () => {
+    // WHY: tabs stay switchable mid-run, and the pending run must not carry the button over.
+    let settle: (accepted: boolean) => void = () => {};
+    const update = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          settle = resolve;
+        }),
+    );
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({ items: [suggestionItem({})], unreadCount: 1, update }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+    expect(update).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Mark all as read" })).toBeDisabled();
+    selectTab("Awaiting response");
+    expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();
+
+    await act(async () => settle(true));
+    selectTab("All");
+    expect(screen.getByRole("button", { name: "Mark all as read" })).toBeEnabled();
+  });
+});
+
+describe("the Inbox in ⌘K", () => {
+  /** Markup without React's generated ids, which count every `useId` call in the tree. */
+  const markup = (element: HTMLElement) => element.innerHTML.replace(/:r[0-9a-z]+:/g, ":id:");
+  const command = (label: string) =>
+    registeredPaletteCommands().find((candidate) => candidate.label === label);
+
+  beforeEach(() => {
+    inboxPaletteCommands.renders = 0;
+  });
+  afterEach(() => usePaletteCommandsStore.setState({ groups: {} }));
+
+  it("mounts nothing with quick_pick_palette off, and the page renders the same", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation()]),
+    );
+    const off = renderPage(undefined, false, { quick_pick_palette: false });
+    await screen.findByTestId("inbox-unread");
+    const withoutCommands = markup(off.container);
+    expect(inboxPaletteCommands.renders).toBe(0);
+    expect(registeredPaletteCommands()).toEqual([]);
+    off.unmount();
+
+    // The commands render nothing themselves, so turning the flag on changes no markup.
+    const on = renderPage(undefined, false, { quick_pick_palette: true });
+    await screen.findByTestId("inbox-unread");
+    expect(inboxPaletteCommands.renders).toBeGreaterThan(0);
+    expect(markup(on.container)).toBe(withoutCommands);
+  });
+
+  it("marks an unread card read and switches the tab from ⌘K, as the card and tabs do", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation()]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    await screen.findByTestId("inbox-unread");
+
+    act(() => command("Mark “Unread Session” as read")!.run());
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+
+    const filter = expectSetting(registeredPaletteCommands(), "Inbox filter", { current: "All" });
+    await act(async () => chooseSettingValue(filter, "Unread"));
+    expect(screen.getByRole("tab", { name: "Unread" })).toHaveAttribute("aria-selected", "true");
+    expect(localStorage.getItem("omnigent:inbox-filter")).toBe("unread");
+  });
+
+  it("expands a collapsed unread card and focuses its reply field from ⌘K's Reply", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation()]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    const item = await screen.findByTestId("inbox-unread");
+    expect(within(item).queryByRole("textbox", { name: /Reply to/ })).toBeNull();
+
+    act(() => command("Reply to “Unread Session”…")!.run());
+    const box = await within(item).findByRole<HTMLTextAreaElement>("textbox", {
+      name: /Reply to/,
+    });
+    await waitFor(() => expect(box).toHaveFocus());
+    // Replying from ⌘K leaves the card unread until the reply sends.
+    expect(screen.getByTestId("inbox-unread")).toBeInTheDocument();
+
+    // Asked again on the open card, it comes back to the draft with the caret after it.
+    fireEvent.change(box, { target: { value: "Check the parser" } });
+    act(() => box.blur());
+    act(() => command("Reply to “Unread Session”…")!.run());
+    await waitFor(() => expect(box).toHaveFocus());
+    expect([box.selectionStart, box.selectionEnd]).toEqual([16, 16]);
+  });
+
+  it("offers no Reply on a card the viewer can't edit", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unreadConversation({ permission_level: 1 })]),
+    );
+    renderPage(undefined, false, { quick_pick_palette: true });
+    await screen.findByTestId("inbox-unread");
+    expect(command("Open “Unread Session”")).toBeDefined();
+    expect(command("Reply to “Unread Session”…")).toBeUndefined();
+  });
 });

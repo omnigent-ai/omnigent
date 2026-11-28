@@ -54,6 +54,20 @@ see *Network* below).
 
 ## Journeys
 
+### Runner-local shell latency
+
+On Linux with the isolated Bubblewrap request launcher, compare warmed
+file-tool environment reuse against disposable shell calls:
+
+```bash
+uv run --no-sync python -m dev.benchmarks.omnigent.shell_request \
+    --iterations 3 --output /tmp/omnigent-shell-latency.json
+```
+
+The sampler uses a temporary workspace and starts no server or provider calls.
+It reports individual timings and medians without a performance threshold.
+Helper reuse and retirement are covered separately by runner correctness tests.
+
 ### HTTP/API (server + DB, runner-free)
 
 | Journey | Operation timed | Stressed by |

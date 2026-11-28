@@ -250,7 +250,12 @@ class ScheduledTaskScheduler:
     # ── internals ────────────────────────────────────────────────────────────
 
     def _register(self, task: ScheduledTask) -> None:
-        """Validate the task's rrule and arm its timer, replacing any existing."""
+        """Validate the task's rrule and arm its timer, replacing any existing.
+
+        Agent timers (``kind="timer"``) need the database scheduler and are skipped.
+        """
+        if task.kind == "timer":
+            return
         trigger = validate_rrule(task.rrule)
         self.remove(task.id)  # replace_existing semantics
         job = _Job(

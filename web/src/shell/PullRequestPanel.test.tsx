@@ -1,9 +1,22 @@
+import type { FileDiff } from "@pierre/diffs/react";
+import type { Comment } from "@/hooks/useComments";
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 // Tests for PullRequestPanel — the stacked "Files changed" view. The GitHub data
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
@@ -43,17 +56,19 @@ const state = vi.hoisted(() => ({
     isFetching: boolean;
   } | null,
   // Per-file diffs the stubbed parsePatchFiles yields (name + optional
-  // rename fields), so tests can exercise renamed/pure-rename rendering.
+  // rename fields and hunk sizes), so tests can exercise renamed/pure-rename rendering.
   parsedFiles: [] as {
     name: string;
     prevName?: string;
     type?: string;
-    unifiedLineCount?: number;
+    hunks?: { unifiedLineCount: number; hunkContent: unknown[] }[];
   }[],
   // The whole-PR diff response; the panel parses its patch into per-file diffs.
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
   canEdit: true,
+  // The server's word on whether the viewer owns the session; null when it doesn't say.
+  sessionOwner: null as boolean | null,
   updateSessionPr: vi.fn(),
   realPrHooks: false,
   repoLabels: {
@@ -82,12 +97,15 @@ const state = vi.hoisted(() => ({
   serveable: undefined as boolean | undefined,
 }));
 
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
+
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
   const original = await importOriginal<typeof UsePullRequestsModule>();
   return {
     // The panel reads every info payload through the real normalizer.
     normalizePullRequestInfo: original.normalizePullRequestInfo,
     usePullRequestCommentComposer: original.usePullRequestCommentComposer,
+    usePullRequestReviewThreadComposer: original.usePullRequestReviewThreadComposer,
     pullRequestCommentTooLong: original.pullRequestCommentTooLong,
     MAX_PULL_REQUEST_COMMENT_CHARACTERS: original.MAX_PULL_REQUEST_COMMENT_CHARACTERS,
     applyPullRequestLabelChange: original.applyPullRequestLabelChange,
@@ -117,6 +135,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       isError: false,
     }),
     uploadPullRequestAttachment: vi.fn(),
+    usePullRequestReadPriority: vi.fn(),
     usePullRequestInfo: vi.fn((...args: Parameters<typeof original.usePullRequestInfo>) =>
       state.realPrHooks ? original.usePullRequestInfo(...args) : state.info,
     ),
@@ -127,6 +146,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       error: state.diffError,
       isFetching: false,
     }),
+    usePullRequestCommits: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitDiff: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitsUnsupported: () => false,
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
@@ -163,7 +185,12 @@ vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
     useUnlinkSessionPr: () => state.unlink,
   };
 });
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: () => state.canEdit,
+  useIsSessionOwner: () => state.sessionOwner,
+}));
+let sandboxStarting = false;
+vi.mock("@/hooks/useSessionReconnect", () => ({ useSandboxStarting: () => sandboxStarting }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceAsleep: () => state.sandboxAsleep,
@@ -175,11 +202,25 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 // stubbed to yield the files configured on `state` (name + optional rename
 // metadata), matching the whole-PR patch.
 vi.mock("@pierre/diffs", () => ({
-  parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
+  parsePatchFiles: vi.fn(() => [
+    { files: state.parsedFiles.map((parsed) => ({ hunks: [], ...parsed })) },
+  ]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
-  FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
-    <div data-testid="diff" data-path={fileDiff.name} />
+  FileDiff: ({
+    fileDiff,
+    renderGutterUtility,
+    lineAnnotations,
+    renderAnnotation,
+  }: React.ComponentProps<typeof FileDiff>) => (
+    <div data-testid="diff" data-path={fileDiff.name}>
+      {renderGutterUtility?.(() => ({ lineNumber: 1, side: "additions" }))}
+      {lineAnnotations?.map((annotation) => (
+        <div key={`${annotation.side}:${annotation.lineNumber}`}>
+          {renderAnnotation?.(annotation)}
+        </div>
+      ))}
+    </div>
   ),
 }));
 // The resolved theme mode drives @pierre/diffs' themeType.
@@ -197,16 +238,20 @@ vi.mock("@/components/ai-elements/message", () => ({
 import {
   usePullRequestInfo,
   usePullRequestChangedFiles,
+  usePullRequestReadPriority,
   usePullRequestRepoLabels,
   usePullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
 
 import {
   PullRequestPanel,
+  selectPullRequestInPanel,
   derivePullRequestPanelState,
   LARGE_DIFF_THRESHOLD,
+  type PullRequestSubtab,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { viewedStorageKey } from "@/lib/pullRequestViewed";
 
 const FORGE_DISPLAY = {
   id: "example_forge",
@@ -214,6 +259,19 @@ const FORGE_DISPLAY = {
   request_name: "pull request",
   number_prefix: "!",
 };
+
+const OTHER_PR: PullRequestAssociation = {
+  url: "https://github.com/acme/app/pull/6001",
+  host: "github.com",
+  repository: "acme/app",
+  number: 6001,
+  relationship: "attached",
+};
+
+/** A parsed hunk stub that renders `unifiedLineCount` lines. */
+function hunk(unifiedLineCount: number) {
+  return { unifiedLineCount, hunkContent: [] };
+}
 
 function file(
   path: string,
@@ -232,23 +290,36 @@ function file(
   };
 }
 
-function renderPanel(mobile = false, active?: boolean) {
+function renderPanel(
+  mobile = false,
+  active?: boolean,
+  onOpenPullRequest?: (url: string, section?: PullRequestSubtab) => void,
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return {
     client,
-    ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
-      wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>
-          {mobile ? (
-            <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
-              {children}
-            </MobilePanelDrawer>
-          ) : (
-            children
-          )}
-        </QueryClientProvider>
-      ),
-    }),
+    ...render(
+      <PullRequestPanel
+        conversationId="conv_1"
+        active={active}
+        onOpenPullRequest={onOpenPullRequest}
+      />,
+      {
+        wrapper: ({ children }) => (
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+            <QueryClientProvider client={client}>
+              {mobile ? (
+                <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
+                  {children}
+                </MobilePanelDrawer>
+              ) : (
+                children
+              )}
+            </QueryClientProvider>
+          </CapabilitiesProvider>
+        ),
+      },
+    ),
   };
 }
 
@@ -259,6 +330,16 @@ function renderChanges() {
   const r = renderPanel();
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
   return r;
+}
+
+/**
+ * Sidebar rows and section toggles by name. A file's copy and overflow buttons carry the
+ * path in their labels and the overflow trigger reports aria-expanded, so skip labeled buttons.
+ */
+function fileRowButtons(name: RegExp) {
+  return screen
+    .getAllByRole("button", { name })
+    .filter((button) => !button.hasAttribute("aria-label"));
 }
 
 /** Render, then switch to the Comments tab (see renderChanges). */
@@ -368,6 +449,7 @@ beforeEach(() => {
   state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
   state.diffError = null;
   state.canEdit = true;
+  state.sessionOwner = null;
   state.repoLabels = { data: undefined, isPending: true, isError: false, error: null };
   state.updateLabels = { mutate: vi.fn(), isError: false, error: null };
 });
@@ -378,6 +460,98 @@ afterEach(() => {
 });
 
 describe("PullRequestPanel", () => {
+  it.each([
+    { mobile: false, multiple: false },
+    { mobile: true, multiple: false },
+    { mobile: false, multiple: true },
+    { mobile: true, multiple: true },
+  ])(
+    "restores cached PR details after session switches and remounts ($mobile, $multiple)",
+    async ({ mobile, multiple }) => {
+      state.realPrHooks = true;
+      const url = state.info!.data!.pr!.url;
+      const payload = {
+        ...state.info!.data!,
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "github.com",
+            repository: "acme/app",
+            number: 6000,
+            relationship: "attached",
+          },
+        ],
+      };
+      if (multiple) {
+        payload.prs.push({ ...payload.prs[0]!, url: `${url}1`, number: 60001 });
+      }
+      let refreshing = false;
+      const fetchMock = vi.fn(() =>
+        refreshing
+          ? new Promise<Response>(() => {})
+          : Promise.resolve(new Response(JSON.stringify(payload))),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const user = userEvent.setup();
+      const { client, rerender } = renderPanel(mobile);
+      if (multiple) {
+        await user.click(
+          await screen.findByRole("button", { name: "acme/app #6000 — chore: dummy PR" }),
+        );
+      }
+      await waitFor(() => {
+        expect(client.getQueryData(["github-info", "conv_1", url])).toBeDefined();
+      });
+      await user.click(await screen.findByRole("tab", { name: "Comments" }));
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      // A subsequent poll replaces the original response in the shared cache.
+      payload.pr = { ...payload.pr!, title: "Updated by polling" };
+      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      expect(await screen.findByText("Updated by polling")).toBeVisible();
+
+      expect(client.getQueryData(["pull-request-panel-view", "conv_1"])).toMatchObject({
+        subtab: "comments",
+      });
+      rerender(<PullRequestPanel conversationId="conv_other" />);
+      if (multiple) {
+        expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+      } else {
+        expect(await screen.findByRole("tab", { name: "Summary" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+      }
+      fetchMock.mockClear();
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByText("Updated by polling")).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // Even a stale response remains visible while the return refresh is pending.
+      rerender(<div />);
+      await act(() =>
+        client.invalidateQueries({ queryKey: ["github-info", "conv_1"], refetchType: "none" }),
+      );
+      refreshing = true;
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByText("Updated by polling")).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.queryByText("Loading pull requests…")).toBeNull();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    },
+  );
+
   it.each(["UNKNOWN", "BLOCKED", "error"])(
     "keeps compact confirmation and pending refusal through a polling transition: %s",
     async (transition) => {
@@ -389,6 +563,7 @@ describe("PullRequestPanel", () => {
         tracking_available: true,
         selected_pr_url: url,
         prs: [
+          OTHER_PR,
           {
             url,
             host: "github.com",
@@ -495,7 +670,6 @@ describe("PullRequestPanel", () => {
     );
     const user = userEvent.setup();
     const { client } = renderPanel();
-    await user.click(await screen.findByRole("button", { name: "acme/app #1 — PR 1" }));
     await screen.findByRole("link", { name: /PR 1/ });
     let resolveStored: (value: {
       prs: PullRequestAssociation[];
@@ -532,34 +706,51 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("link", { name: /PR 2/ })).toBeVisible();
   });
 
-  it("uses one mobile heading with working header actions in list and details", async () => {
-    const user = userEvent.setup();
-    state.storesPrs = false;
-    const url = state.info!.data!.pr!.url;
-    Object.assign(state.info!.data!, {
-      tracking_available: true,
-      selected_pr_url: url,
-      prs: [
-        { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
-      ],
-    });
-    const { client } = renderPanel(true);
-    const invalidate = vi.spyOn(client, "invalidateQueries");
-    const heading = screen.getByRole("heading", { name: "Pull Requests" });
-    const header = heading.closest("header")!;
-    expect(screen.getAllByRole("heading", { name: "Pull Requests" })).toHaveLength(1);
-    await user.click(within(header).getByRole("button", { name: "Refresh" }));
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-pull-requests", "conv_1"] });
-    await user.click(within(header).getByRole("button", { name: "Link a PR" }));
-    expect(screen.getByRole("textbox", { name: "Pull request URL" })).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
-    await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
-    expect(within(header).getByRole("button", { name: "All pull requests (1)" })).toBeVisible();
-    expect(within(header).getByRole("button", { name: "Unlink PR" })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "All pull requests (1)" }));
-    expect(within(header).queryByRole("button", { name: "Unlink PR" })).toBeNull();
-    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
-  });
+  it.each([1, 2])(
+    "uses one mobile heading with working header actions for %i PRs",
+    async (count) => {
+      const user = userEvent.setup();
+      state.storesPrs = false;
+      const url = state.info!.data!.pr!.url;
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "github.com",
+            repository: "acme/app",
+            number: 6000,
+            relationship: "attached",
+          },
+          ...(count > 1 ? [OTHER_PR] : []),
+        ],
+      });
+      const { client } = renderPanel(true);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const heading = screen.getByRole("heading", { name: "Pull Requests" });
+      const header = heading.closest("header")!;
+      expect(screen.getAllByRole("heading", { name: "Pull Requests" })).toHaveLength(1);
+      await user.click(within(header).getByRole("button", { name: "Refresh" }));
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-pull-requests", "conv_1"] });
+      await user.click(within(header).getByRole("button", { name: "Link a PR" }));
+      expect(screen.getByRole("textbox", { name: "Pull request URL" })).toBeVisible();
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+      if (count > 1) {
+        await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
+      }
+      expect(within(header).getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+      expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
+      if (count > 1) {
+        await user.click(within(header).getByRole("button", { name: "All pull requests (2)" }));
+        expect(within(header).queryByRole("button", { name: "Unlink PR" })).toBeNull();
+        expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+      } else {
+        expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+        expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+      }
+    },
+  );
 
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
@@ -611,6 +802,7 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: false, prUrl: pr.url });
     }
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
 
     expect(refetchQueries).not.toHaveBeenCalled();
 
@@ -619,15 +811,49 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: "list", prUrl: pr.url });
     }
+    // List rows wait their turn; only an open details view reads ahead of them.
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     // Turning the poll back on doesn't fetch by itself.
     expect(refetchQueries).toHaveBeenCalledWith({
       queryKey: ["github-info", "conv_1"],
       stale: true,
     });
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: url });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+    });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+    });
     rerender(<PullRequestPanel conversationId="conv_1" active={false} />);
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false, prUrl: url });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: false,
+      prUrl: url,
+    });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
+    rerender(<PullRequestPanel conversationId="conv_1" active />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+    });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
+    await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", {
+      poll: "list",
+      prUrl: url,
+    });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
+    await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
+    expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+    });
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {
@@ -887,13 +1113,11 @@ describe("PullRequestPanel", () => {
       expect(
         labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
-      // Reviewers and labels share one row, split by a vertical divider, above a divider.
+      // Reviewers and labels share one row, the labels column bordering the reviewers,
+      // above a divider.
       const row = reviewers.parentElement!.parentElement!;
       expect(row).toContainElement(labels);
-      expect(row.querySelector('[data-slot="separator"]')).toHaveAttribute(
-        "data-orientation",
-        "vertical",
-      );
+      expect(labels.parentElement).toHaveClass("border-l");
       expect(row.nextElementSibling).toHaveAttribute("data-slot", "separator");
     });
 
@@ -979,6 +1203,40 @@ describe("PullRequestPanel", () => {
       fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
       expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
     });
+
+    it.each([
+      [true, true, true],
+      [false, true, false],
+      // An older host would merge as its saved account, whatever the dialog sent.
+      [true, undefined, false],
+    ])(
+      "offers the PR's accounts to merge as (switching: %s, merge as account: %s)",
+      (switching, mergeAsAccount, offered) => {
+        state.info!.data!.capabilities!.account_switching = switching;
+        state.info!.data!.capabilities!.merge_as_account = mergeAsAccount;
+        state.info!.data!.accounts = ["work", "personal"].map((login) => ({
+          login,
+          active: login === "work",
+          state: "success",
+          host: "github.com",
+        }));
+        state.info!.data!.selected_account = "work";
+        renderPanel();
+
+        // The repository resolved, so only the merge dialog asks for an account.
+        expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+        const merge = screen.getByRole("region", { name: "Merge" });
+        fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+        const picker = within(screen.getByRole("dialog")).queryByRole("combobox", {
+          name: "Merge as",
+        });
+        if (offered) {
+          expect(picker).toHaveTextContent("work (active)");
+        } else {
+          expect(picker).toBeNull();
+        }
+      },
+    );
 
     it("divides the metadata from the description", () => {
       renderPanel();
@@ -1145,6 +1403,101 @@ describe("PullRequestPanel", () => {
     assertColors();
   });
 
+  it("interleaves commits and force pushes with comments without inflating their count", () => {
+    const keyWarnings = watchKeyWarnings();
+    state.info!.data!.pr!.comments = [
+      { author: "reviewer", body: "Please update", created_at: "2026-09-05T08:00:00Z", url: null },
+      { author: "reviewer", body: "Looks good", created_at: "2026-09-05T10:00:00Z", url: null },
+      { author: null, body: "Undated comment", created_at: null, url: null },
+    ];
+    state.info!.data!.pr!.timeline_events = [
+      {
+        id: "push-1",
+        kind: "force_push",
+        author: "octocat",
+        created_at: "2026-09-05T09:00:00Z",
+        sha: "bbbbbbb222222",
+        previous_sha: "aaaaaaa111111",
+        url: "https://github.com/acme/app/commit/bbbbbbb222222",
+      },
+      {
+        id: "commit-1",
+        kind: "commit",
+        author: "octocat",
+        created_at: "2026-09-05T07:00:00Z",
+        sha: "aaaaaaa111111",
+        url: "https://github.com/acme/app/pull/6000/commits/aaaaaaa111111",
+        message: "Add the feature",
+      },
+    ];
+    const view = renderComments();
+    const rows = screen.getAllByRole("listitem");
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toHaveTextContent("octocatcommittedaaaaaaa");
+    expect(rows[0]).toHaveTextContent("Add the feature");
+    expect(rows[1]).toHaveTextContent("Please update");
+    expect(rows[2]).toHaveTextContent("octocatforce-pushedfrom aaaaaaatobbbbbbb");
+    expect(rows[3]).toHaveTextContent("Looks good");
+    expect(rows[4]).toHaveTextContent("Undated comment");
+    expect(rows[2]!.querySelector("time")).toHaveAttribute("dateTime", "2026-09-05T09:00:00Z");
+    expect(rows[2]!.querySelector("time")).toHaveAttribute(
+      "title",
+      expect.stringContaining("2026"),
+    );
+    expect(screen.getByRole("link", { name: "Open commit aaaaaaa on GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/6000/commits/aaaaaaa111111",
+    );
+    expect(screen.getByRole("link", { name: "Open commit bbbbbbb on GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/commit/bbbbbbb222222",
+    );
+    expect(screen.getByRole("tab", { name: "Comments 3" })).toBeInTheDocument();
+    state.info!.data!.pr!.timeline_events.push({
+      id: "commit-2",
+      kind: "commit",
+      author: "octocat",
+      created_at: "2026-09-05T08:30:00Z",
+      sha: "ccccccc333333",
+      url: null,
+      message: "Address review",
+    });
+    view.rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByText("Looks good").closest("li")).toBe(rows[3]);
+    expect(screen.getByText("Address review")).toBeInTheDocument();
+    expect(keyWarnings()).toEqual([]);
+  });
+
+  it.each(["https://example.com/pr/6000", "javascript:alert(1)", "data:text/html,unsafe"])(
+    "keeps incomplete history visible and validates its link: %s",
+    (prUrl) => {
+      state.info!.data!.pr!.url = prUrl;
+      state.info!.data!.pr!.timeline_events = [
+        {
+          id: "push-1",
+          kind: "force_push",
+          author: null,
+          created_at: null,
+          sha: null,
+          url: null,
+        },
+      ];
+      state.info!.data!.pr!.timeline_partial = true;
+      renderComments();
+      expect(screen.getByRole("listitem")).toHaveTextContent("unknownforce-pushedthe branch");
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Some commit and push history is unavailable.",
+      );
+      if (prUrl.startsWith("https://")) {
+        expect(screen.getByRole("link", { name: "View on GitHub" })).toHaveAttribute("href", prUrl);
+      } else {
+        expect(screen.queryByRole("link", { name: "View on GitHub" })).toBeNull();
+      }
+      expect(screen.queryByText("No comments yet.")).toBeNull();
+      expect(screen.getByRole("tab", { name: "Comments" })).toBeInTheDocument();
+    },
+  );
+
   it("shows empty states when the PR has no body or comments", () => {
     // The default fixture carries neither a body nor comments.
     renderPanel();
@@ -1242,6 +1595,28 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("Checks")).toBeNull();
   });
 
+  it("keys viewed marks by the selected PR's identity and pinned head", async () => {
+    const url = state.info!.data!.pr!.url;
+    const selected = {
+      url,
+      host: "example.com",
+      repository: "acme/app",
+      number: 6000,
+      relationship: "created" as const,
+    };
+    state.info!.data!.pr!.head_sha = "head";
+    state.info!.data!.selected_pr_url = url;
+    state.info!.data!.prs = [selected];
+    // The list's head is pinned, so the mock carries it as an extra field.
+    Object.assign(state.changes!.data!, { head_sha: "head" });
+    state.diff = { ...state.diff!, head_sha: "head" };
+    renderChanges();
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
+    const key = viewedStorageKey(window.location.origin, "alice", selected);
+    expect(localStorage.getItem(key)).toContain("hello.py");
+  });
+
   it("stacks a diff section per changed file", async () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
@@ -1267,6 +1642,27 @@ describe("PullRequestPanel", () => {
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
 
+  it("collapses a jumped-to file from its header and keeps collapse across tabs", async () => {
+    renderChanges();
+    await screen.findAllByTestId("diff");
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Collapse all diffs" })).toBeInTheDocument();
+    // The jump expanded the file only temporarily; one header click closes it again.
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    expect(
+      fileRowButtons(/app\.ts/).find((b) => b.getAttribute("aria-expanded") === "false"),
+    ).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    await screen.findAllByTestId("diff");
+    expect(
+      fileRowButtons(/app\.ts/).find((b) => b.getAttribute("aria-expanded") === "false"),
+    ).toBeInTheDocument();
+  });
+
   it("collapses a file's diff when its section header is clicked", async () => {
     renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
@@ -1286,18 +1682,26 @@ describe("PullRequestPanel", () => {
     // The same button now offers the inverse action.
     fireEvent.click(screen.getByRole("button", { name: "Expand all diffs" }));
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
+
+    // A file revealed by a jump counts as expanded, and collapse all closes it.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(screen.queryAllByTestId("diff")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Expand all diffs" })).toBeInTheDocument();
   });
 
   it("hides and shows the file sidebar from the toolbar", async () => {
     renderChanges();
     await screen.findAllByTestId("diff");
     // hello.py appears as a sidebar jump row and as a section header.
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
     // Sidebar gone → only the section header remains.
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(1);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Show file list" }));
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(2);
   });
 
   it("toggles the diff layout between unified and split", async () => {
@@ -1330,6 +1734,25 @@ describe("PullRequestPanel", () => {
     expect(screen.getAllByRole("button", { name: /util\.py/ }).length).toBeGreaterThan(0);
   });
 
+  it("truncates a long file name in the sidebar tree from its middle, keeping its start", async () => {
+    state.changes = {
+      data: { available: true, data: [file("src/DataModelHandler.scala", "modified")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderChanges();
+    await screen.findByRole("button", { name: "src" });
+    // The section header carries aria-expanded; the sidebar row doesn't.
+    const row = fileRowButtons(/DataModelHandler\.scala/).find(
+      (button) => !button.hasAttribute("aria-expanded"),
+    )!;
+    const start = within(row).getByText("DataModelHandler.");
+    expect(start).toHaveClass("truncate");
+    expect(start.closest('[class~="[direction:rtl]"]')).toBeNull();
+    expect(within(row).getByText("scala")).toBeInTheDocument();
+  });
+
   it("collapses a folder to hide its files in the sidebar tree", async () => {
     state.changes = {
       data: {
@@ -1343,10 +1766,10 @@ describe("PullRequestPanel", () => {
     renderChanges();
     const folder = await screen.findByRole("button", { name: "omnigent/runner" });
     // Before collapse: the sidebar leaf + the diff section header both match.
-    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/app\.py/)).toHaveLength(2);
     fireEvent.click(folder);
     // After collapse: only the diff section header remains (sidebar leaf gone).
-    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(1);
+    expect(fileRowButtons(/app\.py/)).toHaveLength(1);
   });
 
   it("shows a pure rename as a note with an old → new header", async () => {
@@ -1438,7 +1861,6 @@ describe("PullRequestPanel", () => {
     }));
     info.selected_account = "personal";
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "acme/app #6000" }));
     const emptyState = screen.getByText("Can’t reach the upstream repo").parentElement;
     const link = screen.getByRole("link", { name: "Open the PR on GitHub" });
     expect(emptyState).toContainElement(link);
@@ -1532,30 +1954,40 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("GitHub")).toBeNull();
   });
 
-  it("tells a GitHub Enterprise user to sign in to the remote's host", () => {
-    state.info = {
-      data: {
-        object: "session.github.info",
-        available: false,
-        reason: "unsupported_remote",
-        remote_host: "git.example.com",
-        provider: null,
-      },
-      isLoading: false,
-      error: null,
-      isFetching: false,
-    };
-    renderPanel();
-    // A second line under the sentence about the host; the command is set as code.
-    const hint = screen.getByText(/which isn’t a supported/);
-    const note = screen.getByText(/For a GitHub Enterprise host, run/);
-    expect(note).not.toBe(hint);
-    expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(note).toHaveTextContent(
-      "For a GitHub Enterprise host, run gh auth login --hostname git.example.com on the host.",
-    );
-    expect(screen.getByText("gh auth login --hostname git.example.com")).toHaveClass("font-mono");
-  });
+  it.each(["git.example.com", "github.com-work"])(
+    "shows provider setup for unrecognized host %s",
+    (remoteHost) => {
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "unsupported_remote",
+          remote_host: remoteHost,
+          provider: null,
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      // A second line under the sentence about the host; commands are set as code.
+      const hint = screen.getByText(/couldn’t identify the git provider/);
+      const note = screen.getByText(/On the execution host, run/);
+      expect(note).not.toBe(hint);
+      expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(note).toHaveTextContent(
+        `On the execution host, run glab auth login --hostname ${remoteHost} for GitLab or gh auth login --hostname ${remoteHost} for GitHub Enterprise.`,
+      );
+      expect(screen.getByText(`glab auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(screen.getByText(`gh auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(note).toHaveTextContent(
+        "For a GitHub SSH alias, run git config --local omnigent.gitprovider github in this checkout, then refresh for installation or sign-in help.",
+      );
+      expect(screen.getByText("git config --local omnigent.gitprovider github")).toHaveClass(
+        "font-mono",
+      );
+    },
+  );
 
   it("leaves out the sign-in line when the remote's host is unknown", () => {
     state.info = {
@@ -1571,10 +2003,11 @@ describe("PullRequestPanel", () => {
     };
     renderPanel();
     expect(
-      screen.getByText("This workspace’s remote isn’t on a supported git provider."),
+      screen.getByText("Omnigent couldn’t identify this workspace’s git provider."),
     ).toBeInTheDocument();
     expect(screen.queryByText(/GitHub Enterprise/)).toBeNull();
     expect(screen.queryByText(/gh auth login/)).toBeNull();
+    expect(screen.queryByText(/glab auth login/)).toBeNull();
   });
 
   describe("header when no provider is known", () => {
@@ -1669,6 +2102,7 @@ describe("PullRequestPanel", () => {
           tracking_available: true,
           selected_pr_url: url,
           prs: [
+            OTHER_PR,
             {
               url,
               host: "github.com",
@@ -1711,6 +2145,7 @@ describe("PullRequestPanel", () => {
         tracking_available: true,
         selected_pr_url: url,
         prs: [
+          OTHER_PR,
           {
             url,
             host: "forge.example.test",
@@ -1772,6 +2207,30 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
       expect(screen.queryByText(/GitHub/)).toBeNull();
+    });
+
+    it("shows a GitLab merge request authenticated by a token without a CLI", () => {
+      const { repo, pr } = state.info!.data!;
+      state.info!.data = {
+        ...gitlab({ cli: null }),
+        repo,
+        pr: { ...pr!, url: "https://git.example.com/acme/app/-/merge_requests/6000" },
+      };
+      renderPanel();
+      expect(screen.getByText("chore: dummy PR")).toBeInTheDocument();
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
+    });
+
+    it("shows the GitLab token error without asking to install a CLI", () => {
+      state.info!.data = gitlab({
+        authenticated: false,
+        cli: null,
+        hint: "Check `GITLAB_TOKEN` on the execution host.",
+      });
+      renderPanel();
+      expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+      expect(screen.getByText("GITLAB_TOKEN")).toHaveClass("font-mono");
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
     });
 
     it("shows the host's sign-in hint when the repo can't be reached", () => {
@@ -1920,9 +2379,6 @@ describe("PullRequestPanel", () => {
         prs: [association()],
       };
       renderPanel();
-      fireEvent.click(
-        screen.getByRole("button", { name: /^(?!Actions for).*contoso\/web\/app !7/ }),
-      );
       expect(screen.getByText("No supported remote")).toBeInTheDocument();
       expect(screen.getByRole("link", { name: "Open the PR on Example Forge" })).toHaveAttribute(
         "href",
@@ -2122,8 +2578,11 @@ describe("PullRequestPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual([
       "github-info",
+      "github-review-threads",
       "github-changed-files",
       "github-pr-diff",
+      "github-pr-commits",
+      "github-pr-commit-diff",
       "session-pull-requests",
     ]);
   });
@@ -2215,8 +2674,104 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
-  it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
-    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD }];
+  it("shows someone other than the owner the PRs without the controls that change them", async () => {
+    const user = userEvent.setup();
+    const pr = state.info!.data!.pr!;
+    Object.assign(state.info!.data!, {
+      owner_only_changes: true,
+      // What the server sends a non-owner: only read capabilities stay on.
+      capabilities: {
+        account_switching: false,
+        base_remote_selection: false,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: false,
+      },
+      tracking_available: true,
+      prs: [
+        OTHER_PR,
+        {
+          url: pr.url,
+          repository: "example/repo",
+          host: "github.com",
+          number: pr.number,
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+
+    expect(
+      screen.getByText(/Only the session’s owner can change its pull requests here/),
+    ).toHaveTextContent("Open the pull request on GitHub to make changes.");
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Actions for example/repo #6000" }));
+    expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
+    await user.keyboard("{Escape}");
+  });
+
+  it("keeps a non-owner's PR changes hidden while the host is offline", async () => {
+    const user = userEvent.setup();
+    const url = "https://github.com/example/one/pull/42";
+    state.sessionOwner = false;
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [
+      { url, host: "github.com", repository: "example/one", number: 42, relationship: "created" },
+      { ...OTHER_PR },
+    ];
+    renderPanel();
+
+    await screen.findByRole("list", { name: "Pull requests" });
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Actions for example/one #42" }));
+    expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
+  });
+
+  it("offers a non-owner no unlink on a PR's details, even while another PR's load", async () => {
+    const url = state.info!.data!.pr!.url;
+    Object.assign(state.info!.data!, {
+      owner_only_changes: true,
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [
+        { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
+      ],
+    });
+    // A server that doesn't say who owns the session: only the PR info's marker decides.
+    state.sessionOwner = null;
+    const { rerender } = renderPanel();
+    expect(await screen.findByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+
+    state.info = { isLoading: true, error: null, isFetching: true };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
+  });
+
+  it("offers a non-owner no link in the empty state", () => {
+    Object.assign(state.info!.data!, {
+      pr: null,
+      prs: [],
+      tracking_available: true,
+      owner_only_changes: true,
+    });
+    renderPanel();
+    expect(screen.getByText(/Pull requests created in this session appear here/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+  });
+
+  it("shows the diff immediately when its hunks render the threshold's lines", async () => {
+    state.parsedFiles = [{ name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD)] }];
     state.changes = {
       data: { available: true, data: [file("hello.py", "modified")] },
       isLoading: false,
@@ -2229,9 +2784,9 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText(/Large diff/)).toBeNull();
   });
 
-  it("replaces a file's diff with a large-diff affordance when unifiedLineCount exceeds the threshold", async () => {
+  it("replaces a file's diff with a large-diff affordance when its hunks exceed the threshold", async () => {
     state.parsedFiles = [
-      { name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 },
+      { name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD), hunk(1)] },
       { name: "src/app.ts" },
     ];
     renderChanges();
@@ -2247,7 +2802,7 @@ describe("PullRequestPanel", () => {
   });
 
   it("reveals the diff after clicking Show diff", async () => {
-    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 }];
+    state.parsedFiles = [{ name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD + 1)] }];
     state.changes = {
       data: { available: true, data: [file("hello.py", "modified")] },
       isLoading: false,
@@ -2399,6 +2954,95 @@ describe("derivePullRequestPanelState", () => {
 });
 
 describe("session PR selection", () => {
+  it.each([false, true])(
+    "selects a previewed PR in a mounted panel (active: %s)",
+    async (active) => {
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        prs: [
+          {
+            ...OTHER_PR,
+            url: state.info!.data!.pr!.url,
+            number: 6000,
+          },
+          OTHER_PR,
+        ],
+      });
+      const { client, rerender } = renderPanel(false, active);
+      expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+
+      act(() => selectPullRequestInPanel(client, "conv_1", OTHER_PR.url));
+
+      expect(await screen.findByRole("tab", { name: "Summary" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+      expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+        poll: active,
+        prUrl: OTHER_PR.url,
+      });
+
+      rerender(<div />);
+      selectPullRequestInPanel(client, "conv_1", state.info!.data!.pr!.url);
+      rerender(<PullRequestPanel conversationId="conv_1" active={active} />);
+      expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
+      expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+        poll: active,
+        prUrl: state.info!.data!.pr!.url,
+      });
+    },
+  );
+
+  it.each([false, true])("opens a single PR directly (stored list: %s)", async (stored) => {
+    const url = state.info!.data!.pr!.url;
+    const association: PullRequestAssociation = {
+      url,
+      host: "github.com",
+      repository: "acme/app",
+      number: 6000,
+      relationship: "attached",
+    };
+    state.storesPrs = stored;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [association],
+    });
+    if (stored) state.stored.conv_1 = [association];
+    const { client, rerender } = renderPanel();
+
+    expect(await screen.findByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: url });
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+
+    Object.assign(state.info!.data!, { prs: [association, OTHER_PR] });
+    if (stored) state.stored.conv_2 = [association, OTHER_PR];
+    rerender(<PullRequestPanel conversationId="conv_2" />);
+    expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+
+    state.info!.data = { ...state.info!.data!, prs: [association] };
+    if (stored) {
+      act(() => {
+        client.setQueryData(["session-pull-requests", "conv_2"], {
+          prs: [association],
+          synced: true,
+        });
+      });
+    }
+    rerender(<PullRequestPanel conversationId="conv_2" />);
+    expect(await screen.findByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_2", { poll: true, prUrl: url });
+  });
+
   it.each([
     ["ready", {}, true],
     ["draft", { is_draft: true }, false],
@@ -2430,6 +3074,7 @@ describe("session PR selection", () => {
         capabilities: { merging: true },
         tracking_available: true,
         prs: [
+          OTHER_PR,
           {
             url: pr.url,
             repository: "example/repo",
@@ -2444,6 +3089,51 @@ describe("session PR selection", () => {
       expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     },
   );
+
+  it("offers the PR's accounts to merge as from its compact row", () => {
+    const pr = {
+      ...state.info!.data!.pr!,
+      checks: { total: 1, passing: 1, failing: 0, pending: 0, runs: [] },
+      merge_state_status: "CLEAN",
+      head_sha: "head",
+    };
+    Object.assign(state.info!.data!, {
+      pr,
+      capabilities: {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: true,
+        merge_as_account: true,
+      },
+      accounts: ["work", "personal"].map((login) => ({
+        login,
+        active: login === "work",
+        state: "success",
+        host: "github.com",
+      })),
+      selected_account: "work",
+      tracking_available: true,
+      prs: [
+        OTHER_PR,
+        {
+          url: pr.url,
+          repository: "example/repo",
+          host: "github.com",
+          number: pr.number,
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    expect(
+      within(screen.getByRole("dialog")).getByRole("combobox", { name: "Merge as" }),
+    ).toHaveTextContent("work (active)");
+  });
 
   it.each(["failing", "pending", "cancelled", "skipped", "partial", "read-only"])(
     "keeps check details and uses mergeability for %s",
@@ -2473,6 +3163,7 @@ describe("session PR selection", () => {
         capabilities: { merging: true },
         tracking_available: true,
         prs: [
+          OTHER_PR,
           {
             url: pr.url,
             repository: "example/repo",
@@ -2485,7 +3176,7 @@ describe("session PR selection", () => {
       renderPanel();
       if (reason === "read-only") {
         const user = userEvent.setup();
-        await user.click(screen.getByRole("button", { name: /Actions for/ }));
+        await user.click(screen.getByRole("button", { name: "Actions for example/repo #6000" }));
         expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
         expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
         await user.keyboard("{Escape}");
@@ -2554,7 +3245,10 @@ describe("session PR selection", () => {
 
     expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: two,
+    });
     expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
     expect(screen.getByRole("button", { name: "All pull requests (2)" })).toBeVisible();
 
@@ -2573,7 +3267,10 @@ describe("session PR selection", () => {
     await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
     expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "example/one #42 — First repository" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: one,
+    });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_other" />);
@@ -2641,12 +3338,9 @@ describe("session PR selection", () => {
     expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
       /^To load the PR details, please reconnect the session’s host\.$/,
     );
-    await user.click(screen.getByRole("button", { name: "All pull requests (1)" }));
-    expect(screen.queryByRole("button", { name: "example/one #42 — Ship it" })).toBeNull();
-    await user.click(
-      screen.getByRole("button", { name: "Actions for example/two #7 (from branch)" }),
-    );
-    await user.click(screen.getByRole("menuitem", { name: "Unlink PR" }));
+    expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Unlink PR" }));
     expect(state.unlink.mutate).toHaveBeenLastCalledWith(two, expect.any(Object));
     const [, callbacks] = state.unlink.mutate.mock.calls[1];
     act(() => {
@@ -2657,9 +3351,14 @@ describe("session PR selection", () => {
     expect(screen.queryByTestId("github-stored-pr")).toBeNull();
   });
 
-  it.each(["error", "health", "sandbox"])(
-    "replaces cached checks/merge with stored metadata and recovers: %s",
-    async (reason) => {
+  it.each([
+    { reason: "error", prCount: 2 },
+    { reason: "health", prCount: 2 },
+    { reason: "sandbox", prCount: 2 },
+    { reason: "health", prCount: 1 },
+  ])(
+    "replaces cached checks/merge with stored metadata and recovers: $reason ($prCount PRs)",
+    async ({ reason, prCount }) => {
       const user = userEvent.setup();
       const url = "https://github.com/acme/app/pull/6000";
       const attached: PullRequestAssociation = {
@@ -2673,10 +3372,11 @@ describe("session PR selection", () => {
         is_draft: false,
         state_checked_at: Date.now() / 1000 - 60,
       };
+      const prs = prCount === 1 ? [attached] : [attached, OTHER_PR];
       Object.assign(state.info!.data!, {
         tracking_available: true,
         selected_pr_url: url,
-        prs: [attached],
+        prs,
         capabilities: { merging: true },
         pr: {
           ...state.info!.data!.pr!,
@@ -2686,10 +3386,16 @@ describe("session PR selection", () => {
           head_sha: "head",
         },
       });
-      state.stored.conv_1 = [attached];
+      state.stored.conv_1 = prs;
       const { rerender } = renderPanel();
-      await screen.findByRole("list", { name: "Pull requests" });
-      expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      if (prCount === 1) {
+        await screen.findByRole("tab", { name: "Summary" });
+        expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+      } else {
+        await screen.findByRole("list", { name: "Pull requests" });
+        expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      }
+      expect(screen.getByRole("region", { name: "Merge" })).toBeVisible();
       expect(screen.getByRole("button", { name: "66 passed" })).toBeVisible();
       const online = state.info!;
       expect(screen.queryByTestId("github-stored-pr")).toBeNull();
@@ -2700,16 +3406,24 @@ describe("session PR selection", () => {
       state.sandboxAsleep = reason === "sandbox";
       rerender(<PullRequestPanel conversationId="conv_1" />);
 
-      expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+      expect(screen.queryByRole("region", { name: "Merge" })).toBeNull();
       expect(screen.queryByRole("button", { name: "66 passed" })).toBeNull();
-      const status = screen.getByText(reason === "sandbox" ? "Sandbox asleep" : "Host offline");
-      await user.hover(status);
-      expect(await screen.findByRole("tooltip")).toHaveTextContent("Last sync time:");
-      await user.unhover(status);
-      await user.click(
-        screen.getByRole("button", { name: "acme/app #6000 — Attached while online" }),
-      );
+      if (prCount > 1) {
+        const status = screen.getAllByText(
+          reason === "sandbox" ? "Sandbox asleep" : "Host offline",
+        )[0];
+        await user.hover(status);
+        expect(await screen.findByRole("tooltip")).toHaveTextContent("Last sync time:");
+        await user.unhover(status);
+        await user.click(
+          screen.getByRole("button", { name: "acme/app #6000 — Attached while online" }),
+        );
+      } else {
+        expect(screen.getByRole("heading", { name: "Pull Requests" })).toBeVisible();
+        expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+      }
       const stored = screen.getByTestId("github-stored-pr");
+      expect(within(stored).getByRole("status")).toHaveTextContent("Last sync time:");
       expect(within(stored).getByRole("link", { name: /Attached while online/ })).toHaveAttribute(
         "href",
         url,
@@ -2722,8 +3436,16 @@ describe("session PR selection", () => {
       state.sandboxAsleep = false;
       rerender(<PullRequestPanel conversationId="conv_1" />);
       expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
-      await user.click(screen.getByRole("button", { name: "All pull requests (1)" }));
-      expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      if (prCount > 1) {
+        await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
+        expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      } else {
+        expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+        expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+      }
+      expect(screen.getByRole("region", { name: "Merge" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "66 passed" })).toBeVisible();
+      expect(screen.queryByTestId("github-stored-pr")).toBeNull();
       expect(screen.queryByText("Host offline")).toBeNull();
     },
   );
@@ -2748,9 +3470,8 @@ describe("session PR selection", () => {
       state.info = { ...state.info!, error: offline ? new RunnerOfflineError() : null };
       state.stored.conv_1 = [cached];
       const { client } = renderPanel();
-      const user = userEvent.setup();
-      await user.click(await screen.findByRole("button", { name: /^(acme\/app #6000)/ }));
-      expect(screen.getByRole("button", { name: "All pull requests (1)" })).toBeVisible();
+      await screen.findByRole("button", { name: "Unlink PR" });
+      expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
       act(() => {
         client.setQueryData(["session-pull-requests", "conv_1"], { prs: [], synced: true });
       });
@@ -2895,7 +3616,6 @@ describe("session PR selection", () => {
       ];
       renderPanel();
 
-      fireEvent.click(await screen.findByRole("button", { name: "acme/app #1 — Not a link" }));
       // The details remount once the selection settles on the stored PR.
       await waitFor(() =>
         expect(
@@ -2929,12 +3649,41 @@ describe("session PR selection", () => {
     ];
     renderPanel();
 
-    fireEvent.click(await screen.findByRole("button", { name: "acme/app #6000 — Sandbox PR" }));
     return waitFor(() =>
       expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
         /^To load the PR details, send a message to start the session’s sandbox\.$/,
       ),
     );
+  });
+
+  it("says the sandbox is starting while it wakes", async () => {
+    const url = "https://github.com/acme/app/pull/6001";
+    state.sandboxAsleep = true;
+    sandboxStarting = true;
+    try {
+      state.info = { isLoading: false, error: null, isFetching: false };
+      state.stored.conv_1 = [
+        {
+          url,
+          host: "github.com",
+          repository: "acme/app",
+          number: 6001,
+          title: "Waking PR",
+          relationship: "created",
+          state: "OPEN",
+          is_draft: false,
+          state_checked_at: null,
+        },
+      ];
+      renderPanel();
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("github-stored-pr")).getByRole("status"),
+        ).toHaveTextContent(/^Starting the session’s sandbox\. The PR details will load/),
+      );
+    } finally {
+      sandboxStarting = false;
+    }
   });
 
   it.each([undefined, null, "", "   "])(
@@ -2945,6 +3694,7 @@ describe("session PR selection", () => {
         tracking_available: true,
         selected_pr_url: url,
         prs: [
+          OTHER_PR,
           {
             url,
             host: "github.com",
@@ -2971,6 +3721,7 @@ describe("session PR selection", () => {
       tracking_available: true,
       selected_pr_url: url,
       prs: [
+        OTHER_PR,
         {
           url,
           host: "github.example.com",
@@ -3061,3 +3812,229 @@ it.each(["capabilities", "selected_pr_url"] as const)(
     expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
   },
 );
+
+it("saves a local comment as agent context and retains earlier revisions", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  const diffs = await vi.importActual<typeof DiffsModule>("@pierre/diffs");
+  state.parsedFiles = diffs.parsePatchFiles(
+    "diff --git a/hello.py b/hello.py\n--- a/hello.py\n+++ b/hello.py\n@@ -1 +1 @@\n-old\n+new\n",
+  )[0]!.files;
+  state.changes!.data!.data = [file("hello.py", "modified")];
+  state.diff = {
+    object: "session.github.pr_diff",
+    patch: "PATCH",
+    head_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+  };
+  const comments: Comment[] = [];
+  const requests: string[] = [];
+  let failMutation = false;
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    requests.push(`${init?.method ?? "GET"} ${url}`);
+    if (failMutation && (init?.method === "PATCH" || init?.method === "DELETE"))
+      return new Response(null, { status: 500, statusText: "Try again" });
+    if (url.endsWith("/comments") && init?.method === "POST") {
+      const comment = {
+        ...JSON.parse(String(init.body)),
+        id: "local-1",
+        conversation_id: "conv_1",
+        status: "draft",
+        created_by: null,
+        created_at: 0,
+        updated_at: 1,
+        anchor_content: null,
+      } as Comment;
+      comments.push(comment);
+      return new Response(JSON.stringify(comment));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "PATCH") {
+      Object.assign(comments[0]!, JSON.parse(String(init.body)));
+      return new Response(JSON.stringify(comments[0]));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "DELETE") {
+      comments.splice(0);
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify(comments));
+  });
+  onTestFinished(() => {
+    fetch.mockRestore();
+    clearLocalReviewContexts("conv_1");
+  });
+  const { client } = renderChanges();
+  const contexts = renderHook(() => usePendingLocalReviewContexts("conv_1"));
+  await userEvent.click(screen.getByRole("button", { name: "Start a new review conversation" }));
+  expect(
+    within(screen.getByRole("group", { name: "Comment destination" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["GitHub", "Agent"]);
+  expect(screen.getByRole("button", { name: "Agent" })).toHaveAttribute("aria-pressed", "true");
+  await userEvent.hover(screen.getByRole("button", { name: "Agent" }));
+  expect(await screen.findByRole("tooltip")).toHaveTextContent(
+    "Leave a comment for your agent in this session.",
+  );
+  await userEvent.unhover(screen.getByRole("button", { name: "Agent" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "New review comment" }),
+    "Handle empty input",
+  );
+  fireEvent.keyDown(screen.getByRole("textbox", { name: "New review comment" }), {
+    key: "Enter",
+    metaKey: true,
+  });
+  await screen.findByRole("region", { name: "Local review comment" });
+  expect(comments[0]?.anchor_metadata).toMatchObject({
+    side: "RIGHT",
+    line: 1,
+    head_sha: "a".repeat(40),
+  });
+  expect(requests.filter((request) => request.startsWith("POST"))).toEqual([
+    "POST /v1/sessions/conv_1/comments",
+  ]);
+  expect(contexts.result.current).toHaveLength(1);
+  expect(contexts.result.current[0]).toMatchObject({ id: "local-1", body: "Handle empty input" });
+  expect(requests.some((request) => request.includes("/comments/send"))).toBe(false);
+  const other = {
+    ...comments[0]!,
+    id: "other",
+    body: "Feedback on a different PR",
+    anchor_metadata: { ...comments[0]!.anchor_metadata!, pr_url: "https://example.com/pr/other" },
+  };
+  const addressed = { ...comments[0]!, id: "addressed", status: "addressed" as const };
+  await act(async () => {
+    client.setQueryData(["comments", "conv_1"], [...comments, other, addressed]);
+  });
+  expect(screen.queryByText("Feedback on a different PR")).not.toBeInTheDocument();
+  expect(screen.queryByText(/Add to chat/)).not.toBeInTheDocument();
+  state.diff = { ...state.diff!, head_sha: "c".repeat(40) };
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  expect(screen.queryByText(/Earlier revision/)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "More actions for hello.py" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Show earlier comments" }));
+  expect(screen.getAllByText(/Earlier revision/).length).toBeGreaterThan(0);
+  const card = within(screen.getAllByRole("region", { name: "Local review comment" })[0]!);
+  expect(
+    card.queryByRole("button", { name: /Attach to agent|Mark addressed|Reopen/ }),
+  ).not.toBeInTheDocument();
+  await userEvent.click(card.getByRole("button", { name: "Edit local comment" }));
+  await userEvent.clear(card.getByRole("textbox", { name: "Edit local comment" }));
+  await userEvent.type(
+    card.getByRole("textbox", { name: "Edit local comment" }),
+    "Validate empty input",
+  );
+  const originalAnchor = { ...comments[0]!.anchor_metadata! };
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(card.getByRole("textbox", { name: "Edit local comment" })).toHaveValue(
+    "Validate empty input",
+  );
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Handle empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(comments[0]?.body).toBe("Validate empty input"));
+  expect(contexts.result.current[0]?.body).toBe("Validate empty input");
+  expect(contexts.result.current[0]?.anchor_metadata).toEqual(originalAnchor);
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Validate empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),
+  );
+  expect(contexts.result.current).toHaveLength(0);
+});
+
+describe("a host that shows each pull request in a place of its own", () => {
+  function listPrs(prs: PullRequestAssociation[]) {
+    state.storesPrs = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: prs[0]!.url,
+      prs,
+    });
+  }
+  const FIRST: PullRequestAssociation = {
+    ...OTHER_PR,
+    url: "https://github.com/acme/app/pull/6000",
+    number: 6000,
+  };
+
+  it("hands a chosen pull request to the host and keeps showing the list", async () => {
+    const user = userEvent.setup();
+    listPrs([FIRST, OTHER_PR]);
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    await user.click(within(list).getByRole("button", { name: "acme/app #6001" }));
+    expect(onOpenPullRequest).toHaveBeenCalledWith(OTHER_PR.url);
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+  });
+
+  it("lists a session's only pull request rather than opening it in the list's place", async () => {
+    const user = userEvent.setup();
+    listPrs([FIRST]);
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    await user.click(within(list).getByRole("button", { name: "acme/app #6000" }));
+    expect(onOpenPullRequest).toHaveBeenCalledWith(FIRST.url);
+  });
+  it.each([
+    {
+      shape: "an older host that sends only the branch's pull request",
+      setUp: () => {
+        state.storesPrs = false;
+      },
+    },
+    {
+      shape: "a host whose list of linked pull requests isn't synced yet",
+      setUp: () => {
+        state.storesPrs = true;
+        state.stored.conv_1 = [];
+        state.unsynced.add("conv_1");
+        Object.assign(state.info!.data!, { tracking_available: true });
+      },
+    },
+  ])("lists the branch's pull request from $shape, and hands it over too", async ({ setUp }) => {
+    const user = userEvent.setup();
+    setUp();
+    const url = state.info!.data!.pr!.url;
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    await user.click(
+      within(list).getByRole("button", { name: /^example\.com\/acme\/app #6000 \(from branch\)/ }),
+    );
+    expect(onOpenPullRequest).toHaveBeenCalledWith(url);
+  });
+
+  it("titles an older host's list and keeps its Refresh", () => {
+    state.storesPrs = false;
+    renderPanel(false, true, vi.fn());
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Pull Requests" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
+  });
+
+  it("still shows the branch's pull request itself without a host to hand it to", () => {
+    state.storesPrs = false;
+    renderPanel(false, true);
+    expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+  });
+});

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import mimetypes
 import os
+import re
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
@@ -15,11 +17,13 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import RangeNotSatisfiable
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.entities.session_resources import (
@@ -28,6 +32,7 @@ from omnigent.entities.session_resources import (
     resolve_terminal_entry_by_resource_id,
     session_resource_view_to_dict,
     terminal_resource_id,
+    wait_for_terminal_entry_by_resource_id,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
@@ -48,6 +53,7 @@ from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
     NativeLaunchContext,
+    _antigravity_startup_agent_spec,
     _auto_create_qwen_terminal,
     _auto_create_repl_terminal,
     _claude_native_bridge_id_for_session,
@@ -57,6 +63,7 @@ from omnigent.runner.native import (
     _is_runner_owned_codex_terminal,
     _log_terminal_lookup_miss,
     _publish_tmux_target_for_bridge,
+    _readvertise_live_claude_tmux_target,
     _resolved_spec_workdir,
     _unwrap_resolved_spec,
 )
@@ -70,14 +77,42 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.slow_io import run_provider_cli, run_slow_io
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.shell_inspection import (
+    TERMINAL_SHELL_NOT_FOUND,
+    ShellInspection,
+    ShellInspector,
+)
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
+from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.entities.environment_filesystem import FilesystemEntry
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _logger = logging.getLogger("omnigent.runner.app")
+
+
+def _download_byte_range(header: str, size: int) -> tuple[int, int] | None:
+    """Resolve one byte range; ignore malformed and multipart ranges."""
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", header.strip(), re.IGNORECASE)
+    if match is None or not any(match.groups()):
+        return None
+    first, last = match.groups()
+    try:
+        start = int(first) if first else 0
+        end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    if first:
+        if last and end < start:
+            return None
+    else:
+        start, end = max(0, size - end), size - 1
+    if start >= size or start > end:
+        raise RangeNotSatisfiable(size)
+    return start, min(end + 1, size)
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -469,13 +504,6 @@ def register_resource_routes(
                     "and could not be closed."
                 )
 
-            elif terminal_name == "antigravity":
-                _ensure_is_owned = _is_runner_owned_antigravity_terminal
-                _ensure_conflict = (
-                    "Existing antigravity terminal is not a runner-owned agy TUI "
-                    "and could not be closed."
-                )
-
             elif terminal_name in ("pi", "opencode"):
                 # pi/opencode resolve the spec unwrapped — a resolution error
                 # surfaces as a terminal-start error (the resolver does not
@@ -490,6 +518,7 @@ def register_resource_routes(
                 _ensure_build = _spec_ensure_build
 
             elif terminal_name in (
+                "antigravity",
                 "cursor",
                 "kimi",
                 "devin",
@@ -502,11 +531,22 @@ def register_resource_routes(
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
-                    return dataclasses.replace(
-                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
+                    spec = (
+                        await _antigravity_startup_agent_spec(
+                            session_id, _resolve_session_agent_spec_or_none
+                        )
+                        if terminal_name == "antigravity"
+                        else await _resolve_session_agent_spec_or_none(session_id)
                     )
+                    return dataclasses.replace(ctx, agent_spec=spec)
 
                 _ensure_build = _spec_or_none_ensure_build
+                if terminal_name == "antigravity":
+                    _ensure_is_owned = _is_runner_owned_antigravity_terminal
+                    _ensure_conflict = (
+                        "Existing antigravity terminal is not a runner-owned agy TUI "
+                        "and could not be closed."
+                    )
 
             _ensure_result = await _ensure_native_terminal(
                 terminal_name,
@@ -642,6 +682,44 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource_view),
         )
 
+    async def _readvertise_live_claude_pane(
+        conv_id: str, instance: TerminalInstance, terminal_registry: TerminalRegistry
+    ) -> None:
+        """Restore a live Claude pane's missing or stale ``tmux.json`` before a turn.
+
+        The relay binding already knows the bridge dir; the session labels
+        (a server round trip) are the fallback. Best-effort.
+        """
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+        binding = _session_comment_relays.get(conv_id)
+        if binding is not None:
+            bridge_dir = binding.bridge_dir
+        else:
+            try:
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.warning(
+                    "could not resolve the claude bridge dir for conv=%s; skipping re-advertise",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+                return
+            bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await asyncio.to_thread(
+            _readvertise_live_claude_tmux_target,
+            bridge_dir,
+            instance,
+            terminal_registry=terminal_registry,
+            session_id=conv_id,
+        )
+
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
@@ -673,6 +751,9 @@ def register_resource_routes(
             return
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
+            if terminal_name == "claude":
+                # A live pane still needs its advertisement for message delivery.
+                await _readvertise_live_claude_pane(conv_id, instance, terminal_registry)
             if terminal_name != "codex":
                 return
             terminal_id = terminal_resource_id("codex", "main")
@@ -776,6 +857,36 @@ def register_resource_routes(
             status_code=200,
             content=session_resource_view_to_dict(resource),
         )
+
+    shell_inspector = ShellInspector()
+
+    @app.get("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell")
+    async def get_session_terminal_shell(session_id: str, terminal_id: str) -> JSONResponse:
+        """Whether one of this session's terminals runs anything besides its login shell.
+
+        Looked up under this session only. A missing terminal, another session's and a stopped
+        one all answer the same 404, so none can be told apart from the others.
+
+        :param session_id: Owning session id.
+        :param terminal_id: Terminal resource id, e.g. ``"terminal_bash_s1"``.
+        :returns: ``{"state", "foreground", "background_jobs"}``; see :class:`ShellInspection`.
+        """
+        entry = resolve_terminal_entry_by_resource_id(session_id, terminal_id, terminal_registry)
+        if entry is None or not entry.instance.running:
+            return JSONResponse(status_code=404, content=TERMINAL_SHELL_NOT_FOUND)
+        instance = entry.instance
+
+        async def read_live_shell() -> ShellInspection | None:
+            # Live tmux state, not the optimistic flag: a stopped terminal is a miss too.
+            if not await instance.is_alive():
+                return None
+            return await instance.inspect_shell()
+
+        # Concurrent requests share one liveness check and one read, both inside the budget.
+        inspection = await shell_inspector.inspect(str(instance.socket_path), read_live_shell)
+        if inspection is None:
+            return JSONResponse(status_code=404, content=TERMINAL_SHELL_NOT_FOUND)
+        return JSONResponse(status_code=200, content=inspection.to_dict())
 
     @app.get("/v1/sessions/{session_id}/sign-in-link")
     async def get_session_sign_in_link(session_id: str) -> JSONResponse:
@@ -962,6 +1073,7 @@ def register_resource_routes(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        await_launch: bool = Query(default=False),
     ) -> None:
         await websocket.accept()
         entry = resolve_terminal_entry_by_resource_id(
@@ -969,6 +1081,12 @@ def register_resource_routes(
             terminal_id,
             terminal_registry,
         )
+        if entry is None and await_launch:
+            entry = await wait_for_terminal_entry_by_resource_id(
+                session_id,
+                terminal_id,
+                terminal_registry,
+            )
         terminal_role = (
             resource_registry.terminal_resource_role(session_id, terminal_id)
             if resource_registry is not None
@@ -1198,28 +1316,51 @@ def register_resource_routes(
             },
         )
 
+    async def _changes_registry(
+        session_id: str, environment_id: str, agent_spec: AgentSpec | None
+    ) -> FilesystemRegistry | None:
+        from omnigent.runtime.filesystem_registry import MultiRepositoryFilesystemRegistry
+
+        if environment_id != DEFAULT_ENVIRONMENT_ID:
+            try:
+                resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.NOT_FOUND) from exc
+        registry = await _resolve_session_fs_registry(session_id)
+        if isinstance(registry, MultiRepositoryFilesystemRegistry):
+            return registry.with_git_runner(
+                lambda argv, cwd, timeout: resource_registry.resolve_environment(
+                    session_id, environment_id, agent_spec
+                ).run_git(argv, cwd, timeout)
+            )
+        return registry
+
+    # A browser abandons a slow listing but its git status keeps running, so
+    # refetches would pile up on the slow-IO pool; concurrent ones share a scan.
+    changes_scans: FreshCallCoalescer[tuple[str, str], list[dict[str, Any]]] = FreshCallCoalescer()
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
-        environment_id: str,  # noqa: ARG001
+        environment_id: str,
     ) -> JSONResponse:
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
-        await _require_os_env(session_id)
+        agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
-        try:
+
+        async def scan() -> list[dict[str, Any]]:
+            # Resolved when the scan starts, so a multi-repository Git budget
+            # does not run down while the request waits its turn.
+            session_registry = await _changes_registry(session_id, environment_id, agent_spec)
+            if session_registry is None:
+                return []
             # git status can take seconds; keep it off the loop (relay probes)
             # and off the default pool (native message delivery).
-            raw_changes = (
-                await run_slow_io(
-                    session_registry.list_changed_files,
-                    session_id,
-                    limit=10_000,
-                )
-                if session_registry is not None
-                else []
-            )
+            return await run_slow_io(session_registry.list_changed_files, session_id, limit=10_000)
+
+        try:
+            raw_changes = await changes_scans.run((session_id, environment_id), scan)
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -1235,6 +1376,10 @@ def register_resource_routes(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                "untracked_lines": rec.get("untracked_lines"),
+                **(
+                    {"repository_root": rec["repository_root"]} if "repository_root" in rec else {}
+                ),
             }
             for rec in raw_changes
         ]
@@ -1254,7 +1399,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
 
         from omnigent.entities.environment_filesystem import InvalidPath
         from omnigent.runner.environment_filesystem import _validate_path
@@ -1292,6 +1437,11 @@ def register_resource_routes(
                 if session_registry is not None
                 else None
             )
+            before = (
+                await run_slow_io(session_registry.get_baseline, relative_path)
+                if session_registry is not None and record is not None
+                else None
+            )
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -1312,12 +1462,6 @@ def register_resource_routes(
             )
         is_deleted = record.get("status") == "deleted"
 
-        before: str | None = (
-            await run_slow_io(session_registry.get_baseline, relative_path)
-            if session_registry is not None
-            else None
-        )
-
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
         after: str | None = None
@@ -1332,8 +1476,13 @@ def register_resource_routes(
             content={
                 "object": "session.environment.filesystem.file_diff",
                 "path": relative_path,
-                "before": before,
+                "before": None if record.get("status") == "created" and before == "" else before,
                 "after": after,
+                **(
+                    {"baseline_state": "unknown"}
+                    if before is None and record.get("status") != "created"
+                    else {}
+                ),
             },
         )
 
@@ -1374,17 +1523,43 @@ def register_resource_routes(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(status_code=200, content=result)
 
+    @app.get("/v1/sessions/{session_id}/resources/repository-branches")
+    async def get_repository_branches(session_id: str, repositories: str) -> JSONResponse:
+        """Inspect server-provided repository targets in the existing workspace."""
+        from omnigent.workspace_fs import WorkspaceReaderError, read_repository_branches
+
+        root = await _github_workspace_root(session_id)
+        try:
+            targets = json.loads(repositories)
+            if not isinstance(targets, list) or any(
+                not isinstance(target, dict)
+                or not isinstance(target.get("url"), str)
+                or not isinstance(target.get("path"), str)
+                for target in targets
+            ):
+                raise ValueError("Invalid repository targets")
+            result = await run_slow_io(read_repository_branches, Path(root), targets)
+        except WorkspaceReaderError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid repository targets") from exc
+        return JSONResponse(content=result)
+
     @app.get("/v1/sessions/{session_id}/resources/github")
     async def read_github_info(
         session_id: str,
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        allow_cached: bool = False,
+        account_rights: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
-            "pr_info",
+            "cached_pr_info",
             pr_url=pr_url,
+            allow_cached=allow_cached,
+            account_rights=account_rights,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )
@@ -1395,10 +1570,31 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_changed_files",
+            head_sha=head_sha,
+            base_sha=base_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/commits")
+    async def read_github_commits(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        head_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_commits",
+            head_sha=head_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1410,10 +1606,50 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_diff",
+            head_sha=head_sha,
+            base_sha=base_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/commit-diff")
+    async def read_github_commit_diff(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        commit_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_commit_diff",
+            commit_sha=commit_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/compare-diff")
+    async def read_github_compare_diff(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_compare_diff",
+            head_sha=head_sha,
+            from_sha=from_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1517,6 +1753,21 @@ def register_resource_routes(
             expected_head=body.get("expected_head"),
         )
 
+    @app.post("/v1/sessions/{session_id}/resources/github/merge-as")
+    async def merge_github_pr_as_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "merge_pr_as",
+            pr_url=body["pr_url"],
+            **_server_tracking_fields(body),
+            merge_method=body.get("merge_method"),
+            expected_head=body.get("expected_head"),
+            account=body.get("account"),
+        )
+
     @app.post("/v1/sessions/{session_id}/resources/github/disable-auto-merge")
     async def disable_github_auto_merge_route(session_id: str, request: Request) -> JSONResponse:
         body = await request.json()
@@ -1549,6 +1800,80 @@ def register_resource_routes(
             **_server_tracking_fields(body),
             add=body.get("add", []),
             remove=body.get("remove", []),
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/review-threads")
+    async def read_review_threads_route(
+        session_id: str,
+        pr_url: str,
+        after: str = "",
+        head_sha: str = "",
+        base_sha: str = "",
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        account_rights: bool = False,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_review_threads",
+            pr_url=pr_url,
+            after=after,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            account_rights=account_rights,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments")
+    async def read_review_thread_comments_route(
+        session_id: str,
+        thread_id: str,
+        pr_url: str,
+        after: str,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        account_rights: bool = False,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_review_thread_comments",
+            pr_url=pr_url,
+            thread_id=thread_id,
+            after=after,
+            account_rights=account_rights,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/review-threads")
+    async def create_review_thread_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "create_pr_review_thread",
+            pr_url=body["pr_url"],
+            body=body.get("body"),
+            anchor=body.get("anchor"),
+            **_server_tracking_fields(body),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies")
+    async def reply_to_review_thread_route(
+        session_id: str, thread_id: str, request: Request
+    ) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "reply_to_pr_review_thread",
+            thread_id=thread_id,
+            pr_url=body["pr_url"],
+            body=body.get("body"),
+            **_server_tracking_fields(body),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/comments")
@@ -1604,6 +1929,7 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,
         relative_path: str,
+        request: Request,
         limit: int = Query(default=20, ge=1, le=1000),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
@@ -1621,6 +1947,9 @@ def register_resource_routes(
                 session_id,
                 environment_id,
                 relative_path,
+                range_header=request.headers.get("range")
+                if "if-range" not in request.headers
+                else None,
                 follow_outward_links=follow_outward_links,
             )
         return await _fs_list_or_read(
@@ -1632,6 +1961,44 @@ def register_resource_routes(
             before=before,
             order=order,
             follow_outward_links=follow_outward_links,
+        )
+
+    async def _read_editor_text(fs: CallerProcessFilesystem, relative_path: str) -> str | None:
+        """Return *relative_path*'s complete UTF-8 text, or ``None`` when it has none."""
+        try:
+            existing = await fs.read(relative_path, limit=None)
+        except Exception:  # noqa: BLE001
+            return None  # a new or unreadable file has no text to keep
+        if existing.encoding != "utf-8" or existing.truncated:
+            return None
+        return existing.data.decode("utf-8")
+
+    def _forget_other_environment_original(
+        relative_path: str, session_id: str, environment_id: str
+    ) -> None:
+        """Make the original unknown before a non-default environment changes the path."""
+        if filesystem_registry is not None and environment_id != DEFAULT_ENVIRONMENT_ID:
+            # Another environment may hold a different file at this relative path.
+            filesystem_registry.forget_original(relative_path, session_id=session_id)
+
+    async def _seed_editor_original(
+        fs: CallerProcessFilesystem, relative_path: str, session_id: str, environment_id: str
+    ) -> None:
+        """Seed the original an editor save replaces, when it is complete text."""
+        if filesystem_registry is None:
+            return
+        _forget_other_environment_original(relative_path, session_id, environment_id)
+        original = await _read_editor_text(fs, relative_path)
+        filesystem_registry.seed_snapshot(relative_path, original, session_id=session_id)
+
+    async def _record_editor_change(
+        fs: CallerProcessFilesystem, relative_path: str, operation: str, session_id: str
+    ) -> None:
+        """Record an editor save, passing its text when it may restore the original."""
+        if filesystem_registry is None:
+            return
+        await filesystem_registry.record_tracked_change(
+            relative_path, operation, session_id, lambda: _read_editor_text(fs, relative_path)
         )
 
     @app.put(
@@ -1658,23 +2025,13 @@ def register_resource_routes(
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
         content_bytes = content_str.encode(encoding)
-        try:
-            existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
-                    relative_path,
-                    existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id,
-                )
-        except Exception:  # noqa: BLE001
-            pass
+        await _seed_editor_original(fs, relative_path, session_id, environment_id)
         result = await fs.write(
             relative_path,
             content_bytes,
             create_parents=create_parents,
         )
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        await _record_editor_change(fs, relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -1707,16 +2064,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        try:
-            existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
-                    relative_path,
-                    existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id,
-                )
-        except Exception:  # noqa: BLE001
-            pass
+        await _seed_editor_original(fs, relative_path, session_id, environment_id)
         body = await request.json()
         edit_req = TextEditRequest(
             old_text=body.get("old_text"),
@@ -1724,8 +2072,7 @@ def register_resource_routes(
             replace_all=body.get("replace_all", False),
         )
         result = await fs.edit_text(relative_path, edit_req)
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        await _record_editor_change(fs, relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -1758,6 +2105,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
+        _forget_other_environment_original(relative_path, session_id, environment_id)
         result = await fs.delete(relative_path, recursive=recursive)
         if filesystem_registry is not None and result.type in ("file", "symlink"):
             filesystem_registry.record_change(relative_path, "deleted", session_id)
@@ -1779,9 +2127,10 @@ def register_resource_routes(
         environment_id: str,
         path: str,
         *,
+        range_header: str | None = None,
         follow_outward_links: bool = False,
-    ) -> StreamingResponse:
-        """Serve a file's complete bytes as an attachment.
+    ) -> Response:
+        """Serve complete or ranged file bytes from the authorized descriptor.
 
         The read path inlines content in a JSON envelope, so it caps at
         ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
@@ -1791,6 +2140,7 @@ def register_resource_routes(
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
+        :param range_header: An optional HTTP byte range for media seeking.
         :param follow_outward_links: Admit a workspace symlink whose target
             lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``.
@@ -1805,12 +2155,25 @@ def register_resource_routes(
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         fobj, resolved, size = await fs.open_download(path)
+        headers = {"Accept-Ranges": "bytes"}
+        try:
+            byte_range = _download_byte_range(range_header, size) if range_header else None
+        except RangeNotSatisfiable:
+            fobj.close()
+            headers["Content-Range"] = f"bytes */{size}"
+            return Response(status_code=416, headers=headers)
+        start, end = byte_range if byte_range is not None else (0, size)
+        length = end - start
+        if byte_range is not None:
+            headers["Content-Range"] = f"bytes {start}-{end - 1}/{size}"
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
             # underneath the download cannot overrun the response.
-            remaining = size
+            remaining = length
             try:
+                if start:
+                    await asyncio.to_thread(fobj.seek, start)
                 while remaining > 0:
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
@@ -1821,8 +2184,8 @@ def register_resource_routes(
                             "Download of %s aborted: file shrank while streaming "
                             "(sent %d of %d announced bytes)",
                             resolved.name,
-                            size - remaining,
-                            size,
+                            length - remaining,
+                            length,
                         )
                         raise RuntimeError(f"{resolved.name} shrank during download")
                     remaining -= len(chunk)
@@ -1840,9 +2203,11 @@ def register_resource_routes(
         )
         return StreamingResponse(
             _chunks(),
+            status_code=206 if byte_range is not None else 200,
             media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
             headers={
-                "Content-Length": str(size),
+                **headers,
+                "Content-Length": str(length),
                 "Content-Disposition": disposition,
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",

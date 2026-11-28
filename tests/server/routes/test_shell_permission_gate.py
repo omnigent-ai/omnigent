@@ -59,6 +59,11 @@ from omnigent.server.auth import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes.sessions import create_sessions_router
+from tests._helpers.connect_stream import connect_frame
+from tests.host.test_workspace_methods import (
+    _PULL_REQUEST_OWNER_METHODS,
+    _PULL_REQUEST_OWNER_STREAMS,
+)
 
 # The server route is mounted under /v1 and proxies to the runner at the
 # same path, so the client URL and the recorded runner path are identical.
@@ -301,7 +306,15 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
     application = FastAPI()
-    application.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_CONTENT_SEARCH}))
+    application.state.feature_flags = FeatureFlags(
+        frozenset(
+            {
+                Feature.WORKSPACE_CONTENT_SEARCH,
+                Feature.WORKSPACE_DIRECT_ACCESS,
+                Feature.WORKSPACE_API_SERVER_ACCESS,
+            }
+        )
+    )
 
     @application.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -467,6 +480,7 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", [None, "workspace"])
 @pytest.mark.parametrize(
     "caller,url,marked",
     [
@@ -500,14 +514,26 @@ async def test_filesystem_marks_reach_scope_for_the_owner_only(
     caller: str,
     url: str,
     marked: bool,
+    scope: str | None,
 ) -> None:
     """Only effective owners receive reach scope for relative reads, including
     ownership inherited through a parent; an absolute path needs no mark."""
-    resp = await client.get(url, headers={"X-Forwarded-Email": caller})
+    resp = await client.get(
+        url,
+        headers={"X-Forwarded-Email": caller},
+        params={"scope": scope} if scope is not None else None,
+    )
 
+    if scope == "workspace" and url == _FS_ABSOLUTE:
+        assert resp.status_code == 400, resp.text
+        assert runner_client.gets == []
+        return
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
-    assert ("scope=reach" in runner_client.gets[0]) is marked
+    assert ("scope=reach" in runner_client.gets[0]) is (marked and scope is None)
+    assert resp.headers.get("X-Omnigent-File-Scope") == scope
+    if scope == "workspace":
+        assert "scope=workspace" in runner_client.gets[0]
 
 
 @pytest.mark.asyncio
@@ -953,6 +979,48 @@ _REVIEWER = {"login": "octocat", "kind": "user"}
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize("caller", ["owner@example.com", "viewer@example.com"])
+@pytest.mark.parametrize(
+    "resource,code_context,after",
+    [
+        ("", False, None),
+        ("/review-threads", True, None),
+        ("/review-threads", True, "cursor"),
+        ("/review-threads/thread-1/comments", False, "cursor"),
+    ],
+)
+async def test_review_conversation_reads_follow_file_sharing(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    resource: str,
+    code_context: bool,
+    after: str | None,
+    session: str,
+    caller: str,
+) -> None:
+    path = f"/v1/sessions/{session}/resources/github{resource}"
+    params = {"pr_url": _LABELS_PR_URL}
+    if after:
+        params["after"] = after
+        if resource == "/review-threads":
+            params.update(head_sha="a" * 40, base_sha="b" * 40)
+    response = await client.get(path, params=params, headers={"X-Forwarded-Email": caller})
+    if code_context and session == "conv_share" and caller == "viewer@example.com":
+        assert response.status_code == 403, response.text
+        assert runner_client.gets == []
+        return
+    assert response.status_code == 200, response.text
+    assert runner_client.gets == [path]
+    forwarded = (
+        {**params, "after": "", "head_sha": "", "base_sha": ""}
+        if code_context and not after
+        else params
+    )
+    assert runner_client.get_params == [forwarded]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path, added",
     [(_LABELS_PATH, "bug"), (_REVIEWERS_PATH, _REVIEWER)],
@@ -960,8 +1028,9 @@ _REVIEWER = {"login": "octocat", "kind": "user"}
 )
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 async def test_pr_edit_routes_require_edit(
     client: httpx.AsyncClient,
@@ -971,7 +1040,7 @@ async def test_pr_edit_routes_require_edit(
     path: str,
     added: object,
 ) -> None:
-    """PR label and reviewer routes act as the host's account, so viewers are refused."""
+    """PR label and reviewer routes act as the host's account, so only the owner reaches it."""
     headers = {"X-Forwarded-Email": caller}
     listed = await client.get(path, params={"pr_url": _LABELS_PR_URL}, headers=headers)
     edited = await client.post(
@@ -995,7 +1064,10 @@ _MERGE_PATH = "/v1/sessions/conv_share/resources/github/merge"
 _MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
 _DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
 _MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
+_MERGE_AS_PATH = "/v1/sessions/conv_share/resources/github/merge-as"
+_MERGE_AS_BODY = {**_MERGE_BODY, "account": "personal"}
 _COMMENTS_PATH = "/v1/sessions/conv_share/resources/github/comments"
+_REVIEW_REPLY_PATH = "/v1/sessions/conv_share/resources/github/review-threads/thread-1/replies"
 _DETAILS_PATH = "/v1/sessions/conv_share/resources/github/details"
 _ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
 
@@ -1003,8 +1075,9 @@ _ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 async def test_pr_merge_routes_require_edit(
     client: httpx.AsyncClient,
@@ -1012,27 +1085,30 @@ async def test_pr_merge_routes_require_edit(
     caller: str,
     expected: int,
 ) -> None:
-    """Merging acts with the host's account, so viewers are refused before the runner."""
+    """Merging acts with the host's account, so only the owner reaches the runner."""
     headers = {"X-Forwarded-Email": caller}
     options = await client.get(
         _MERGE_OPTIONS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers
     )
     merged = await client.post(_MERGE_PATH, json=_MERGE_BODY, headers=headers)
+    merged_as = await client.post(_MERGE_AS_PATH, json=_MERGE_AS_BODY, headers=headers)
     disabled = await client.post(
         _DISABLE_AUTO_MERGE_PATH, json={"pr_url": _LABELS_PR_URL}, headers=headers
     )
 
-    assert (options.status_code, merged.status_code, disabled.status_code) == (
-        expected,
-        expected,
-        expected,
-    ), merged.text
+    assert (
+        options.status_code,
+        merged.status_code,
+        merged_as.status_code,
+        disabled.status_code,
+    ) == (expected, expected, expected, expected), merged.text
     if expected == 403:
         assert runner_client.gets == runner_client.posts == []
         return
     assert runner_client.gets == [_MERGE_OPTIONS_PATH]
     assert runner_client.posts == [
         (_MERGE_PATH, _MERGE_BODY),
+        (_MERGE_AS_PATH, _MERGE_AS_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ]
 
@@ -1040,20 +1116,30 @@ async def test_pr_merge_routes_require_edit(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
-@pytest.mark.parametrize("comment", [False, True], ids=["details", "comment"])
+@pytest.mark.parametrize("resource", ["details", "comment", "reply", "thread"])
 async def test_pr_details_route_requires_edit(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
     caller: str,
     expected: int,
-    comment: bool,
+    resource: str,
 ) -> None:
-    """Writing PR text acts as the host's account, so viewers are refused."""
-    path = _COMMENTS_PATH if comment else _DETAILS_PATH
+    """Writing PR text acts as the host's account, so only the owner may."""
+    comment = resource != "details"
+    path = {
+        "details": _DETAILS_PATH,
+        "comment": _COMMENTS_PATH,
+        "reply": _REVIEW_REPLY_PATH,
+        "thread": _REVIEW_REPLY_PATH.removesuffix("/thread-1/replies"),
+    }[resource]
     fields = {"body": "Hello"} if comment else {"title": "Renamed"}
+    if resource == "thread":
+        fields["anchor"] = {"line": 2}
+    forwarded = {**fields, **({"thread_id": "thread-1"} if resource == "reply" else {})}
     edited = await client.post(
         path,
         json={"pr_url": _LABELS_PR_URL, **fields, "session_id": "untrusted"},
@@ -1062,7 +1148,7 @@ async def test_pr_details_route_requires_edit(
 
     assert edited.status_code == expected, edited.text
     expected_posts = [
-        (path, {"pr_url": _LABELS_PR_URL, **({"body": None} if not comment else {}), **fields})
+        (path, {"pr_url": _LABELS_PR_URL, **({"body": None} if not comment else {}), **forwarded})
     ]
     assert runner_client.posts == ([] if expected == 403 else expected_posts)
 
@@ -1091,10 +1177,21 @@ async def test_pr_attachment_upload_refuses_viewers_before_the_runner(
         (_REVIEWERS_PATH, {"pr_url": _LABELS_PR_URL, "add": [_REVIEWER]}),
         (_DETAILS_PATH, {"pr_url": _LABELS_PR_URL, "title": "Renamed"}),
         (_COMMENTS_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
+        (_REVIEW_REPLY_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
         (_MERGE_PATH, _MERGE_BODY),
+        (_MERGE_AS_PATH, _MERGE_AS_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ],
-    ids=["labels", "reviewers", "details", "comments", "merge", "disable-auto-merge"],
+    ids=[
+        "labels",
+        "reviewers",
+        "details",
+        "comments",
+        "reply",
+        "merge",
+        "merge-as",
+        "disable-auto-merge",
+    ],
 )
 async def test_pr_edit_requires_a_json_body(
     client: httpx.AsyncClient,
@@ -1106,8 +1203,332 @@ async def test_pr_edit_requires_a_json_body(
     resp = await client.post(
         path,
         content=json.dumps(body),
-        headers={"X-Forwarded-Email": "owner@example.com", "Content-Type": "text/plain"},
+        headers={"X-Forwarded-Email": "real-owner@example.com", "Content-Type": "text/plain"},
     )
 
     assert resp.status_code == 415, resp.text
     assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user", "status"),
+    [
+        ("viewer@example.com", 403),
+        ("owner@example.com", 403),  # an edit collaborator, despite the name
+        ("manager@example.com", 403),
+        # The owner passes the gate; this harness has no connected host to offer.
+        ("real-owner@example.com", 404),
+    ],
+)
+async def test_workspace_direct_access_is_owner_only(
+    client: httpx.AsyncClient, user: str, status: int
+) -> None:
+    """A direct-access token reads the workspace with no per-read server check,
+    so only the session owner may get one."""
+    resp = await client.post(
+        "/v1/sessions/conv_share/workspace/direct-access", headers={"X-Forwarded-Email": user}
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 404:
+        assert "host is not connected" in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("session", "passes"), [("conv_share", False), ("conv_open", True)])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+        "SearchFiles",
+        "SearchText",
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+        "ResolveRepositoryContext",
+    ],
+)
+async def test_workspace_api_follows_the_file_read_gate(
+    client: httpx.AsyncClient, session: str, passes: bool, method: str
+) -> None:
+    """A view-only collaborator reads the workspace API only where files are shared."""
+    streaming = method in ("ReadFile", "SearchText", "ReadBaseFile")
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers={
+            "X-Forwarded-Email": "viewer@example.com",
+            "Content-Type": "application/connect+json" if streaming else "application/json",
+        },
+        # A stream takes one enveloped Connect message; a unary call, the bare message.
+        content=b"\x00\x00\x00\x00\x02{}" if streaming else b"{}",
+    )
+
+    if not passes:
+        assert resp.status_code == 403, resp.text
+        return
+    # Past the gate; this harness has no host, so the call ends with that error. A
+    # stream reports it in its body, a unary call as its status.
+    assert resp.status_code == (200 if streaming else 503), resp.text
+    assert b"unavailable" in resp.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("session", "passes"), [("conv_share", False), ("conv_open", True)])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+    ],
+)
+async def test_workspace_api_gates_a_repository_folder_like_the_workspace(
+    client: httpx.AsyncClient, session: str, passes: bool, method: str
+) -> None:
+    """Naming a folder inside the workspace needs the same file read gate, and no other."""
+    body = b'{"repository": ".worktrees/feature"}'
+    streaming = method == "ReadBaseFile"
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers={
+            "X-Forwarded-Email": "viewer@example.com",
+            "Content-Type": "application/connect+json" if streaming else "application/json",
+        },
+        content=connect_frame(body) if streaming else body,
+    )
+
+    if not passes:
+        assert resp.status_code == 403, resp.text
+        return
+    assert resp.status_code == (200 if streaming else 503), resp.text
+    assert b"unavailable" in resp.content
+
+
+_PR_BROWSE_READS = [
+    "ListPullRequestFiles",
+    "GetPullRequestDiff",
+    "ListPullRequestCommits",
+    "GetCommitDiff",
+    "ComparePullRequestRange",
+    "ListReviewThreads",
+]
+
+
+# Each valid for the server, so a call past the gate reaches the missing host.
+_PR_OWNER_METHODS = {
+    "ListLabels": {},
+    "ListReviewerCandidates": {},
+    "GetMergeOptions": {},
+    "CreateComment": {"body": "Looks good"},
+    "CreateReviewThread": {"body": "Why this?"},
+    "ReplyToReviewThread": {"threadId": "thread_1", "body": "Done"},
+    "UpdatePullRequestDetails": {"title": "A clearer title"},
+    "UpdateLabels": {"add": ["bug"]},
+    "UpdateReviewers": {"add": [{"login": "octocat", "kind": "user"}]},
+    "SetPullRequestAccount": {"account": "octocat"},
+    "MergePullRequest": {"mergeMethod": "squash", "expectedHeadOid": "a" * 40},
+    "MergePullRequestAsAccount": {
+        "mergeMethod": "squash",
+        "expectedHeadOid": "a" * 40,
+        "account": "octocat",
+    },
+    "DisableAutoMerge": {},
+    "SetPullRequestState": {"state": "closed"},
+    "SetPullRequestDraft": {"draft": True},
+    # A batch names its pull requests in its list, not in ``prUrl``.
+    "EnableAutoMerge": {
+        "pullRequests": [
+            {
+                "prUrl": "https://github.com/example/app/pull/7",
+                "mergeMethod": "squash",
+                "expectedHeadOid": "a" * 40,
+            }
+        ]
+    },
+    "GetPendingReview": {},
+    "StartPendingReview": {"commitOid": "a" * 40},
+    "AddPendingReviewComment": {
+        "body": "Why?",
+        "inReplyToThreadId": "PRRT_1",
+        "pendingReviewId": "PRR_1",
+        "expectedHeadOid": "a" * 40,
+    },
+    "UpdatePendingReviewComment": {
+        "commentNodeId": "PRRC_1",
+        "body": "Better",
+        "expectedBodySha256": "c" * 64,
+        "pendingReviewId": "PRR_1",
+    },
+    "DeletePendingReviewComment": {"commentNodeId": "PRRC_1", "pendingReviewId": "PRR_1"},
+    "SubmitPendingReview": {
+        "event": "APPROVE",
+        "commitOid": "a" * 40,
+        "pendingReviewId": "PRR_1",
+    },
+    "DiscardPendingReview": {"pendingReviewId": "PRR_1"},
+    "SubmitReview": {"event": "COMMENT", "body": "Nit", "commitOid": "a" * 40},
+    "SubmitReviewVerdict": {"event": "APPROVE", "commitOid": "a" * 40},
+    "SetReviewThreadResolved": {"threadId": "PRRT_1", "resolved": True},
+    "EditComment": {
+        "kind": "issue",
+        "commentId": "5",
+        "body": "Mine",
+        "expectedBodySha256": "c" * 64,
+    },
+    "DeleteComment": {"kind": "review", "commentId": "5"},
+    "AddReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    "RemoveReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    # JSON carries the bytes base64-encoded.
+    "UploadAttachment": {"name": "shot.png", "content": "iVBORw0KGgo="},
+    "GetMergeQueue": {},
+    "EnqueuePullRequest": {"expectedHeadOid": "a" * 40},
+    "DequeuePullRequest": {},
+    "GetPullRequestStack": {},
+    "GetPullRequestNativeStack": {},
+    "SearchReviewers": {"text": "al", "pageSize": 5},
+    "SearchCompletions": {"kind": "COMPLETION_KIND_MENTION", "text": "al"},
+    "LookupPullRequest": {},
+    # Names its pull requests in a list of URLs, not in ``prUrl``.
+    "GetPullRequestListStats": {"prUrls": ["https://github.com/example/app/pull/8"]},
+    # Names no pull request: it finds them by the workspace's branch.
+    "ListBranchPullRequests": {"branch": "main"},
+    "ReadPullRequestImage": {
+        "imageUrl": "https://github.com/user-attachments/assets/0f1e2d3c-aaaa"
+    },
+}
+
+
+def test_every_owner_method_has_a_gate_case() -> None:
+    assert set(_PR_OWNER_METHODS) == _PULL_REQUEST_OWNER_METHODS
+
+
+def _pull_request_call_passes(method: str, caller: str | None, session: str) -> int:
+    """The status a pull request call gets: 503 past the gate (no host here), else a refusal."""
+    if caller is None:
+        return 401
+    if caller == "manager@example.com" and session == "conv_open":
+        return 404  # No grant on this session: it isn't revealed.
+    if method == "GetPullRequest" or method in _PR_OWNER_METHODS:
+        # Its overview carries the host account's identities: the owner grant only, no admin.
+        return 503 if caller == "real-owner@example.com" else 403
+    if method in _PR_BROWSE_READS and caller == "viewer@example.com" and session == "conv_share":
+        return 403
+    return 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "real-owner@example.com",
+        "owner@example.com",
+        "manager@example.com",
+        "viewer@example.com",
+        "admin@example.com",
+        None,
+    ],
+    ids=["owner", "editor", "manager", "viewer", "admin", "anonymous"],
+)
+@pytest.mark.parametrize(
+    "method", ["GetPullRequest", *_PR_BROWSE_READS, "ListReviewThreadComments"]
+)
+async def test_workspace_api_pull_request_reads_keep_their_rest_gates(
+    client: httpx.AsyncClient, session: str, caller: str | None, method: str
+) -> None:
+    """Each read has its REST route's gate; GetPullRequest is the owner's alone for now."""
+    headers = {"Content-Type": "application/json"}
+    if caller is not None:
+        headers["X-Forwarded-Email"] = caller
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers=headers,
+        content=b'{"prUrl": "https://github.com/example/app/pull/7"}',
+    )
+
+    assert resp.status_code == _pull_request_call_passes(method, caller, session), resp.text
+    if resp.status_code == 503:
+        assert b"unavailable" in resp.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "real-owner@example.com",
+        "owner@example.com",
+        "manager@example.com",
+        "viewer@example.com",
+        "admin@example.com",
+        None,
+    ],
+    ids=["owner", "editor", "manager", "viewer", "admin", "anonymous"],
+)
+@pytest.mark.parametrize("method", sorted(_PR_OWNER_METHODS))
+async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
+    client: httpx.AsyncClient, session: str, caller: str | None, method: str
+) -> None:
+    """They act as the host's account, so no editor or admin makes them, as on REST."""
+    headers = {"Content-Type": "application/json"}
+    if caller is not None:
+        headers["X-Forwarded-Email"] = caller
+    fields = _PR_OWNER_METHODS[method]
+    named = "pullRequests" in fields or "prUrls" in fields or "branch" in fields
+    pr_url = {} if named else {"prUrl": "https://github.com/example/app/pull/7"}
+    body = {**pr_url, **fields}
+    content = json.dumps(body).encode()
+    expected = _pull_request_call_passes(method, caller, session)
+    if method in _PULL_REQUEST_OWNER_STREAMS:
+        content = connect_frame(content)
+        headers["Content-Type"] = "application/connect+json"
+        # A stream that got past the gate ends with its error inside a 200 answer.
+        expected = 200 if expected == 503 else expected
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers=headers,
+        content=content,
+    )
+
+    assert resp.status_code == expected, resp.text
+    if method in _PULL_REQUEST_OWNER_STREAMS and expected == 200:
+        assert b"unavailable" in resp.content
+    if resp.status_code == 403:
+        assert "Only the session's owner can use this" in resp.text
+    if resp.status_code == 503:
+        assert b"unavailable" in resp.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["Bogus", "ListDirectory"])
+async def test_workspace_api_refuses_a_method_it_has_no_gate_for(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """A method the service serves but the gate table leaves out is refused, not served."""
+    from omnigent.server import workspace_access
+
+    gates = {name: gate for name, gate in workspace_access.METHOD_GATES.items() if name != method}
+    monkeypatch.setattr(workspace_access, "METHOD_GATES", gates)
+    resp = await client.post(
+        "/v1/sessions/conv_open/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers={
+            "X-Forwarded-Email": "real-owner@example.com",
+            "Content-Type": "application/json",
+        },
+        content=b"{}",
+    )
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Unknown workspace method"

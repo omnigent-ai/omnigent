@@ -6,6 +6,7 @@ import {
   PaperclipIcon,
   PlusIcon,
   TargetIcon,
+  WorkflowIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,8 +15,18 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { offersSavedWorkflows, WorkflowPicker } from "@/components/composer/WorkflowPicker";
+import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
+import { isCommandAvailable } from "@/store/paletteCommands";
+import {
+  type ComposerAddActionId,
+  composerAddAction,
+  composerAddActions,
+} from "./composerAddActions";
+import { useComposerAddPaletteCommands } from "./useComposerAddPaletteCommands";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
+const EMPTY_WORKFLOWS: readonly SavedWorkflow[] = [];
 
 function ActionText({ label, description }: { label: string; description: string }) {
   // A description that doesn't fit beside the label wraps onto the clipped
@@ -40,12 +51,19 @@ export function ComposerAddMenu({
   showPlan = true,
   planDisabled = false,
   planLabel,
+  planUnavailableReason = "This harness does not support plan mode",
   testIdPrefix = "composer",
   onPlan,
   planActive,
   onSideChat,
+  onWorkflow,
+  savedWorkflows = EMPTY_WORKFLOWS,
+  workflowPagination,
+  onRunSavedWorkflow,
+  onOpen,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
+  paletteSource,
 }: {
   disabled: boolean;
   onAttach: () => void;
@@ -58,24 +76,72 @@ export function ComposerAddMenu({
   showPlan?: boolean;
   planDisabled?: boolean;
   planLabel?: string;
+  planUnavailableReason?: string;
   testIdPrefix?: string;
   onPlan?: () => void;
   planActive: boolean;
   /** Start a new side chat (a fork of this conversation opened as a rail tab).
    *  Absent when the session can't host one. */
   onSideChat?: () => void;
+  /** Open the "Run a workflow" dialog, once the menu has closed, with an optional
+   *  description to start from. Absent when the agent has no `workflow` skill. */
+  onWorkflow?: (description?: string) => void;
+  /** The user's saved workflows; when any can run, Run a workflow lists them. */
+  savedWorkflows?: readonly SavedWorkflow[];
+  workflowPagination?: WorkflowPagination;
+  /** Open the dialog that runs a saved workflow, once the menu has closed. */
+  onRunSavedWorkflow?: (workflow: SavedWorkflow) => void;
+  /** Called as the menu opens, e.g. to refresh the saved workflows. */
+  onOpen?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
+  /** Where ⌘K offers these actions too, with quick_pick_palette on; one composer sets it. */
+  paletteSource?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
-  const pendingGoalRef = useRef(false);
+  const [showWorkflows, setShowWorkflows] = useState(false);
+  const listsSavedWorkflows =
+    onRunSavedWorkflow !== undefined && offersSavedWorkflows(savedWorkflows, workflowPagination);
+  // The items' availability, shared with ⌘K's composer commands.
+  const actions = composerAddActions({
+    attachDisabled,
+    sideChat: onSideChat !== undefined,
+    showGoal,
+    goal: onGoal !== undefined,
+    goalDisabled,
+    goalActive,
+    goalDescription,
+    showPlan,
+    plan: onPlan !== undefined,
+    planDisabled,
+    planActive,
+    planUnavailableReason,
+  });
+  const unavailable = (id: ComposerAddActionId) =>
+    !isCommandAvailable(composerAddAction(actions, id).availability);
+  useComposerAddPaletteCommands(paletteSource, actions, {
+    attach: onAttach,
+    "side-chat": onSideChat,
+    goal: onGoal,
+    plan: onPlan,
+  });
+  const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
+  const [geometry, setGeometry] = useState<{
+    width?: number;
+    alignOffset: number;
+    sideOffset: number;
+  }>({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
     const trigger = triggerRef.current;
-    const composer = trigger?.closest("[data-composer-card]");
+    const composer = trigger?.closest<HTMLElement>("[data-composer-card]");
     if (!trigger || !composer) return;
+    // A panel's card is its whole window, so the menu opens from the trigger at its own width.
+    if (composer.dataset.composerAppearance === "panel") {
+      setGeometry({ alignOffset: 0, sideOffset: 6 });
+      return;
+    }
     const triggerRect = trigger.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
     setGeometry({
@@ -101,8 +167,13 @@ export function ComposerAddMenu({
     <DropdownMenu
       open={open}
       onOpenChange={(nextOpen) => {
-        if (nextOpen) measure();
-        else setShowProjects(false);
+        if (nextOpen) {
+          measure();
+          onOpen?.();
+        } else {
+          setShowProjects(false);
+          setShowWorkflows(false);
+        }
         setOpen(nextOpen);
       }}
     >
@@ -112,9 +183,10 @@ export function ComposerAddMenu({
           type="button"
           size="icon"
           variant="ghost"
-          className="size-8 rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
+          className="size-8 mobile-touch-target rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
           disabled={disabled}
           aria-label="Add"
+          data-composer-action="add"
           title="Add"
           data-testid={`${testIdPrefix}-attach`}
           componentId={`${testIdPrefix}.add_menu`}
@@ -128,9 +200,10 @@ export function ComposerAddMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         onCloseAutoFocus={() => {
-          if (pendingGoalRef.current) {
-            pendingGoalRef.current = false;
-            requestAnimationFrame(() => onGoal?.());
+          const action = pendingActionRef.current;
+          pendingActionRef.current = null;
+          if (action !== null) {
+            requestAnimationFrame(action);
           }
         }}
         side="top"
@@ -139,7 +212,7 @@ export function ComposerAddMenu({
         sideOffset={geometry.sideOffset}
         collisionPadding={12}
         aria-label="Add"
-        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px]"
+        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px] max-md:p-1.5"
         style={{ width: geometry.width }}
         data-testid={`${testIdPrefix}-add-menu`}
       >
@@ -148,9 +221,17 @@ export function ComposerAddMenu({
             <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">
               Choose a project
             </div>
-            {projects.length === 0 && <DropdownMenuItem disabled>No projects yet</DropdownMenuItem>}
+            {projects.length === 0 && (
+              <DropdownMenuItem className="mobile-touch-target" disabled>
+                No projects yet
+              </DropdownMenuItem>
+            )}
             {projects.map((project) => (
-              <DropdownMenuItem key={project.name} onSelect={() => onProjectSelect?.(project.name)}>
+              <DropdownMenuItem
+                className="mobile-touch-target"
+                key={project.name}
+                onSelect={() => onProjectSelect?.(project.name)}
+              >
                 <span className="flex size-4 shrink-0 items-center justify-center">
                   <FolderIcon className="size-3.5" />
                 </span>
@@ -158,23 +239,44 @@ export function ComposerAddMenu({
               </DropdownMenuItem>
             ))}
           </div>
+        ) : showWorkflows ? (
+          <WorkflowPicker
+            workflows={savedWorkflows}
+            pagination={workflowPagination}
+            onSelect={(workflow) => {
+              pendingActionRef.current = () => onRunSavedWorkflow?.(workflow);
+            }}
+            onDescribe={(description) => {
+              pendingActionRef.current = () => onWorkflow?.(description);
+            }}
+          />
         ) : (
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Add</div>
-              <DropdownMenuItem onSelect={onAttach} disabled={attachDisabled}>
+              <DropdownMenuItem
+                className="mobile-touch-target"
+                onSelect={onAttach}
+                disabled={unavailable("attach")}
+              >
                 <span className="flex size-4 shrink-0 items-center justify-center">
                   <PaperclipIcon className="size-3.5" />
                 </span>
                 <span>Files and images</span>
               </DropdownMenuItem>
             </div>
-            {(showGoal || showPlan || onProjectSelect || onSideChat) && (
+            {(showGoal || showPlan || onProjectSelect || onSideChat || onWorkflow) && (
               <div className="flex flex-col gap-0.5">
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
                   {onSideChat && (
-                    <DropdownMenuItem data-testid="composer-side-chat-action" onSelect={onSideChat}>
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      data-testid="composer-side-chat-action"
+                      onSelect={() => {
+                        pendingActionRef.current = onSideChat;
+                      }}
+                    >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
                       </span>
@@ -184,14 +286,41 @@ export function ComposerAddMenu({
                       />
                     </DropdownMenuItem>
                   )}
+                  {onWorkflow && (
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      data-testid="composer-workflow-action"
+                      onSelect={(event) => {
+                        if (listsSavedWorkflows) {
+                          event.preventDefault();
+                          setShowWorkflows(true);
+                          return;
+                        }
+                        pendingActionRef.current = () => onWorkflow();
+                      }}
+                    >
+                      <span className="flex size-4 shrink-0 items-center justify-center">
+                        <WorkflowIcon className="size-3.5" />
+                      </span>
+                      <ActionText
+                        label="Run a workflow"
+                        description={
+                          listsSavedWorkflows
+                            ? "Run a saved one, or describe a new one"
+                            : "Describe it, and the agent plans and runs it"
+                        }
+                      />
+                    </DropdownMenuItem>
+                  )}
                   {showGoal && (
                     <DropdownMenuItem
-                      disabled={!onGoal || goalDisabled}
+                      className="mobile-touch-target"
+                      disabled={unavailable("goal")}
                       title={!onGoal ? goalDescription : undefined}
                       data-testid="composer-goal-action"
                       data-active={goalActive || undefined}
                       onSelect={() => {
-                        pendingGoalRef.current = true;
+                        pendingActionRef.current = onGoal ?? null;
                       }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
@@ -202,12 +331,13 @@ export function ComposerAddMenu({
                   )}
                   {showPlan && (
                     <DropdownMenuItem
+                      className="mobile-touch-target"
                       data-testid="composer-plan-action"
                       data-active={planActive || undefined}
                       aria-label={planLabel}
-                      disabled={!onPlan || planDisabled}
+                      disabled={unavailable("plan")}
                       onSelect={onPlan}
-                      title={onPlan ? undefined : "This harness does not support plan mode"}
+                      title={onPlan ? undefined : planUnavailableReason}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <LightbulbIcon className="size-3.5" />
@@ -220,6 +350,7 @@ export function ComposerAddMenu({
                   )}
                   {onProjectSelect && (
                     <DropdownMenuItem
+                      className="mobile-touch-target"
                       onSelect={(event) => {
                         event.preventDefault();
                         setShowProjects(true);

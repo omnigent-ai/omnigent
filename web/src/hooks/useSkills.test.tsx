@@ -7,8 +7,10 @@ import { useSkills, type SkillsTarget } from "./useSkills";
 const fetchMock = vi.fn();
 const target = { hostId: "host", harness: "claude-native", path: "/repo" };
 const skills = [{ name: "review", description: "Review changes" }];
-const response = (catalog = skills, status = 200) =>
-  new Response(JSON.stringify({ skills: catalog }), { status });
+const response = (catalog = skills, status = 200, warnings?: string[]) =>
+  new Response(JSON.stringify(warnings ? { skills: catalog, warnings } : { skills: catalog }), {
+    status,
+  });
 const wrapper = function QueryWrapper({ children }: { children: ReactNode }) {
   const [client] = useState(
     () =>
@@ -73,8 +75,34 @@ describe("useSkills", () => {
       await act(async () => resolve(response()));
       await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
       expect(result.current.skills).toEqual(skills);
+      // Older servers omit warnings: their catalogs read as complete.
+      expect(result.current.skillsWarnings).toEqual([]);
     },
   );
+
+  it("clears the warning once a retry reads the full catalog", async () => {
+    const warning =
+      "Codex plugin skills unavailable: `codex plugin list` exited 1; see the host log for details.";
+    fetchMock.mockResolvedValueOnce(response([], 200, [warning]));
+    const { result } = renderHook(() => useSkills({ target }), { wrapper });
+    await waitFor(() => expect(result.current.skillsWarnings).toEqual([warning]));
+    fetchMock.mockResolvedValueOnce(response());
+    await act(async () => {
+      await result.current.refetch();
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    expect(result.current.skillsWarnings).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces why a ready catalog is incomplete, once per distinct warning", async () => {
+    const warning = "Codex plugin skills unavailable: `codex plugin list` exited 1";
+    fetchMock.mockResolvedValue(response([], 200, [warning, warning]));
+    const { result } = renderHook(() => useSkills({ target }), { wrapper });
+    await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
+    expect(result.current.skills).toEqual([]);
+    expect(result.current.skillsWarnings).toEqual([warning]);
+  });
 
   it.each([{ target: null }, { target, enabled: false }])(
     "does not discover with an unavailable or disabled target: %j",

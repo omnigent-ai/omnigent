@@ -102,6 +102,8 @@ def test_confidential_client_still_requires_secret(monkeypatch, auth_method):
         ("AUTHORIZATION_ENDPOINT", "", "Set all three"),
         ("JWKS_URI", "", "Set all three"),
         ("REQUIRE_REAUTH", "of", "OMNIGENT_OIDC_REQUIRE_REAUTH must be"),
+        ("REAUTH_PROMPT", "of", "OMNIGENT_OIDC_REAUTH_PROMPT must be"),
+        ("REAUTH_PROMPT", "0", "requires OMNIGENT_OIDC_REQUIRE_REAUTH=0"),
     ],
 )
 def test_invalid_provider_configuration_fails_at_startup(monkeypatch, setting, value, error):
@@ -140,6 +142,19 @@ def test_reauth_verification_setting(monkeypatch, caplog, value, required, githu
     # GitHub never forces re-authentication, so the opt-out changes nothing there.
     warned = "OMNIGENT_OIDC_REQUIRE_REAUTH is disabled" in caplog.text
     assert warned is (not required and not github)
+
+
+@pytest.mark.usefixtures("oidc_env")
+@pytest.mark.parametrize(("value", "prompt"), [(None, True), ("1", True), (" No ", False)])
+def test_reauth_prompt_setting(monkeypatch, caplog, value, prompt):
+    """Without auth_time verification, the operator can also stop asking for re-authentication."""
+    monkeypatch.setenv("OMNIGENT_OIDC_REQUIRE_REAUTH", "0")
+    if value is not None:
+        monkeypatch.setenv("OMNIGENT_OIDC_REAUTH_PROMPT", value)
+    with caplog.at_level("WARNING", logger="omnigent.server.oidc"):
+        assert OIDCConfig.from_env().reauth_prompt is prompt
+    assert ("OMNIGENT_OIDC_REAUTH_PROMPT is disabled" in caplog.text) is not prompt
+    assert ("OMNIGENT_OIDC_REQUIRE_REAUTH is disabled" in caplog.text) is prompt
 
 
 @pytest.mark.usefixtures("oidc_env")
@@ -263,8 +278,13 @@ def begin_login(client, codes, params=None):
     return {"code": code, "state": query["state"][0]}
 
 
-@pytest.mark.parametrize("reauth", [False, True])
-def test_authorization_override_preserves_provider_query(monkeypatch, request, reauth):
+@pytest.mark.parametrize(
+    ("reauth", "reauth_prompt"),
+    [(False, True), (True, True), pytest.param(True, False, id="reauth-prompt-disabled")],
+)
+def test_authorization_override_preserves_provider_query(
+    monkeypatch, request, reauth, reauth_prompt
+):
     """Provider parameters coexist with authoritative OAuth and reauthentication values."""
     monkeypatch.setitem(
         _ENDPOINTS,
@@ -272,8 +292,13 @@ def test_authorization_override_preserves_provider_query(monkeypatch, request, r
         "https://login.example.test/custom/authorize?p=policy&p=second&empty="
         "&value=a%2Bb%26c&response_type=token&client_id=wrong&state=wrong"
         "&code_challenge=wrong&code_challenge_method=plain"
-        "&redirect_uri=https%3A%2F%2Fwrong.example.test&scope=wrong&prompt=select_account&max_age=300",
+        "&redirect_uri=https%3A%2F%2Fwrong.example.test&scope=wrong&prompt=select_account&max_age=3600",
     )
+    request.getfixturevalue("oidc_env")
+    monkeypatch.setenv("OMNIGENT_OIDC_REAUTH_MAX_AGE", "120")
+    if not reauth_prompt:
+        monkeypatch.setenv("OMNIGENT_OIDC_REQUIRE_REAUTH", "0")
+        monkeypatch.setenv("OMNIGENT_OIDC_REAUTH_PROMPT", "0")
     client, _, _, _, _ = request.getfixturevalue("provider_client")
     response = client.get(
         "/auth/login", params={"reauth": "1"} if reauth else {}, follow_redirects=False
@@ -291,8 +316,9 @@ def test_authorization_override_preserves_provider_query(monkeypatch, request, r
     assert query["state"] != ["wrong"]
     assert query["code_challenge"] != ["wrong"]
     assert query["code_challenge_method"] == ["S256"]
-    assert query["prompt"] == (["login"] if reauth else ["select_account"])
-    assert query["max_age"] == (["0"] if reauth else ["300"])
+    prompted = reauth and reauth_prompt
+    assert query["prompt"] == (["login"] if prompted else ["select_account"])
+    assert query["max_age"] == (["120"] if prompted else ["3600"])
 
 
 def test_public_pkce_ps256_login_and_code_replay(provider_client):

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { absoluteTime, relativeTime } from "./relativeTime";
+import {
+  absoluteTime,
+  formatMessageTimestamp,
+  longRelativeTime,
+  relativeTime,
+} from "./relativeTime";
 
 const NOW = new Date("2026-05-28T12:00:00Z").getTime();
 const MIN = 60_000;
@@ -71,5 +76,41 @@ describe("relativeTime", () => {
     expect(relativeTime(NOW - DAY, NOW)).toBe("1d");
     expect(relativeTime(NOW - (WEEK - 1), NOW)).toBe("6d");
     expect(relativeTime(NOW - WEEK, NOW)).toBe("1w");
+  });
+});
+
+describe("formatMessageTimestamp", () => {
+  // Local times, so the stamps don't depend on the machine's time zone.
+  const now = new Date(2026, 10, 12, 9, 30);
+  // ICU may put a narrow no-break space before AM/PM.
+  const stamp = (date: Date) =>
+    formatMessageTimestamp(date.getTime() / 1000, now).replace(/\s/g, " ");
+
+  it("is the time today, adds the day before today, and the year before this year", () => {
+    expect(stamp(new Date(2026, 10, 12, 8, 5))).toBe("8:05 AM");
+    expect(stamp(new Date(2026, 10, 11, 20, 56))).toBe("Nov 11, 8:56 PM");
+    expect(stamp(new Date(2025, 10, 11, 20, 56))).toBe("Nov 11, 2025, 8:56 PM");
+  });
+});
+
+describe("longRelativeTime", () => {
+  it.each([
+    ["seconds", NOW - 30_000, "30 seconds ago"],
+    ["a minute at 60 seconds", NOW - MIN, "1 minute ago"],
+    ["minutes", NOW - 5 * MIN, "5 minutes ago"],
+    ["an hour at 60 minutes", NOW - HR, "1 hour ago"],
+    ["hours", NOW - 3 * HR, "3 hours ago"],
+    ["yesterday", NOW - DAY, "yesterday"],
+    ["days", NOW - 4 * DAY, "4 days ago"],
+    ["months", NOW - 90 * DAY, "3 months ago"],
+    ["years, not dozens of months", NOW - 3 * 365 * DAY, "3 years ago"],
+  ])("reads %s in a sentence", (_label, time, label) => {
+    expect(longRelativeTime(time, NOW)).toBe(label);
+  });
+
+  // `Date.parse("")`, a missing timestamp, is NaN.
+  it.each([NaN, Infinity])("has no label for the time %s", (time) => {
+    expect(longRelativeTime(time, NOW)).toBe("");
+    expect(longRelativeTime(NOW, time)).toBe("");
   });
 });

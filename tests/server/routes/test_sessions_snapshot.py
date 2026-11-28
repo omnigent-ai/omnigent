@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import itertools
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,7 +259,11 @@ async def test_session_snapshot_reads_latest_items_then_returns_chronological() 
 async def test_session_snapshot_uses_child_spec_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Child snapshots expose their selected spec while parents keep the root spec."""
+    """Child snapshots expose their selected spec while parents keep the root spec.
+
+    Each snapshot reads the agent row once, off the event loop, and reuses
+    it for metadata and harness resolution.
+    """
     child_spec = AgentSpec(
         spec_version=1,
         name="executor",
@@ -296,12 +303,16 @@ async def test_session_snapshot_uses_child_spec_metadata(
         ),
     }
     conv_store = _ConversationStore([], conversations=conversations)
+    event_loop_thread = threading.get_ident()
     cache_loads: list[bool] = []
+    cache_loads_on_loop: list[bool] = []
+    agent_reads_on_loop: list[bool] = []
 
     class _AgentStore:
         @staticmethod
         def get(agent_id: str) -> Any:
             assert agent_id == "ag_advisor"
+            agent_reads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type(
                 "StoredAgent",
                 (),
@@ -316,9 +327,14 @@ async def test_session_snapshot_uses_child_spec_metadata(
 
     class _AgentCache:
         @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
+        @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             cache_loads.append(expand_env)
+            cache_loads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -346,6 +362,8 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+    assert cache_loads_on_loop == [False, False, False, False]
+    assert agent_reads_on_loop == [False, False]
 
 
 @pytest.mark.asyncio
@@ -403,6 +421,10 @@ async def test_session_snapshot_does_not_claim_agent_model_for_own_auth_acp(
             )()
 
     class _AgentCache:
+        @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
         @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             return type("LoadedAgent", (), {"spec": spec})()
@@ -496,6 +518,10 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
 
     class _AgentCache:
         @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
+        @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             return type("LoadedAgent", (), {"spec": parent_spec})()
@@ -578,6 +604,10 @@ async def test_session_snapshot_native_sub_agent_reports_parent_without_warning(
 
     class _AgentCache:
         @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
+        @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
@@ -628,6 +658,83 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
     assert lookup_calls == [["1949523062921b6989466e2fc257925a"]]
     assert snapshot.runner_online is False
     assert snapshot.host_online is False
+
+
+class _JobTaggingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Default executor that tags every submitted job with a sequence number."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=1)
+        self.current = threading.local()
+        self._next_job = itertools.count()
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> concurrent.futures.Future[Any]:
+        job = next(self._next_job)
+
+        def run() -> Any:
+            self.current.job = job
+            return fn(*args, **kwargs)
+
+        return super().submit(run)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_reads_overlays_in_one_executor_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Liveness, usage and the resume-host read share one executor hop.
+
+    Each ``asyncio.to_thread`` hop waits in the default executor's queue, so on
+    a busy replica the snapshot's latency grows with its hop count.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1949523062921b6989466e2fc257925a"
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    conv.host_id = "host_1"
+    executor = _JobTaggingExecutor()
+    jobs: dict[str, int] = {}
+
+    def _liveness_lookup(session_ids: list[str]) -> dict[str, SessionLiveness]:
+        jobs["liveness"] = executor.current.job
+        return {session_id: SessionLiveness(runner_online=True, host_online=False)}
+
+    class _HostStore:
+        def get_host(self, host_id: str) -> object:
+            jobs["host"] = executor.current.job
+            return SimpleNamespace(id=host_id)
+
+    real_usage = orchestration.load_session_usage
+
+    def _usage(*args: Any, **kwargs: Any) -> Any:
+        jobs["usage"] = executor.current.job
+        return real_usage(*args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "load_session_usage", _usage)
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda host, config: True)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(executor)
+    try:
+        snapshot = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            session_id,
+            conversation=conv,
+            liveness_lookup=_liveness_lookup,
+            host_store=_HostStore(),  # type: ignore[arg-type]
+            sandbox_config=SimpleNamespace(),  # type: ignore[arg-type]
+        )
+    finally:
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+        executor.shutdown(wait=True)
+
+    assert set(jobs) == {"liveness", "host", "usage"}
+    assert len(set(jobs.values())) == 1
+    assert snapshot.runner_online is True
+    assert snapshot.host_online is False
+    assert snapshot.host_resumable is True
+    assert snapshot.usage_included is True
 
 
 @pytest.mark.asyncio
@@ -867,9 +974,23 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
             'version 2.1.280 or newer is required."}',
             "client_update_required",
         ),
+        (
+            "API Error: Sonnet 4 can't help with this. Start a new session to continue.",
+            "content_policy_refusal",
+        ),
+        (
+            "Output limit reached — the response exceeded the model’s maximum output "
+            "length and was cut off. Ask for a shorter answer, or break the request "
+            "into smaller pieces and continue step by step.",
+            "output_limit_exceeded",
+        ),
+        (
+            "Claude Code ended the turn with an API error (max_output_tokens).",
+            "output_limit_exceeded",
+        ),
     ],
 )
-async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+async def test_session_snapshot_classifies_preexisting_generic_native_errors(
     message: str,
     expected_code: str,
 ) -> None:
@@ -1018,7 +1139,7 @@ async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_conn
 
     assert snapshot.status == "failed"
     assert snapshot.last_task_error == {
-        "code": "runner_failed_to_start",
+        "code": "runner_process_crash",
         "message": _RUNNER_EXIT_ERROR,
     }
 
@@ -1107,21 +1228,127 @@ class _NotFoundRunnerClient:
 class _GatedRunnerClient:
     """Fake runner whose status GET blocks until released, so callers provably overlap."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, status: str = "running", status_code: int = 200) -> None:
         self.get_calls: list[str] = []
         self.arrived = asyncio.Event()
         self.release = asyncio.Event()
+        self.status = status
+        self.status_code = status_code
 
     async def get(self, url: str, timeout: float) -> Any:
         self.get_calls.append(url)
         self.arrived.set()
         await self.release.wait()
-        return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+        return SimpleNamespace(status_code=self.status_code, json=lambda: {"status": self.status})
 
 
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_http_status", [200, 404])
+@pytest.mark.parametrize(
+    ("probed_status", "published_status"),
+    [("running", "idle"), ("idle", "running"), ("idle", "waiting"), ("running", "failed")],
+)
+async def test_session_snapshot_preserves_status_published_during_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    probed_status: str,
+    published_status: str,
+    probe_http_status: int,
+) -> None:
+    """A late status reply cannot undo a turn edge or make completed work fail on disconnect."""
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    session_id = "52970ab86e2a4eeaa9804421091d5002"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_status_race",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+    _sessions_mod._session_status_cache.pop(session_id, None)
+    _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
+    persisted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_live_status",
+        lambda key, status: persisted.append((key, status)),
+    )
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_scheduled_run_completion",
+        lambda *args, **kwargs: None,
+    )
+    runner_client = _GatedRunnerClient(status=probed_status, status_code=probe_http_status)
+    _use_runner_client(monkeypatch, runner_client)
+    snapshot_task = asyncio.create_task(
+        _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+        helpers._publish_status(
+            session_id, published_status, failure_origin="synthetic_native_failure"
+        )
+        runner_client.release.set()
+        snapshot = await asyncio.wait_for(snapshot_task, timeout=1.0)
+
+        assert snapshot.status == (
+            "running" if published_status == "waiting" else published_status
+        )
+        assert _sessions_mod._session_status_cache.get(session_id) == published_status
+        assert persisted == [(session_id, published_status)]
+        assert _sessions_mod._runner_status_probe_inflight.get(session_id) is None
+        assert _sessions_mod._runner_status_probe_backoff.get(session_id) is None
+        assert await orchestration._runner_disconnect_requires_failure(
+            session_id,
+            conv_store,  # type: ignore[arg-type]
+            origin="runner_offline_sweep",
+            snapshot=conv,
+        ) is (published_status in {"running", "waiting"})
+    finally:
+        runner_client.release.set()
+        await asyncio.gather(snapshot_task, return_exceptions=True)
+        _sessions_mod._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_session_status_edge_before_probe_task_starts_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued probe cannot treat an intervening turn edge as its original cache state."""
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    session_id = "b9dfc503c89441fdbfcf9db877ae361b"
+    _sessions_mod._session_status_cache.pop(session_id, None)
+    _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *args: None)
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_scheduled_run_completion",
+        lambda *args, **kwargs: None,
+    )
+    runner_client = _GatedRunnerClient()
+    probe = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.sleep(0)
+        assert not runner_client.arrived.is_set()
+        assert _sessions_mod._runner_status_probe_inflight.get(session_id) is not None
+        helpers._publish_status(session_id, "idle")
+        runner_client.release.set()
+        assert await asyncio.wait_for(probe, timeout=1.0) == "idle"
+        assert _sessions_mod._session_status_cache.get(session_id) == "idle"
+    finally:
+        runner_client.release.set()
+        await asyncio.gather(probe, return_exceptions=True)
+        _sessions_mod._session_status_cache.pop(session_id, None)
 
 
 @pytest.mark.asyncio
@@ -2425,7 +2652,10 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
 
     host_queries: list[str] = []
 
-    async def _fake_host_options(host_id: str) -> list[dict[str, object]] | None:
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        assert harness == "claude-native"
         host_queries.append(host_id)
         return [{"id": "opus", "displayName": "Opus"}]
 
@@ -2460,6 +2690,167 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
     assert host_queries == ["host_abc"]
     assert [m.id for m in snapshot.model_options] == ["opus"]
     assert session_id in _mod._model_options_stale
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inherited_host", [False, True])
+@pytest.mark.parametrize("first_host_failure", [False, True], ids=["success", "retry"])
+async def test_session_snapshot_fills_cold_pi_catalog_from_host(
+    monkeypatch: pytest.MonkeyPatch,
+    inherited_host: bool,
+    first_host_failure: bool,
+) -> None:
+    """Cold Pi snapshots refill from direct or inherited hosts and retry failed lookups."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.schemas import SessionEventInput
+
+    session_id = "conv_pi_host_catalog"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    host_queries: list[tuple[str, str]] = []
+    release_host = asyncio.Event()
+    published: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._publish_model_options", published.append
+    )
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
+        await release_host.wait()
+        if first_host_failure and len(host_queries) == 1:
+            return None
+        return [{"id": "provider/test-model", "displayName": "Test Model"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent" if inherited_host else session_id,
+        parent_conversation_id="parent" if inherited_host else None,
+        kind="sub_agent" if inherited_host else "default",
+        agent_id="ag_test",
+        host_id=None if inherited_host else "host_abc",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    parent = Conversation(
+        id="parent",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent",
+        host_id="host_abc",
+        agent_id="ag_test",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv, "parent": parent},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    filling = _mod._model_options_inflight[session_id]
+    second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert second.model_options == []
+    assert _mod._model_options_inflight[session_id] is filling
+    release_host.set()
+    await asyncio.wait_for(filling, timeout=5)
+    assert session_id not in _mod._model_options_inflight
+    if first_host_failure:
+        assert session_id not in _mod._pushed_model_options_cache
+        assert published == []
+        release_host.clear()
+        retry = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        assert retry.model_options == []
+        refilling = _mod._model_options_inflight[session_id]
+        assert refilling is not filling
+        release_host.set()
+        await asyncio.wait_for(refilling, timeout=5)
+        assert session_id not in _mod._model_options_inflight
+    assert published == [session_id]
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert host_queries == [("host_abc", "pi-native")] * (2 if first_host_failure else 1)
+    assert [m.id for m in snapshot.model_options] == ["provider/test-model"]
+    # Not stale-marked: pi's picker reads only the pushed cache.
+    assert session_id not in _mod._model_options_stale
+
+    _mod._persist_external_model_options(
+        session_id,
+        conv,
+        SessionEventInput(type="external_model_options", data={"models": [{"id": "extension"}]}),
+    )
+    replaced = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert [model.id for model in replaced.model_options] == ["extension"]
+    assert session_id not in _mod._model_options_inflight
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_push", [False, True], ids=["catalog", "cleared"])
+async def test_pi_host_fill_does_not_clobber_extension_push(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_push: bool,
+) -> None:
+    """An accepted catalog or clear during host recovery wins, including later snapshots."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.schemas import SessionEventInput
+
+    session_id = "conv_pi_push_wins"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="host_abc",
+        labels={_mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE},
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+    pushed_models = [] if empty_push else [{"id": "pushed"}]
+    host_queries: list[tuple[str, str]] = []
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
+        _mod._persist_external_model_options(
+            session_id,
+            conv,
+            SessionEventInput(type="external_model_options", data={"models": pushed_models}),
+        )
+        return [{"id": "from-host"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    await _mod._load_model_options_from_host(session_id, "host_abc", "pi-native")
+
+    expected_ids = [] if empty_push else ["pushed"]
+    assert [model["id"] for model in _mod._pushed_model_options_cache[session_id]] == expected_ids
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert [model.id for model in snapshot.model_options] == expected_ids
+    assert session_id not in _mod._model_options_inflight
+    assert host_queries == [("host_abc", "pi-native")]
 
 
 @pytest.mark.asyncio
@@ -3273,47 +3664,80 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(
 
 
 @pytest.mark.asyncio
-async def test_persist_error_labels_short_message_stored_verbatim() -> None:
-    """A short failure message is stored without modification."""
+async def test_persist_error_labels_timestamp_and_recovery_preserve_activity(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure occurrence and recovery leave the transcript timestamp unchanged."""
+    from omnigent.server.routes._sessions import helpers
     from omnigent.server.schemas import ErrorDetail
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
-    captured: dict[str, dict[str, str]] = {}
-
-    class _MockStore:
-        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
-            captured[session_id] = updates
-
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
     error = ErrorDetail(code="runner_error", message="Process exited with code 1")
 
-    await _persist_session_status_error_labels(
-        "d6e1678fb446a1cf5a892e0df60aaba3", error, _MockStore()
-    )  # type: ignore[arg-type]
+    for occurred_at in (conversation.updated_at + 60, conversation.updated_at + 120):
+        monkeypatch.setattr(helpers.time, "time", lambda occurred_at=occurred_at: occurred_at)
+        await _persist_session_status_error_labels(conversation.id, error, store)
 
-    assert (
-        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_message"]
-        == "Process exited with code 1"
+        stored = store.get_conversation(conversation.id)
+        assert stored is not None
+        assert stored.labels["omnigent.last_task_error_message"] == error.message
+        assert stored.labels["omnigent.last_task_error_code"] == error.code
+        assert stored.labels["omnigent.last_task_error_at"] == str(occurred_at)
+        assert stored.updated_at == conversation.updated_at
+
+    await _persist_session_status_error_labels(conversation.id, None, store)
+
+    recovered = store.get_conversation(conversation.id)
+    assert recovered is not None
+    assert recovered.labels["omnigent.last_task_error_at"] == ""
+    assert all(
+        value == ""
+        for key, value in recovered.labels.items()
+        if key.startswith("omnigent.last_task_error_")
     )
-    assert (
-        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
-        == "runner_error"
-    )
+    assert recovered.updated_at == conversation.updated_at
 
 
 # ── _runner_reject_detail ────────────────────────────────────────────────────
 
 
-def test_runner_reject_detail_combines_error_code_and_detail() -> None:
-    """The runner's own ``{error, detail}`` shape reads as ``code: detail``."""
+@pytest.mark.parametrize(
+    "status,payload,expected",
+    [
+        (
+            503,
+            {"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+            "harness_spawn_failed: harness spawn failed (see log)",
+        ),
+        (
+            400,
+            {"error": {"code": "invalid_input", "message": "unsupported harness configuration"}},
+            "invalid_input: unsupported harness configuration",
+        ),
+        (
+            400,
+            {"error": {"code": "invalid_input", "message": "  "}, "detail": "policy rejected"},
+            "invalid_input: policy rejected",
+        ),
+    ],
+    ids=["flat-spawn-failure", "nested-policy-failure", "blank-nested-message-keeps-detail"],
+)
+def test_runner_reject_detail_combines_error_code_and_detail(
+    status: int, payload: dict[str, object], expected: str
+) -> None:
+    """Flat and nested runner rejections retain a readable code and detail."""
     import httpx
 
     from omnigent.server.routes.sessions import _runner_reject_detail
 
     resp = httpx.Response(
-        503,
+        status,
         request=httpx.Request("POST", "http://runner/v1/sessions/conv_x/events"),
-        json={"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+        json=payload,
     )
-    assert _runner_reject_detail(resp) == "harness_spawn_failed: harness spawn failed (see log)"
+    assert _runner_reject_detail(resp) == expected
 
 
 def test_runner_reject_detail_falls_back_through_code_body_and_status() -> None:
@@ -3427,108 +3851,6 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
     }
 
 
-def _side_chat_child(
-    *,
-    runner_id: str | None,
-    parent_id: str | None = "parent",
-    nickname: str = "Side chat",
-    wrapper: str = "codex-native-ui-subagent",
-    kind: str = "sub_agent",
-) -> Any:
-    """A conversation row shaped like a codex ``/side`` child."""
-    labels: dict[str, str] = {"omnigent.wrapper": wrapper}
-    if nickname:
-        labels["omnigent.codex_native.agent_nickname"] = nickname
-    return SimpleNamespace(
-        kind=kind,
-        labels=labels,
-        parent_conversation_id=parent_id,
-        runner_id=runner_id,
-    )
-
-
-class _ParentStore:
-    """A conversation store that returns one canned parent row."""
-
-    def __init__(self, parent: Any) -> None:
-        self._parent = parent
-
-    def get_conversation(self, conversation_id: str) -> Any:
-        return self._parent
-
-
-@pytest.mark.asyncio
-async def test_side_chat_fork_sealed_on_runner_divergence() -> None:
-    """A resumed/relaunched host gives the parent a fresh ``runner_id`` while the
-    side-chat child keeps its birth one. The divergence means the ephemeral fork's
-    owning runner is gone, so the child seals read-only."""
-    from omnigent.server.routes._sessions.orchestration import (
-        _codex_side_chat_fork_sealed,
-    )
-
-    child = _side_chat_child(runner_id="runner-birth")
-    store = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
-    assert await _codex_side_chat_fork_sealed(child, store) is True  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_side_chat_fork_not_sealed_when_runner_matches() -> None:
-    """A plain page reload keeps the same live runner, so parent and child agree
-    and the still-reachable fork stays sendable."""
-    from omnigent.server.routes._sessions.orchestration import (
-        _codex_side_chat_fork_sealed,
-    )
-
-    child = _side_chat_child(runner_id="runner-birth")
-    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
-    assert await _codex_side_chat_fork_sealed(child, store) is False  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_side_chat_fork_seal_only_applies_to_side_chats() -> None:
-    """The seal is gated to the ``/side`` nickname. An ordinary codex sub-agent
-    (durable, not an ephemeral fork) with a diverged runner must NOT be sealed —
-    and a non-codex row is ignored entirely."""
-    from omnigent.server.routes._sessions.orchestration import (
-        _codex_side_chat_fork_sealed,
-    )
-
-    diverged = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
-
-    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
-    assert await _codex_side_chat_fork_sealed(ordinary, diverged) is False  # type: ignore[arg-type]
-
-    not_codex = _side_chat_child(
-        runner_id="runner-birth", wrapper="claude-code-native-ui-subagent"
-    )
-    assert await _codex_side_chat_fork_sealed(not_codex, diverged) is False  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_side_chat_fork_not_sealed_without_reliable_signal() -> None:
-    """Missing signals can't prove the fork is gone, so the child stays sendable:
-    a child with no runner_id, no parent link, or a parent that has no runner_id
-    (never diverged) is not sealed."""
-    from omnigent.server.routes._sessions.orchestration import (
-        _codex_side_chat_fork_sealed,
-    )
-
-    live_parent = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
-
-    no_child_runner = _side_chat_child(runner_id=None)
-    assert await _codex_side_chat_fork_sealed(no_child_runner, live_parent) is False  # type: ignore[arg-type]
-
-    no_parent_link = _side_chat_child(runner_id="runner-birth", parent_id=None)
-    assert await _codex_side_chat_fork_sealed(no_parent_link, live_parent) is False  # type: ignore[arg-type]
-
-    parent_no_runner = _ParentStore(SimpleNamespace(runner_id=None))
-    child = _side_chat_child(runner_id="runner-birth")
-    assert await _codex_side_chat_fork_sealed(child, parent_no_runner) is False  # type: ignore[arg-type]
-
-    missing_parent = _ParentStore(None)
-    assert await _codex_side_chat_fork_sealed(child, missing_parent) is False  # type: ignore[arg-type]
-
-
 async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3565,41 +3887,6 @@ async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
     assert "skills_status" not in snapshot.model_dump()
     assert all(not url.endswith("/skills") for url in calls)
     assert all(event.get("type") != "session.skills" for event in published)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("host_status", "online", "lost"),
-    [
-        ("dead", False, True),
-        ("unknown", False, True),
-        ("alive", False, False),
-        (None, False, False),
-        ("dead", True, False),
-    ],
-)
-async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
-    monkeypatch: pytest.MonkeyPatch, host_status: str | None, online: bool, lost: bool
-) -> None:
-    """Only the launching host can prove an offline runner is gone; no reply proves nothing."""
-    from omnigent.server.routes._sessions import orchestration
-
-    async def _status(_conn: Any, _registry: Any, _runner_id: str) -> str | None:
-        return host_status
-
-    monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
-    monkeypatch.setattr("omnigent.runner.routing.routing_host_id", lambda _c, _s: "host-1")
-    registry = SimpleNamespace(get=lambda host_id: object() if host_id == "host-1" else None)
-    router = SimpleNamespace(runner_is_online=lambda _runner_id: online)
-    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))  # parent not relaunched yet
-    child = _side_chat_child(runner_id="runner-birth")
-
-    assert await orchestration._codex_side_chat_fork_lost(child, store, router, registry) is lost  # type: ignore[arg-type]
-
-    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
-    assert (
-        await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
-    )  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("agent", [CODEX_NATIVE_CODING_AGENT, CLAUDE_NATIVE_CODING_AGENT])

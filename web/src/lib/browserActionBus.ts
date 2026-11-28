@@ -41,3 +41,44 @@ export function emitBrowserActionRequest(
     }
   }
 }
+
+/** How a browser action this window ran ended, as the relay posts it back. */
+export interface BrowserActionOutcome {
+  ok: boolean;
+  error?: string;
+  data?: Record<string, unknown>;
+}
+
+export type BrowserActionSettledListener = (
+  event: BrowserActionRequestEvent,
+  conversationId: string,
+  outcome: BrowserActionOutcome,
+) => void;
+
+const settledListeners = new Set<BrowserActionSettledListener>();
+
+/**
+ * Subscribe to the actions this window ran, once each has its result. Only the window
+ * that claimed an action runs it, so other windows never hear of its outcome.
+ */
+export function onBrowserActionSettled(listener: BrowserActionSettledListener): () => void {
+  settledListeners.add(listener);
+  return () => {
+    settledListeners.delete(listener);
+  };
+}
+
+/** Report an action's outcome to this window's listeners; a throwing one can't stop the others. */
+export function emitBrowserActionSettled(
+  event: BrowserActionRequestEvent,
+  conversationId: string,
+  outcome: BrowserActionOutcome,
+): void {
+  for (const listener of settledListeners) {
+    try {
+      listener(event, conversationId, outcome);
+    } catch (err) {
+      console.warn("[browser-relay] settled listener threw:", err);
+    }
+  }
+}

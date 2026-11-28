@@ -1,0 +1,1701 @@
+/* The new Pull Requests list. Its palette names map onto the theme's tokens here, on the
+   list and on the popovers it portals out, so both themes follow the app's palette. */
+.pr-list,
+.pr-list-portal {
+  --pr-list-muted: var(--muted-foreground);
+  --pr-list-surface: var(--muted);
+  --pr-list-accent: var(--primary);
+  --pr-list-success: var(--status-green);
+  --pr-list-danger: var(--status-red);
+  --pr-list-warning: var(--status-yellow);
+}
+.pr-list {
+  --pr-list-merged: var(--status-purple);
+  --pr-list-row-hover: color-mix(in srgb, var(--foreground) 4.5%, var(--background));
+  /* Checked rows in light themes: a tint light enough that muted text on it still reads as text. */
+  --pr-list-row-selected: color-mix(in srgb, var(--pr-list-accent) 5%, var(--background));
+  --pr-list-row-selected-hover: color-mix(in srgb, var(--pr-list-accent) 6%, var(--background));
+  --pr-list-row-focused: color-mix(in srgb, var(--foreground) 6%, var(--background));
+  --pr-list-hairline: color-mix(in srgb, var(--foreground) 8%, transparent);
+  --pr-list-faint: color-mix(in srgb, var(--pr-list-muted) 72%, transparent);
+  --pr-list-columns-height: 28px;
+  position: relative;
+  /* A column, not grid rows: WebKit sized a wrapped header's row at one line, so its
+     second line covered the state filters. */
+  display: flex;
+  height: 100%;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 12px;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  container-type: size;
+  container-name: pr-list;
+}
+/* Dark themes' text reads on a stronger tint. */
+.dark .pr-list {
+  --pr-list-row-selected: color-mix(in srgb, var(--pr-list-accent) 11%, var(--background));
+  --pr-list-row-selected-hover: color-mix(in srgb, var(--pr-list-accent) 15%, var(--background));
+}
+.pr-list button {
+  font: inherit;
+  color: inherit;
+  cursor: default;
+}
+.pr-list svg {
+  flex: none;
+}
+.pr-list :focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--pr-list-accent) 75%, transparent);
+  outline-offset: -2px;
+}
+/* Utility commands use the same visible surface for pointer and keyboard focus.
+ * Keep the broader list/field focus treatment for controls outside this group. */
+:is(
+    .pr-list-icon-button,
+    .pr-list-quiet-button,
+    .pr-list-display-trigger,
+    .pr-list-search button,
+    .pr-list-group-toggle,
+    .pr-list-group-action,
+    .pr-list-row-actions button,
+    .pr-list-selection-bar button
+  ):is(:hover, :focus-visible):where(:not(:disabled)) {
+  outline: 0;
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+}
+:is(
+    .pr-list-icon-button,
+    .pr-list-quiet-button,
+    .pr-list-display-trigger,
+    .pr-list-search button,
+    .pr-list-group-toggle,
+    .pr-list-group-action,
+    .pr-list-row-actions button,
+    .pr-list-selection-bar button
+  ):active:where(:not(:disabled, [aria-disabled="true"])) {
+  background: color-mix(in srgb, var(--foreground) 14%, transparent);
+}
+.pr-list-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--pr-list-muted);
+}
+.pr-list-loading svg {
+  width: 14px;
+  height: 14px;
+}
+.pr-list-spin {
+  animation: pr-list-spin 1s linear infinite;
+}
+@keyframes pr-list-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Header */
+/* One row: the title keeps its size, the filter takes what's left, and the actions end it. */
+.pr-list-header {
+  display: flex;
+  min-height: 44px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 10px 8px 16px;
+}
+.pr-list-heading {
+  display: flex;
+  flex: none;
+  align-items: baseline;
+  gap: 7px;
+}
+.pr-list-heading h1 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 620;
+  letter-spacing: -0.006em;
+  white-space: nowrap;
+}
+.pr-list-heading-count {
+  color: var(--pr-list-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-icon-button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--pr-list-muted);
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+.pr-list-icon-button svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.75;
+}
+.pr-list-quiet-button {
+  display: inline-flex;
+  height: 26px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--pr-list-hairline);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+  font-weight: 520;
+  white-space: nowrap;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease;
+}
+.pr-list-quiet-button:is(:hover, :focus-visible):where(:not(:disabled)) {
+  border-color: var(--border);
+}
+
+/* Toolbar */
+.pr-list-toolbar {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 6px;
+}
+.pr-list-search {
+  position: relative;
+  display: flex;
+  min-width: 100px;
+  height: 28px;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px 0 9px;
+  border: 1px solid var(--pr-list-hairline);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--foreground) 2.5%, var(--background));
+  color: var(--pr-list-muted);
+  transition:
+    border-color 0.12s ease,
+    box-shadow 0.12s ease,
+    background-color 0.12s ease;
+}
+.pr-list-search:hover {
+  border-color: var(--border);
+}
+.pr-list-search:focus-within {
+  border-color: color-mix(in srgb, var(--pr-list-accent) 60%, var(--border));
+  background: var(--background);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--pr-list-accent) 16%, transparent);
+}
+.pr-list-search > svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.9;
+}
+.pr-list-search input {
+  width: 0;
+  min-width: 0;
+  height: 100%;
+  flex: 1;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 12px;
+  -webkit-appearance: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+/* The field's own ring stands for the focused input, so the input draws none inside it. */
+.pr-list-search input:focus-visible {
+  outline: 0;
+}
+.pr-list-search input::placeholder {
+  color: var(--pr-list-faint);
+}
+.pr-list-search input::-webkit-search-cancel-button {
+  display: none;
+}
+.pr-list-search kbd,
+.pr-list-selection-bar kbd {
+  display: inline-grid;
+  min-width: 16px;
+  height: 16px;
+  place-items: center;
+  padding: 0 4px;
+  border: 1px solid var(--pr-list-hairline);
+  border-radius: 4px;
+  color: var(--pr-list-faint);
+  font:
+    500 10px/1 -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
+}
+.pr-list-search button {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--pr-list-surface);
+  color: var(--pr-list-muted);
+}
+.pr-list-search button svg {
+  width: 10px;
+  height: 10px;
+  stroke-width: 2.25;
+}
+.pr-list-display-trigger {
+  display: inline-flex;
+  height: 28px;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--pr-list-hairline);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--pr-list-muted);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 520;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease;
+}
+.pr-list-display-trigger:is(:hover, :focus-visible):where(:not(:disabled)),
+.pr-list-display-trigger[data-state="open"] {
+  border-color: var(--border);
+}
+.pr-list-display-trigger[data-state="open"] {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+}
+.pr-list-display-trigger svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.75;
+}
+.pr-list-display-trigger.modified svg {
+  color: var(--pr-list-accent);
+}
+.pr-list-popover-positioner {
+  z-index: 40;
+}
+.pr-list-popover {
+  display: grid;
+  width: 248px;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  outline: 0;
+  background: color-mix(in srgb, var(--foreground) 3%, var(--background));
+  color: var(--foreground);
+  box-shadow:
+    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 2px 6px rgba(0, 0, 0, 0.12);
+  font-size: 12px;
+  transform-origin: var(--transform-origin);
+  transition:
+    opacity 0.12s ease,
+    transform 0.12s ease;
+}
+.pr-list-popover[data-starting-style],
+.pr-list-popover[data-ending-style] {
+  opacity: 0;
+  transform: scale(0.97);
+}
+.pr-list-display-option {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+.pr-list-display-switch {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.pr-list-display-switch > label {
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+}
+.pr-list-display-option > span {
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+}
+.pr-list-popover select {
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--pr-list-hairline);
+  border-radius: 6px;
+  outline: 0;
+  background: var(--pr-list-surface);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 11.5px;
+}
+.pr-list-popover select:focus-visible {
+  border-color: color-mix(in srgb, var(--pr-list-accent) 70%, var(--border));
+}
+.pr-list-ordering {
+  display: flex;
+  min-width: 0;
+  gap: 4px;
+}
+.pr-list-ordering .pr-list-icon-button {
+  flex: none;
+  border: 1px solid var(--pr-list-hairline);
+  background: var(--pr-list-surface);
+}
+.pr-list-reset {
+  justify-self: end;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--pr-list-muted) !important;
+  font-size: 11px !important;
+}
+.pr-list-reset:hover {
+  color: var(--foreground) !important;
+}
+
+/* The state tabs, then the active filters; the filters wrap below when the row is full. */
+.pr-list-state-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  padding: 0 10px 8px 12px;
+  border-bottom: 1px solid var(--pr-list-hairline);
+}
+/* Each active filter is a chip to change or remove. */
+.pr-list-active-filters {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Status filters */
+.pr-list-filters {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.pr-list-filters::-webkit-scrollbar {
+  display: none;
+}
+.pr-list-filter {
+  display: inline-flex;
+  height: 24px;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+  font-weight: 520;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+.pr-list-filter:hover {
+  background: var(--pr-list-surface);
+  color: var(--foreground);
+}
+.pr-list-filter.selected {
+  border-color: var(--pr-list-hairline);
+  background: var(--pr-list-surface);
+  color: var(--foreground);
+}
+.pr-list-filter .pr-list-state {
+  width: 12px;
+  height: 12px;
+}
+.pr-list-filter-count {
+  color: var(--pr-list-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-filter.selected .pr-list-filter-count {
+  color: var(--pr-list-muted);
+}
+.pr-list-attention-glyph {
+  width: 7px;
+  height: 7px;
+  margin: 0 2px;
+  border-radius: 50%;
+  background: var(--pr-list-warning);
+  box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--pr-list-warning) 22%, transparent);
+}
+
+/* List */
+/* Loading, empty and unavailable states sit where the table would. */
+.pr-list-placeholder {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+}
+.pr-list-list {
+  --pr-list-number-width: calc(var(--pr-list-number-chars, 6) * 0.62em + 4px);
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  padding-bottom: 72px;
+  overflow: auto;
+  outline: 0;
+  container-type: inline-size;
+  container-name: pr-list-list;
+  scrollbar-gutter: stable;
+}
+.pr-list-columns,
+.pr-list-row {
+  --pr-list-col-diff: 78px;
+  /* Room for the widest date it shows, "Sep 2023", so it never runs under the avatar. */
+  --pr-list-col-updated: 58px;
+  display: grid;
+  grid-template-columns:
+    var(--pr-list-col-select, 26px) 18px var(--pr-list-number-width) minmax(0, 1fr) 28px 30px var(
+      --pr-list-col-diff
+    )
+    64px 26px var(--pr-list-col-updated) 32px;
+  grid-template-areas: "select state number title status checks diff reviewers author updated actions";
+  align-items: center;
+  column-gap: 0;
+  padding: 0 12px 0 6px;
+}
+.pr-list-columns {
+  position: sticky;
+  z-index: 3;
+  top: 0;
+  height: var(--pr-list-columns-height);
+  border-bottom: 1px solid var(--pr-list-hairline);
+  background: var(--background);
+  color: var(--pr-list-faint);
+  font-size: 11px;
+  font-weight: 520;
+}
+.pr-list-columns > span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  white-space: nowrap;
+}
+.pr-list-columns button {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: -4px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+}
+.pr-list-columns button:hover,
+.pr-list-columns button.sorted {
+  color: var(--foreground);
+}
+.pr-list-columns button svg {
+  width: 11px;
+  height: 11px;
+  stroke-width: 2;
+}
+/* Without checkboxes, the select column is only a gutter before the state icon. */
+.pr-list-list.no-row-selection {
+  --pr-list-col-select: 6px;
+  --pr-list-col-select-stacked: 8px;
+}
+.pr-list-col-select {
+  grid-area: select;
+  justify-content: center;
+}
+.pr-list-col-number {
+  grid-column: state / number;
+  padding-left: 2px;
+}
+.pr-list-col-title {
+  grid-area: title;
+  padding-left: 8px;
+}
+.pr-list-col-status {
+  grid-area: status;
+  justify-content: center;
+}
+/* A glyph header fits its 28px track: 13px glyph, 1px gap, 9px arrow and 2px either side. */
+.pr-list-columns button.glyph {
+  gap: 1px;
+  margin-left: 0;
+  padding: 2px;
+}
+.pr-list-columns button.glyph .column-glyph {
+  width: 13px;
+  height: 13px;
+}
+.pr-list-columns button.glyph svg:not(.column-glyph) {
+  width: 9px;
+  height: 9px;
+  stroke-width: 2.5;
+}
+.pr-list-col-checks {
+  grid-area: checks;
+  justify-content: center;
+}
+.pr-list-col-diff {
+  grid-area: diff;
+  justify-content: flex-end;
+  padding-right: 10px;
+}
+.pr-list-col-reviewers {
+  grid-area: reviewers;
+}
+.pr-list-col-author {
+  grid-area: author;
+  font-size: 0;
+}
+.pr-list-col-updated {
+  grid-area: updated;
+  justify-content: flex-end;
+}
+.pr-list-col-updated button {
+  margin-right: -4px;
+  margin-left: 0;
+}
+
+.pr-list-group-header {
+  position: sticky;
+  z-index: 2;
+  top: var(--pr-list-columns-height);
+  display: flex;
+  height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 12px 0 8px;
+  border-bottom: 1px solid var(--pr-list-hairline);
+  background: color-mix(in srgb, var(--foreground) 2.5%, var(--background));
+}
+.pr-list-group-toggle {
+  display: inline-flex;
+  min-width: 0;
+  height: 24px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px 0 2px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 580;
+}
+.pr-list-chevron {
+  width: 12px;
+  height: 12px;
+  color: var(--pr-list-faint);
+  stroke-width: 2.25;
+  transform: rotate(90deg);
+  transition: transform 0.14s ease;
+}
+.pr-list-group-toggle[aria-expanded="false"] .pr-list-chevron {
+  transform: rotate(0deg);
+}
+.pr-list-group-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pr-list-group-count {
+  color: var(--pr-list-muted);
+  font-weight: 450;
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-group-glyph {
+  width: 13px;
+  height: 13px;
+  color: var(--pr-list-muted);
+  stroke-width: 1.75;
+}
+.pr-list-group-header .pr-list-group-action {
+  height: 24px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--pr-list-muted);
+  font-size: 11px !important;
+  opacity: 0.7;
+  transition:
+    opacity 0.12s ease,
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+.pr-list-group-header:is(:hover, :focus-within) .pr-list-group-action {
+  opacity: 1;
+}
+/* The header's actions sit together at its end. */
+.pr-list-group-header .pr-list-group-action {
+  margin-left: auto;
+}
+/* Where Remove All can't run, it stays reachable to say why, and reads as unavailable. */
+.pr-list-group-header .pr-list-group-action[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: default;
+}
+/* While the group's rows are being removed, it says so at rest, not only on hover. */
+.pr-list-group-header .pr-list-group-action[data-busy="true"] {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 55%;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 5px;
+  opacity: 1;
+  white-space: nowrap;
+}
+.pr-list-busy-spinner,
+.pr-list-busy-stop {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+.pr-list-busy-label {
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+}
+/* A removal that can be stopped shows Stop's X in place of its spinner on hover or focus. */
+.pr-list-busy-stop,
+[data-stoppable="true"]:is(:hover, :focus-visible) .pr-list-busy-spinner {
+  display: none;
+}
+[data-stoppable="true"]:is(:hover, :focus-visible) .pr-list-busy-stop {
+  display: inline-block;
+}
+.pr-list-group-header .pr-list-group-action + .pr-list-group-action {
+  margin-left: -6px;
+}
+.pr-list-group-header .pr-list-group-more {
+  display: inline-grid;
+  width: 24px;
+  place-items: center;
+  padding: 0;
+  opacity: 0;
+}
+.pr-list-group-header .pr-list-group-more[data-state="open"] {
+  opacity: 1;
+}
+.pr-list-group-more svg {
+  width: 14px;
+  height: 14px;
+}
+
+.pr-list-row {
+  --row-bg: var(--background);
+  position: relative;
+  height: 36px;
+  border-bottom: 1px solid color-mix(in srgb, var(--foreground) 4.5%, transparent);
+  background: var(--row-bg);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 36px;
+}
+.pr-list-row:hover {
+  --row-bg: var(--pr-list-row-hover);
+}
+/* The pull request on screen beside the list, as a file tree marks its open file. */
+.pr-list-row.shown {
+  --row-bg: var(--muted);
+}
+.pr-list-row.selected {
+  --row-bg: var(--pr-list-row-selected);
+}
+.pr-list-row.selected:hover {
+  --row-bg: var(--pr-list-row-selected-hover);
+}
+.pr-list-row.active::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--pr-list-accent);
+  content: "";
+}
+.pr-list-list:focus .pr-list-row.active,
+.pr-list-list:focus-within .pr-list-row.active {
+  --row-bg: var(--pr-list-row-focused);
+}
+.pr-list-list:focus .pr-list-row.active.selected,
+.pr-list-list:focus-within .pr-list-row.active.selected {
+  --row-bg: var(--pr-list-row-selected-hover);
+}
+.pr-list-row > [role="gridcell"] {
+  display: flex;
+  min-width: 0;
+  height: 100%;
+  align-items: center;
+}
+/* Row text selects and copies like a document; controls and glyphs stay out of the selection. */
+.pr-list-row {
+  cursor: default;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pr-list-row :is(button, svg, .pr-list-avatar) {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.pr-list-link {
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  -webkit-user-drag: none;
+}
+/* A click leaves focus on the link, and a key press makes it visible; the row shows it instead. */
+.pr-list-link:focus-visible {
+  outline: 0;
+}
+.pr-list-number:hover {
+  color: var(--foreground);
+}
+.pr-list-link:hover {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 2px;
+}
+.pr-list-row ::selection {
+  background: color-mix(in srgb, var(--pr-list-accent) 38%, transparent);
+}
+
+.pr-list-cell-select {
+  grid-area: select;
+  justify-content: center;
+}
+.pr-list-checkbox {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--pr-list-muted) 55%, transparent);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--background) !important;
+  opacity: 0;
+  transition:
+    opacity 0.1s ease,
+    background-color 0.1s ease,
+    border-color 0.1s ease;
+}
+.pr-list-checkbox svg {
+  width: 10px;
+  height: 10px;
+  stroke-width: 3;
+}
+.pr-list-checkbox:hover {
+  border-color: var(--foreground);
+}
+.pr-list-checkbox:is([data-state="checked"], [data-state="indeterminate"]) {
+  border-color: var(--pr-list-accent);
+  background: var(--pr-list-accent);
+  opacity: 1;
+}
+.pr-list-row:hover .pr-list-checkbox,
+.pr-list.selecting .pr-list-checkbox,
+.pr-list-columns:hover .pr-list-checkbox,
+.pr-list-checkbox:focus-visible {
+  opacity: 1;
+}
+
+.pr-list-cell-state {
+  grid-area: state;
+  justify-content: center;
+}
+.pr-list-state {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.9;
+}
+.pr-list-state.open {
+  color: var(--pr-list-success);
+}
+.pr-list-state.draft {
+  color: var(--pr-list-muted);
+}
+.pr-list-state.merged {
+  color: var(--pr-list-merged);
+}
+.pr-list-state.closed {
+  color: var(--pr-list-danger);
+}
+.pr-list-state.unknown {
+  color: var(--pr-list-faint);
+  animation: pr-list-spin 3s linear infinite;
+}
+.pr-list-cell-number {
+  grid-area: number;
+  padding-left: 6px;
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.pr-list-cell-title {
+  grid-area: title;
+  gap: 8px;
+  padding-left: 8px;
+  padding-right: 14px;
+}
+.pr-list-title {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: -0.003em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pr-list-row.completed .pr-list-title {
+  color: color-mix(in srgb, var(--foreground) 62%, var(--background));
+}
+/* A Close or Reopen sent from the row, until GitHub answers. */
+.pr-list-title.changing {
+  animation: pr-list-pulse 1.2s ease-in-out infinite;
+}
+@keyframes pr-list-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+.pr-list-changing-label {
+  display: none;
+  flex: none;
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+}
+.pr-list-skeleton {
+  width: min(62%, 280px);
+  height: 9px;
+  border-radius: 4px;
+  background: linear-gradient(
+    90deg,
+    var(--pr-list-surface) 0%,
+    color-mix(in srgb, var(--foreground) 14%, transparent) 50%,
+    var(--pr-list-surface) 100%
+  );
+  background-size: 200% 100%;
+  animation: pr-list-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes pr-list-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+/* A stacked row's tree lines and fold button, before its title; the title truncates first. */
+.pr-list-stack-guides {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  margin-right: -4px;
+  color: var(--pr-list-faint);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+.pr-list-stack-guides > span:not(.pr-stack-depth) {
+  width: 12px;
+  text-align: center;
+}
+/* A deep row's level, sized by its own number so two digits fit, then the fold button. */
+.pr-list-stack-guides > .pr-stack-depth {
+  margin-right: 2px;
+}
+.pr-list-stack-toggle {
+  display: inline-flex;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+  margin-right: -4px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--pr-list-faint);
+}
+.pr-list-stack-toggle-space {
+  flex: none;
+  width: 16px;
+  margin-left: -6px;
+  margin-right: 2px;
+  overflow: hidden;
+  color: var(--pr-list-faint);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.pr-list-stack-toggle:hover {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+}
+.pr-list-stack-toggle svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 2.25;
+  transition: transform 0.14s ease;
+}
+.pr-list-stack-toggle.expanded svg {
+  transform: rotate(90deg);
+}
+/* Unlike the repository name, a stack note stays in narrow lists. */
+.pr-list-stack-note {
+  flex: none;
+  color: var(--pr-list-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.pr-list-stack-stale {
+  display: inline-flex;
+  flex: none;
+  color: var(--pr-list-faint);
+}
+.pr-list-stack-stale svg {
+  width: 12px;
+  height: 12px;
+}
+.pr-list-session-chip {
+  max-width: 160px;
+  border: 1px solid var(--pr-list-hairline);
+  border-radius: 4px;
+  padding: 0 5px;
+  color: var(--pr-list-muted);
+}
+.pr-list-notice-text {
+  margin: 0;
+  padding: 4px 12px;
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+}
+.pr-list-also-in {
+  color: var(--pr-list-faint);
+}
+.pr-list-repository {
+  flex: none;
+  max-width: 120px;
+  overflow: hidden;
+  color: var(--pr-list-faint);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The repository and the agents that link a row show only in very wide lists; narrower ones
+   give the title that room, and the title's tooltip names them. */
+@container pr-list-list (max-width: 1199.98px) {
+  .pr-list-wide-only {
+    display: none;
+  }
+}
+.pr-list-labels {
+  display: none;
+  flex: none;
+  gap: 4px;
+}
+@container pr-list-list (min-width: 960px) {
+  .pr-list-labels {
+    display: flex;
+  }
+}
+.pr-list-label {
+  display: inline-flex;
+  max-width: 112px;
+  height: 18px;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px 0 6px;
+  border: 1px solid var(--pr-list-hairline);
+  border-radius: 999px;
+  color: var(--pr-list-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pr-list-label > span {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+}
+.pr-list-label.more {
+  flex: none;
+  padding: 0 6px;
+}
+
+.pr-list-cell-status {
+  grid-area: status;
+  justify-content: center;
+}
+/* One glyph per status, in its tone; Needs-you tints the tile behind it and firms the stroke. */
+.pr-list-classification {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--pr-list-muted);
+}
+.pr-list-classification:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--pr-list-accent) 75%, transparent);
+  outline-offset: -1px;
+}
+.pr-list-classification svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.9;
+}
+.pr-list-classification.tone-positive {
+  color: var(--pr-list-success);
+}
+.pr-list-classification.tone-danger {
+  color: var(--pr-list-danger);
+}
+.pr-list-classification.tone-warning {
+  color: var(--pr-list-warning);
+}
+.pr-list-classification.tone-merged {
+  color: var(--pr-list-merged);
+}
+.pr-list-classification.attention {
+  background: color-mix(in srgb, currentColor 16%, transparent);
+}
+.pr-list-classification.attention svg {
+  stroke-width: 2.25;
+}
+
+.pr-list-cell-checks {
+  grid-area: checks;
+  justify-content: center;
+}
+.pr-list-checks {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-checks svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke-linecap: round;
+}
+.pr-list-checks .track {
+  stroke: color-mix(in srgb, var(--pr-list-warning) 28%, transparent);
+  stroke-width: 1.7;
+}
+.pr-list-checks .progress {
+  stroke: var(--pr-list-warning);
+  stroke-width: 1.7;
+}
+.pr-list-checks .passed {
+  fill: color-mix(in srgb, var(--pr-list-success) 16%, transparent);
+  stroke: color-mix(in srgb, var(--pr-list-success) 70%, transparent);
+  stroke-width: 1.1;
+}
+.pr-list-checks .tick {
+  stroke: var(--pr-list-success);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+}
+.pr-list-checks .failed {
+  fill: var(--pr-list-danger);
+}
+.pr-list-checks .cross {
+  stroke: var(--background);
+  stroke-width: 1.6;
+}
+.pr-list-checks.failing {
+  color: var(--pr-list-danger);
+  font-weight: 600;
+}
+.pr-list-checks.pending svg {
+  animation: pr-list-pulse 2.4s ease-in-out infinite;
+}
+.pr-list-checks.none {
+  color: var(--pr-list-faint);
+}
+@keyframes pr-list-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.pr-list-cell-diff {
+  grid-area: diff;
+  justify-content: flex-end;
+  padding-right: 10px;
+}
+.pr-list-diff {
+  display: inline-flex;
+  gap: 5px;
+  font:
+    500 11px/1 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
+  letter-spacing: -0.02em;
+}
+.pr-list-diff .additions {
+  color: color-mix(in srgb, var(--pr-list-success) 88%, var(--foreground));
+}
+.pr-list-diff .deletions {
+  color: color-mix(in srgb, var(--pr-list-danger) 88%, var(--foreground));
+}
+.pr-list-row.completed .pr-list-diff {
+  opacity: 0.6;
+}
+
+.pr-list-cell-reviewers {
+  grid-area: reviewers;
+}
+.pr-list-reviewers {
+  display: inline-flex;
+  align-items: center;
+}
+/* The Reviewers cell's clock, once the row's own read is a while old. */
+.pr-list-reviewers-age {
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.pr-list-reviewers .pr-list-avatar + .pr-list-avatar {
+  margin-left: -5px;
+}
+.pr-list-reviewers-more {
+  margin-left: 4px;
+  color: var(--pr-list-muted);
+  font-size: 10.5px;
+}
+
+.pr-list-cell-author {
+  grid-area: author;
+  justify-content: center;
+}
+.pr-list-author-name {
+  display: none;
+}
+.pr-list-avatar {
+  position: relative;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--pr-list-accent) 22%, var(--pr-list-surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--foreground) 10%, transparent) inset;
+  color: var(--foreground);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+.pr-list-avatar.small {
+  width: 18px;
+  height: 18px;
+  box-shadow: 0 0 0 1.5px var(--row-bg, var(--background));
+  font-size: 7px;
+}
+.pr-list-group-toggle .pr-list-avatar.small {
+  box-shadow: none;
+}
+.pr-list-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.pr-list-avatar.ring-positive {
+  box-shadow:
+    0 0 0 1.5px var(--row-bg, var(--background)),
+    0 0 0 2.5px var(--pr-list-success);
+}
+.pr-list-avatar.ring-danger {
+  box-shadow:
+    0 0 0 1.5px var(--row-bg, var(--background)),
+    0 0 0 2.5px var(--pr-list-danger);
+}
+.pr-list-reviewers .pr-list-avatar.ring-positive + .pr-list-avatar,
+.pr-list-reviewers .pr-list-avatar.ring-danger + .pr-list-avatar {
+  margin-left: -3px;
+}
+
+.pr-list-cell-updated {
+  grid-area: updated;
+  min-width: 0;
+  overflow: hidden;
+  justify-content: flex-end;
+  color: var(--pr-list-muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Reserve a column so hover actions never cover row metadata or avatars. */
+.pr-list-row-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+}
+.pr-list-row:is(:hover, :focus-within) .pr-list-row-actions {
+  opacity: 1;
+}
+.pr-list-row:is(:hover, :focus-within) .pr-list-row-actions button {
+  pointer-events: auto;
+}
+.pr-list-row-actions button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--pr-list-muted);
+}
+.pr-list-row-actions svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.9;
+}
+
+.pr-list-empty {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 56px 24px;
+  color: var(--pr-list-muted);
+  text-align: center;
+}
+.pr-list-empty > svg {
+  width: 20px;
+  height: 20px;
+  margin-bottom: 4px;
+  color: var(--pr-list-faint);
+}
+.pr-list-empty strong {
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+}
+.pr-list-empty .pr-list-quiet-button {
+  margin-top: 8px;
+}
+
+/* Selection bar: it fits the list (see selectionBarFit.ts), so the clip is only a backstop. */
+.pr-list-selection-bar {
+  --selection-bar-inset: 12px;
+  position: absolute;
+  z-index: 10;
+  bottom: 14px;
+  left: 50%;
+  display: flex;
+  height: 36px;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--foreground) 5%, var(--background));
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.3),
+    0 1px 3px rgba(0, 0, 0, 0.16);
+  max-width: calc(100% - 2 * var(--selection-bar-inset));
+  overflow: hidden;
+  font-size: 12px;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  animation: pr-list-rise 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes pr-list-rise {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+}
+.pr-list-selection-count {
+  margin-right: 6px;
+  color: var(--pr-list-muted);
+}
+.pr-list-selection-count strong {
+  color: var(--foreground);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-selection-bar :is(button, .pr-list-selection-control) {
+  display: inline-flex;
+  flex: none;
+  height: 28px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 520;
+}
+.pr-list-selection-bar button:is(:disabled, [aria-disabled="true"]) {
+  opacity: 0.45;
+}
+.pr-list-selection-action svg {
+  width: 13px;
+  height: 13px;
+}
+.pr-list-selection-divider {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--border);
+}
+.pr-list-selection-remove:is(:hover, :focus-visible):where(
+    :not(:disabled, [aria-disabled="true"])
+  ) {
+  color: var(--pr-list-danger) !important;
+}
+.pr-list-selection-bar .pr-list-selection-clear {
+  width: 28px;
+  justify-content: center;
+  padding: 0 !important;
+  color: var(--pr-list-muted);
+}
+.pr-list-selection-clear svg {
+  width: 13px;
+  height: 13px;
+}
+/* How many of the selection a shortened action acts on, as "2/4". */
+.pr-list-selection-share {
+  margin-left: -2px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--foreground) 9%, transparent);
+  color: var(--pr-list-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-sizer-strong {
+  color: var(--foreground);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Without the shell's stats read there is no diff size or update time to show. */
+.pr-list-list.no-stats :is(.pr-list-columns, .pr-list-row) {
+  --pr-list-col-diff: 0px;
+  --pr-list-col-updated: 0px;
+}
+.pr-list-list.no-stats
+  :is(.pr-list-cell-diff, .pr-list-col-diff, .pr-list-cell-updated, .pr-list-col-updated) {
+  visibility: hidden;
+}
+
+/* The list fills what the panel leaves below its notices, and keeps a row for its own. */
+.pr-list {
+  flex: 1 1 0;
+  min-height: 0;
+}
+.pr-list > :is(.pr-list-header, .pr-list-state-row, .pr-list-notices) {
+  flex: none;
+}
+.pr-list-header-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Fork primitives inside the list: the checkbox, avatars and the CI popover trigger. */
+.pr-list-checkbox {
+  flex: none;
+}
+.pr-list-avatar::after {
+  display: none;
+}
+.pr-list-avatar-initials {
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+}
+.pr-list-avatar.team {
+  color: var(--pr-list-muted);
+}
+.pr-list-avatar.team svg {
+  width: 10px;
+  height: 10px;
+}
+.pr-list-checks-button {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+}
+
+/* Medium widths shed the least essential columns first. */
+@container pr-list-list (max-width: 820px) {
+  .pr-list-columns,
+  .pr-list-row {
+    --pr-list-col-diff: 74px;
+    grid-template-columns:
+      var(--pr-list-col-select, 26px) 18px var(--pr-list-number-width) minmax(0, 1fr)
+      28px 30px var(--pr-list-col-diff)
+      0 26px var(--pr-list-col-updated) 32px;
+  }
+  .pr-list-cell-reviewers,
+  .pr-list-col-reviewers {
+    visibility: hidden;
+  }
+}
+@container pr-list-list (max-width: 680px) {
+  .pr-list-columns,
+  .pr-list-row {
+    --pr-list-col-updated: 54px;
+    grid-template-columns:
+      var(--pr-list-col-select, 26px) 18px var(--pr-list-number-width) minmax(0, 1fr)
+      28px 30px 0 0 26px
+      var(--pr-list-col-updated) 32px;
+  }
+  .pr-list-cell-diff,
+  .pr-list-col-diff,
+  .pr-list-labels {
+    display: none !important;
+  }
+  .pr-list-repository {
+    max-width: 80px;
+  }
+}
+
+/* Narrow sidebars stack metadata beneath the title. */
+@container pr-list-list (max-width: 620px) {
+  .pr-list-columns {
+    display: none;
+  }
+  .pr-list-group-header {
+    top: 0;
+  }
+  .pr-list-row {
+    height: 52px;
+    grid-template-columns:
+      var(--pr-list-col-select-stacked, 24px) 20px auto auto minmax(0, 1fr)
+      auto 0;
+    grid-template-rows: 26px 20px;
+    grid-template-areas:
+      "select state title title title updated actions"
+      "select . number status checks author actions";
+    align-content: center;
+    padding: 0 12px 0 4px;
+    contain-intrinsic-size: auto 52px;
+  }
+  .pr-list-row > [role="gridcell"] {
+    height: auto;
+  }
+  /* The row's one hover action shows over the end of the title line, centred above the
+     author's avatar, so titles keep that width otherwise. */
+  .pr-list-row-actions {
+    grid-area: 1 / 6;
+    justify-self: end;
+    margin-right: calc((18px - 24px) / 2);
+    border-radius: 6px;
+    background: var(--row-bg);
+  }
+  .pr-list-cell-title {
+    padding: 0 10px 0 4px;
+  }
+  .pr-list-cell-number {
+    padding-left: 4px;
+    padding-right: 8px;
+    font-size: 11px;
+  }
+  .pr-list-cell-status {
+    padding-right: 6px;
+  }
+  /* The second line is 20px tall; the tile fits it. */
+  .pr-list-classification {
+    width: 20px;
+    height: 20px;
+  }
+  .pr-list-cell-checks {
+    justify-content: flex-start;
+  }
+  .pr-list-cell-author {
+    justify-content: flex-end;
+  }
+  .pr-list-cell-reviewers {
+    display: none !important;
+  }
+  .pr-list-avatar {
+    width: 18px;
+    height: 18px;
+  }
+}
+@container pr-list-list (max-width: 380px) {
+  .pr-list-repository {
+    display: none;
+  }
+}
+/* Narrow panes, such as the list beside a pull request, keep the title and its actions on
+   the first row and give the filter and Display the whole second row. */
+@container pr-list (max-width: 520px) {
+  .pr-list-heading {
+    flex: 1 1 auto;
+  }
+  .pr-list-toolbar {
+    order: 1;
+    flex-basis: 100%;
+  }
+  .pr-list-search {
+    min-width: 100px;
+  }
+}
+/* Too narrow for their words, Filter and Display keep only their icons, never clipping. */
+@container pr-list (max-width: 360px) {
+  .pr-list-toolbar .pr-list-display-trigger {
+    width: 28px;
+    justify-content: center;
+    padding: 0;
+  }
+  .pr-list-toolbar .pr-list-display-trigger > span {
+    display: none;
+  }
+}
+/* Zoomed panes let Display drop below the filter rather than clip. */
+@container pr-list (max-width: 220px) {
+  .pr-list-toolbar {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .pr-list-search {
+    min-width: min(140px, 100%);
+    flex-basis: 140px;
+  }
+}
+/* Avatars lift with a slight overshoot so faces are easy to read without opening anything. */
+.pr-list-avatar {
+  transition:
+    transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.12s ease;
+}
+.pr-list-avatar:hover {
+  transform: scale(1.35);
+}
+/* Keep enlarged avatars above neighboring cells. */
+.pr-list-cell-author,
+.pr-list-cell-reviewers {
+  position: relative;
+  z-index: 2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pr-list *,
+  .pr-list *::before {
+    animation: none !important;
+    transition: none !important;
+  }
+  .pr-list-avatar:hover {
+    transform: none;
+  }
+  .pr-list-changing-label {
+    display: inline;
+  }
+}
+
+/* The rows a long list hasn't read yet, and how it ended. */
+.pr-list-more-header,
+.pr-list-more-filtered,
+.pr-list-more-end {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  border-bottom: 1px solid var(--pr-list-hairline);
+}
+.pr-list-more-cell {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  color: var(--pr-list-muted);
+  font-size: 12px;
+}
+.pr-list-more-caption {
+  font-variant-numeric: tabular-nums;
+}
+.pr-list-more-status:empty {
+  display: none;
+}
+.pr-list-more-rows {
+  /* One faint bar per row still to read, at the rows' own height. */
+  background-image: linear-gradient(
+    to bottom,
+    transparent 12px,
+    color-mix(in srgb, var(--foreground) 5%, transparent) 12px,
+    color-mix(in srgb, var(--foreground) 5%, transparent) 24px,
+    transparent 24px
+  );
+  background-position: 12px 0;
+  background-repeat: repeat-y;
+  background-size: min(420px, 60%) 36px;
+}

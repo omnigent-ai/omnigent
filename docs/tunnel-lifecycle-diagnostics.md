@@ -73,12 +73,21 @@ session impact or changes KPI eligibility.
 - `runner_connected`: `connection_id`, `reconnect` (an earlier connection on
   this process was accepted), `attempt` (ordinal within the reconnect
   streak), `downtime_s` (gap since the previous connection ended), `pid`.
+- `runner_tunnel_renewal_started`: `runner_id`, `connection_id`,
+  `connection_age_s`. One row before a scheduled close, after replacement
+  credentials are prepared. It records the renewal attempt; use the next
+  `runner_connected` and session-stream readiness to verify recovery.
+- `runner_tunnel_renewal_deferred`: `runner_id`, `connection_id`, `reason`
+  (`credential_unavailable` or `credential_refresh_failed`), `error_type`.
+  The working connection stays open. Failed preparation retries once per
+  minute while that connection remains alive.
 - `runner_tunnel_disconnected`: one row per attempt the runner retries,
   replacing the plain retry line. A fatal exit (persistent auth or protocol
   rejection, cancellation) raises out of the reconnect loop and is logged by
   the caller instead. `disconnect_reason` (the bounded classifier shared with
   the OTel counter; `local_shutdown` when the process is stopping, even if the
-  close handshake broke), `close_code`, `close_reason`, `close_rcvd_code` and
+  close handshake broke; `scheduled_renewal` for a planned renewal),
+  `close_code`, `close_reason`, `close_rcvd_code` and
   `close_sent_code` (which side sent a close frame; a 1006 has neither),
   `error_type`, `connected`, `connection_age_s`, `recycle`, `backoff_reset`,
   `delay_s`, `retry_in_s`. A clean 1000/1001 close ends the read loop without
@@ -88,6 +97,36 @@ session impact or changes KPI eligibility.
   `recovery_prompt` or `none`) with its inputs `recovery_id`,
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,
   `history_len`, `last_item_type`, and the resulting `status`.
+
+### Native status publication
+
+`codex_turn_status` records the intended native status before posting it.
+`codex_turn_status_publication_failed` warns when an exception interrupts that
+publication, with the session and native `turn_id`, `intended_status`,
+`protocol_source`, `delivery_phase`, `exception_type`, and
+`exception_cause_type`. `delivery_phase = before_status` covers output and other
+preparatory flushes; `status_post` covers the status-post operation. Exceptions
+after that operation returns do not emit this warning. Existing HTTP rejection
+diagnostics remain separate.
+
+If a preparatory flush raises, the forwarder still attempts the known terminal
+status in the same handler before re-raising the original error. Cancellation
+skips that attempt. A `before_status` warning alone therefore does not establish
+that the terminal status was lost; check the following status-post observations.
+
+These events add metadata, without terminal text or exception messages, and do
+not require stderr capture. A local terminal completion does not establish that
+its status reached the server. Conversely, a failed post may have reached the
+server before its exception; compare the matching server status and input
+events. An absent warning is inconclusive when client telemetry is disabled or
+cannot be uploaded.
+
+When all client records are missing, inspect that process's local log for
+`debug-log sink enabled`, `first batch delivered`, and `debug-log sink:` warnings.
+The uploader already reports credential, insert, and dropped-batch failures at
+most once per category per minute. Its own thread's warnings stay local to avoid
+recursive uploads, so the remote table cannot establish that the uploader was
+healthy. Collect those local diagnostics before adding more remote events.
 
 ### Stack capture during runner event-loop stalls
 
@@ -261,7 +300,10 @@ when the context exits.
   the outage still fails the turn. `held_host_offline` means the session's
   user-run host went offline too; the disconnect sweep holds the turn
   (`runner_disconnect_held_host_offline` / `runner_disconnect_hold_ended`) and
-  the reconnect restarts the relay. The
+  the reconnect restarts the relay. When the host returns without the runner,
+  the hold ends `host_back_without_runner`. On the host's replica, the
+  interrupted turn is settled as `runner_interrupted` before the server
+  relaunches its runner; the interrupted input is not redelivered. The
   `runner_disconnected` row carries the same two attributes. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
@@ -369,6 +411,10 @@ The disconnect grace task rechecks the local tunnel after loading bound
 sessions. A reconnect during that read logs `reconnected during offline
 lookup; skipping offline-marking`; an older database snapshot must not turn
 the live runner's sessions into disconnect failures.
+The per-session sweep also checks the final ownership read for a fresh heartbeat
+newer than its conversation snapshot. When another replica renewed that runner,
+the departing replica drops its stale local status and leaves the turn alone.
+An unchanged or expired heartbeat does not establish a takeover.
 
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =
@@ -449,6 +495,57 @@ loop delays suggest backpressure. Missing heartbeats with neither observation
 still leave the peer or network path unresolved; compare both sides before
 assigning a cause. These observations do not change liveness, retry, or turn
 failure decisions.
+
+## Planned connection renewal
+
+The runner renews its WebSocket after 23 hours 45–50 minutes, with a new
+jittered deadline on each connection. This leaves a margin before proxies
+with a 24-hour absolute connection lifetime. Traffic does not extend that
+deadline; the proxy limits themselves are unchanged.
+
+Credentials are resolved off the event loop while the current socket keeps
+serving traffic. A host-bootstrap bearer is replaced through the existing
+runner-local credential providers. If replacement fails, the bootstrap is
+retained and the planned close is deferred. A slow provider does not block
+the socket's receive loop. Shutdown or an earlier socket loss cancels the
+renewal task; an already-running synchronous credential call can still finish
+in its worker thread.
+
+A successful preparation closes the transport with code `1001` and reason
+`scheduled tunnel renewal`. The next handshake uses the prepared credential
+without another credential lookup in the disconnected interval. Its
+`runner_tunnel_disconnected` row reports `disconnect_reason = scheduled_renewal`
+and reconnects at the base delay, not as a server recycle. The runner
+and harness stay alive, and the usual session-stream recovery runs. Renewal
+does not run the idle-shutdown drain or mark sessions intentionally stopped.
+It still depends on working session recovery, including across replicas;
+a close handshake alone does not prove that the active turn survived.
+
+Set `OMNIGENT_RUNNER_TUNNEL_RENEWAL_S` in the **runner process environment** to
+change the maximum renewal age in seconds; its default is `85800`. Jitter
+subtracts up to the smaller of five minutes or one percent of the interval.
+Set it to `0` to disable scheduled renewal while keeping ordinary reconnects.
+Negative, non-finite, and non-numeric values log a warning and use the default.
+The interval must leave room before the deployment's shortest proxy lifetime.
+
+For a disposable development runner, use `OMNIGENT_RUNNER_TUNNEL_RENEWAL_S=120`
+and keep a turn in flight across a renewal. Verify a new connection ID with
+the same process ID, completed tool output and turn, and no duplicate tool
+effects or persisted disconnect failure. The automated test also sends the
+renewed connection to another replica and holds the tool past the old
+replica's disconnect grace. Its accelerated interval leaves time for that
+reconciliation before the next renewal. Repeated drops within the old
+replica's grace can still expose a server recovery race if its deadline lands
+during a later reconnect gap.
+
+Run the focused checks with:
+
+```sh
+uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_tunnel_renewal.py \
+  tests/runner/test_runner_auth_renewal.py
+uv run --no-sync pytest -q tests/e2e/test_runner_tunnel_renewal_e2e.py \
+  --override-ini addopts=''
+```
 
 ## Build identity
 

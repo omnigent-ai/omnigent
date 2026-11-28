@@ -21,6 +21,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.git_providers import provider_display
 from omnigent.server.schemas import SessionPullRequest, SessionPullRequestList
 from omnigent.stores.session_pull_request_store import (
@@ -42,8 +43,8 @@ _RELATIONSHIPS = frozenset({"created", "worked_on", "attached", "inferred"})
 FRESHNESS_S = 300.0
 _ATTEMPTS_MAX = 10_000
 
-# custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
-_stores: dict[str, SessionPullRequestStore] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by database URLs; queries scope rows
+_stores: dict[tuple[str, str | None], SessionPullRequestStore] = {}
 _stores_lock = threading.Lock()
 
 
@@ -51,20 +52,25 @@ def open_store(conversation_store: object) -> SessionPullRequestStore | None:
     """Return the PR store beside the session metadata, or ``None`` without a SQL backend.
 
     :param conversation_store: The server's conversation store; PRs live in the
-        database at its ``storage_location``.
+        database at its ``storage_location`` and run labels at its
+        ``conversation_storage_location``.
     """
     location = getattr(conversation_store, "storage_location", None)
     if not isinstance(location, str) or not location:
         return None
+    conversation_location = getattr(conversation_store, "conversation_storage_location", None)
+    if not isinstance(conversation_location, str) or not conversation_location:
+        conversation_location = None
+    key = (location, conversation_location)
     with _stores_lock:
-        store = _stores.get(location)
+        store = _stores.get(key)
         if store is None:
             try:
-                store = SessionPullRequestStore(location)
+                store = SessionPullRequestStore(location, conversation_location)
             except Exception:
                 _logger.warning("Session pull request storage is unavailable", exc_info=True)
                 return None
-            _stores[location] = store
+            _stores[key] = store
         return store
 
 
@@ -131,6 +137,38 @@ def fetched_state(info: Mapping[str, Any]) -> FetchedState | None:
     )
 
 
+def listed_states(entries: object) -> list[FetchedState]:
+    """Read the states a host looked up for listed PRs while it refreshed their titles.
+
+    Hosts that look up only titles leave ``state`` out of the entries, so this is empty.
+
+    :param entries: The ``prs`` of a ``session.github.info`` payload.
+    """
+    if not isinstance(entries, list):
+        return []
+    states: list[FetchedState] = []
+    for entry in entries[:_MAX_REPORTED_PRS]:
+        if not isinstance(entry, dict):
+            continue
+        url, number, state, title = (
+            entry.get("url"),
+            entry.get("number"),
+            entry.get("state"),
+            entry.get("title"),
+        )
+        if isinstance(url, str) and isinstance(number, int) and isinstance(state, str):
+            states.append(
+                FetchedState(
+                    url=url,
+                    number=number,
+                    state=state,
+                    is_draft=entry.get("is_draft") is True,
+                    title=title if isinstance(title, str) else None,
+                )
+            )
+    return states
+
+
 def ingest_info(
     store: SessionPullRequestStore,
     session_id: str,
@@ -138,7 +176,7 @@ def ingest_info(
     *,
     requested_at: float,
 ) -> SessionPullRequests | None:
-    """Merge a host payload's PRs and the selected PR's state into the store.
+    """Merge a host payload's PRs and the states it fetched into the store.
 
     :param store: The server's PR store.
     :param session_id: The session the payload describes.
@@ -150,7 +188,11 @@ def ingest_info(
     return store.apply_report(
         session_id,
         parse_reports(info.get("prs")),
-        fetched=fetched_state(info),
+        # The selected PR's full read wins over its listed entry from the same response.
+        fetched=[
+            *listed_states(info.get("prs")),
+            *([selected] if (selected := fetched_state(info)) is not None else []),
+        ],
         requested_at=requested_at,
         complete=info.get("tracking_available") is True and isinstance(info.get("prs"), list),
     )
@@ -270,6 +312,59 @@ def needs_refresh(summary: SessionSummary, *, now: float) -> bool:
     return checked is None or now - checked >= FRESHNESS_S
 
 
+def has_stale_state(stored: SessionPullRequests, *, now: float) -> bool:
+    """Whether any of a session's PRs is open, or of unknown state, as of :data:`FRESHNESS_S` ago.
+
+    Unlike :func:`needs_refresh`, which looks only at the first PR, this covers
+    every PR, for surfaces that show them all.
+    """
+    if not stored.synced:
+        return True
+    return any(
+        entry.state in (None, "OPEN")
+        and (entry.state_checked_at is None or now - entry.state_checked_at >= FRESHNESS_S)
+        for entry in stored.entries
+    )
+
+
+def run_pull_requests(
+    run_id: str, stored: SessionPullRequests, *, created_session: bool
+) -> list[StoredPullRequest]:
+    """Pick the PRs one automation run created or worked on from its session's PRs.
+
+    A run gets the PRs the server first stored while the session's turn belonged
+    to it (:attr:`StoredPullRequest.run_id`), however long its agent worked
+    after the prompt was delivered. PRs first seen outside any run, such as from
+    chat between runs, belong to none. PRs with no recorded run, ones the user
+    linked or stored before runs were recorded, go to the run that created the
+    session. Branch-inferred PRs are left out, since being checked out on a
+    branch is not work on its PR, unless one is the run's only PR: that is most
+    likely the run's own branch.
+
+    :param run_id: The run.
+    :param stored: Its session's PRs.
+    :param created_session: Whether the run created the session.
+    :returns: The run's PRs, created ones first, then in the order they were first seen.
+    """
+    picked = [
+        entry
+        for entry in stored.entries
+        if entry.run_id == run_id or (not entry.run_recorded and created_session)
+    ]
+    explicit = [entry for entry in picked if entry.relationship != "inferred"]
+    if not explicit and len(picked) == 1:
+        explicit = picked
+    return sorted(
+        explicit, key=lambda entry: (entry.relationship != "created", entry.first_seen_at)
+    )
+
+
+def request_refresh(session_id: str) -> None:
+    """Refresh a session's stored PRs in the background, at most once per :data:`FRESHNESS_S`."""
+    if _installed is not None:
+        _installed.request(session_id)
+
+
 class PullRequestRefresher:
     """Refreshes sessions' stored PRs from their runner or host in the background.
 
@@ -277,7 +372,9 @@ class PullRequestRefresher:
     unless a client read already covered the turn, and a turn that ends during
     a refresh gets one more. Listed sessions are refreshed at most once per
     :data:`FRESHNESS_S` each. Jobs run in a copy of the scheduling context, so
-    workspace scoping holds, and at most ``concurrency`` run at once.
+    workspace scoping holds, and at most ``concurrency`` run at once. Sessions
+    are tracked by workspace and id, since session ids are unique only within
+    a workspace.
     """
 
     def __init__(self, *, concurrency: int = 4, turn_end_delay_s: float = 5.0) -> None:
@@ -289,10 +386,10 @@ class PullRequestRefresher:
         self._semaphore = asyncio.Semaphore(concurrency)
         self._delay_s = turn_end_delay_s
         # Sessions with a turn no read has covered yet, by when that turn ended.
-        self._turn_ended: dict[str, float] = {}
+        self._turn_ended: dict[tuple[int, str], float] = {}
         # When each listed session was last refreshed, on the monotonic clock.
-        self._attempted: dict[str, float] = {}
-        self._running: dict[str, asyncio.Task[None]] = {}
+        self._attempted: dict[tuple[int, str], float] = {}
+        self._running: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._closed = False
 
     def bind(self, refresh: Callable[[str], Awaitable[None]]) -> None:
@@ -306,49 +403,53 @@ class PullRequestRefresher:
         """Refresh after a turn ends; a no-op outside an event loop."""
         if self._refresh is None or self._closed:
             return
-        self._turn_ended[session_id] = time.time()
-        self._start(session_id, refresh_now=False)
+        key = (current_workspace_id(), session_id)
+        self._turn_ended[key] = time.time()
+        self._start(key, refresh_now=False)
 
     def note_read(self, session_id: str, requested_at: float) -> None:
         """Mark a session's ended turn as covered by a read sent after it ended."""
-        ended = self._turn_ended.get(session_id)
+        key = (current_workspace_id(), session_id)
+        ended = self._turn_ended.get(key)
         if ended is not None and requested_at >= ended:
-            del self._turn_ended[session_id]
+            del self._turn_ended[key]
 
     def request(self, session_id: str) -> None:
         """Refresh a listed session that needs it, at most once per :data:`FRESHNESS_S`."""
-        if self._refresh is None or self._closed or session_id in self._running:
+        key = (current_workspace_id(), session_id)
+        if self._refresh is None or self._closed or key in self._running:
             return
         now = time.monotonic()
-        last = self._attempted.get(session_id)
+        last = self._attempted.get(key)
         if last is not None and now - last < FRESHNESS_S:
             return
         if len(self._attempted) >= _ATTEMPTS_MAX:
             self._attempted = {
                 key: value for key, value in self._attempted.items() if now - value < FRESHNESS_S
             }
-        self._attempted[session_id] = now
-        self._start(session_id, refresh_now=True)
+        self._attempted[key] = now
+        self._start(key, refresh_now=True)
 
-    def _start(self, session_id: str, *, refresh_now: bool) -> None:
-        if session_id in self._running:
+    def _start(self, key: tuple[int, str], *, refresh_now: bool) -> None:
+        if key in self._running:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._running[session_id] = loop.create_task(self._run(session_id, refresh_now))
+        self._running[key] = loop.create_task(self._run(key, refresh_now))
 
-    async def _run(self, session_id: str, refresh_now: bool) -> None:
+    async def _run(self, key: tuple[int, str], refresh_now: bool) -> None:
+        session_id = key[1]
         try:
             if refresh_now:
                 await self._refresh_once(session_id)
-            while session_id in self._turn_ended:
+            while key in self._turn_ended:
                 await asyncio.sleep(self._delay_s)
-                if self._turn_ended.pop(session_id, None) is not None:
+                if self._turn_ended.pop(key, None) is not None:
                     await self._refresh_once(session_id)
         finally:
-            self._running.pop(session_id, None)
+            self._running.pop(key, None)
 
     async def _refresh_once(self, session_id: str) -> None:
         assert self._refresh is not None

@@ -7,13 +7,62 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.debug_logging import record_to_row
+from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _record_native_input_lifecycle,
+    _settle_undelivered_native_input,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+
+@pytest.mark.asyncio
+async def test_rejected_durable_input_restores_by_client_id_after_server_restart(
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native"})
+    content = [{"type": "input_text", "text": "saved message"}]
+    stable_id = "a" * 32
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=PENDING_INPUT_RESPONSE_ID,
+                data=MessageData(role="user", content=content, user_authored=True),
+                stable_id=stable_id,
+                status="incomplete",
+                created_by="alice@example.com",
+            )
+        ],
+    )
+    original_pending = pending_inputs.record(conv.id, content, stable_id=stable_id)
+    original = pending_inputs.delivery_attributes_for(conv.id, original_pending)
+    pending_inputs.reset_for_tests()
+    newer = pending_inputs.record(conv.id, [{"type": "input_text", "text": "later message"}])
+
+    for _ in range(2):
+        await _settle_undelivered_native_input(
+            store,
+            conv.id,
+            "resp_rejected",
+            stable_id,
+            pending_id=original_pending,
+            delivery_attempt_id=str(original["delivery_attempt_id"]),
+        )
+
+    [saved] = store.list_items(conv.id).data
+    assert saved.id == stable_id
+    assert saved.response_id == "resp_rejected"
+    assert saved.data.content == content
+    assert saved.created_by == "alice@example.com"
+    assert store.list_pending_inputs(conv.id) == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [newer]
+    pending_inputs.resolve(conv.id, newer)
 
 
 @pytest.mark.asyncio

@@ -2,26 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import base64
 import codecs
 import contextlib
 import errno
+import functools
 import json
+import locale
 import logging
 import os
+import select
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TextIO, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
@@ -32,8 +37,10 @@ from omnigent.runner.identity import (
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
+from ._bounded_output import DEFAULT_OUTPUT_CHARS, CapturedOutput
+from ._proc import run_isolated
 from .agent_env import strip_desktop_session_env
-from .async_utils import run_sync_on_thread
+from .async_utils import run_sync_cleanup, run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
@@ -56,10 +63,11 @@ from .sandbox import (
     with_additional_read_roots,
     with_additional_write_roots,
 )
+from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_broker
 
 if TYPE_CHECKING:
-    import asyncio
-
+    from ._bwrap_shell_request import BwrapShellRequest
+    from .claude_model_access import ClaudeModelAccess
     from .egress import EgressProxyHandle
     from .egress.proxy import EgressProxy
 from .sandbox import (
@@ -82,12 +90,23 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # Ops without side effects: safe to send again if the helper died before replying.
-_REPLAY_SAFE_OPS = frozenset({"read"})
+_REPLAY_SAFE_OPS = frozenset({"read", "shell_encoding"})
+_SHELL_METADATA_TIMEOUT_S = 10.0
+_MAX_SHELL_METADATA_BYTES = 64 * 1024
 
 logger = logging.getLogger(__name__)
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
 EditEntry: TypeAlias = dict[str, str]
+
+
+def validate_shell_arguments(command: object, timeout: int | None) -> OpResult | None:
+    """Return the caller-process shell error before acquiring helper ownership."""
+    if not isinstance(command, str) or not command.strip():
+        return {"error": "command must be a non-empty string"}
+    if (120 if timeout is None else timeout) < 1:
+        return {"error": "timeout must be >= 1"}
+    return None
 
 
 class _PopenKwargs(TypedDict, total=False):
@@ -175,7 +194,7 @@ _DEFAULT_ENV_PASSTHROUGH_PREFIXES: tuple[str, ...] = ("LC_",)
 # (e.g. ``cat`` on a multi-MB log file) saturate the context window and cause
 # the LLM to fail with a context-length-exceeded error. The limit applies
 # independently to stdout and stderr — each may be up to this size.
-_MAX_TOOL_OUTPUT_CHARS = 100_000
+_MAX_TOOL_OUTPUT_CHARS = DEFAULT_OUTPUT_CHARS
 
 # Default line limit for sys_os_read when the caller does not specify one.
 # Without a cap an agent can ask to read an unbounded file and saturate the
@@ -334,6 +353,8 @@ class OSEnvironment(ABC):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -361,6 +382,25 @@ class OSEnvironment(ABC):
     ) -> OpResult:
         raise NotImplementedError
 
+    async def isolated_shell(
+        self,
+        command: str,
+        timeout: int | None = None,
+        max_output: int | None = None,
+        *,
+        launcher: str | None = None,
+    ) -> OpResult:
+        """Retire a shell's complete lifetime before its environment can be reused."""
+        del command, timeout, max_output, launcher
+        return {"error": "This environment does not support reusable shell requests"}
+
+    def run_git(
+        self, argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run Git read arguments from a worker thread in this environment."""
+        del argv, cwd, timeout
+        raise OSError("This environment does not support Git reads")
+
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
         """Remove the entry *path* names, confined like ``write``.
 
@@ -376,6 +416,11 @@ class OSEnvironment(ABC):
         if policy.copy_on_write_roots:
             raise RuntimeError("This environment cannot own copy-on-write mounts")
 
+    def isolate_model_credentials(self, access: ClaudeModelAccess) -> None:
+        """Apply the owning session's credential boundary before executing tools."""
+        del access
+        raise NotImplementedError("This OS environment cannot isolate model credentials")
+
     @property
     def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
         return None
@@ -387,6 +432,29 @@ class OSEnvironment(ABC):
         handles, etc.). The default is a no-op so stateless environments
         don't need to implement it.
         """
+
+
+@dataclass(frozen=True)
+class _PreparedHelper:
+    sandbox: SandboxPolicy
+    cwd: Path
+    env: dict[str, str]
+
+
+def _wait_shell_metadata_pipe(
+    descriptor: int, event: int, deadline: float, request: BwrapShellRequest
+) -> None:
+    from ._bwrap_request_control import RequestCancelled
+
+    poller = select.poll()
+    poller.register(descriptor, event)
+    while not request.cancelled.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("OS helper shell metadata preparation timed out")
+        if poller.poll(max(1, round(min(remaining, 0.05) * 1000))):
+            return
+    raise RequestCancelled("Shell request was cancelled during metadata preparation")
 
 
 class _HelperProcessClient:
@@ -402,8 +470,10 @@ class _HelperProcessClient:
         egress_rules: list[str] | None = None,
         egress_allow_private_destinations: bool = False,
         copy_on_write_environment: CopyOnWriteEnvironment | None = None,
+        relaunch_when_stale: bool = False,
     ) -> None:
         self._copy_on_write_environment = copy_on_write_environment
+        self._relaunch_when_stale = relaunch_when_stale
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
@@ -424,6 +494,11 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # Recompute callable and value of the running helper's launch fingerprint.
+        self._launch: tuple[Callable[[], object], object] | None = None
+        self._launch_env: dict[str, str] | None = None
+        self._prepared: _PreparedHelper | None = None
+        self._shell_metadata: tuple[str, dict[str, str]] | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -439,23 +514,220 @@ class _HelperProcessClient:
         # the handle when present.
         self._egress_handle: EgressProxyHandle | None = None
         self._git_ssh_broker: GitSshBroker | None = None
+        self._tcp_egress_broker: TcpEgressBroker | None = None
         self._lock = threading.Lock()
+        self._shell_request_lock = threading.Lock()
+        self._active_shell_request: BwrapShellRequest | None = None
+        self._closing = False
         # bwrap --die-with-parent kills the helper when the thread that spawned it
         # exits, and each request runs on its own short-lived thread.
         self._spawner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="os-env-helper")
         self._closed = False
+        self._model_access: ClaudeModelAccess | None = None
         atexit.register(self.close)
 
+    def isolate_model_credentials(self, access: ClaudeModelAccess) -> SandboxPolicy:
+        with self._lock:
+            protected = access.protect_sources(self.sandbox, self.cwd)
+            # Callbacks re-derive equal access; keep the running relay's placeholder.
+            if self._model_access != access:
+                self._stop_locked()
+                self._model_access = access
+            elif self._model_access is not None:
+                self._model_access._adopt_credential(access)
+            self.sandbox = protected
+            return protected
+
     def request(self, payload: OpRequest) -> OpResult:
+        if payload.get("op") == "git":
+            timeout = max(0.0, float(payload["timeout"]))
+            payload = {**payload, "deadline": time.monotonic() + timeout}
+            if not self._lock.acquire(timeout=timeout):
+                return {"timed_out": True}
+            try:
+                return self._request_locked(payload, allow_retry=True)
+            finally:
+                self._lock.release()
         with self._lock:
             return self._request_locked(payload, allow_retry=True)
 
     def close(self) -> None:
+        with self._shell_request_lock:
+            self._closing = True
+            if self._active_shell_request is not None:
+                self._active_shell_request.cancel()
         with self._lock:
             self._closed = True
             self._stop_locked()
         self._spawner.shutdown(wait=False)
         atexit.unregister(self.close)
+
+    def shell_request(
+        self,
+        command: str,
+        timeout: int,
+        max_output: int,
+        request: BwrapShellRequest,
+    ) -> OpResult:
+        # The helper lock retains its brokers and credential policy until retirement.
+        with self._lock:
+            with self._shell_request_lock:
+                if self._closed or self._closing:
+                    return {"error": "OS environment helper is closed"}
+                self._active_shell_request = request
+            try:
+                return self._shell_request_locked(command, timeout, max_output, request)
+            finally:
+                with self._shell_request_lock:
+                    self._active_shell_request = None
+
+    def _shell_request_locked(
+        self, command: str, timeout: int, max_output: int, request: BwrapShellRequest
+    ) -> OpResult:
+        if request.cancelled.is_set():
+            from ._bwrap_request_control import RequestCancelled
+
+            raise RequestCancelled("Shell request was cancelled before preparation")
+        self._ensure_started_locked()
+        metadata = self._shell_metadata
+        if metadata is None:
+            try:
+                response = self._read_shell_metadata_locked(request, timeout)
+            except BaseException:
+                self._stop_locked()
+                raise
+            encoding, locale_env = response.get("encoding"), response.get("locale")
+            if (
+                not isinstance(encoding, str)
+                or not isinstance(locale_env, dict)
+                or not all(
+                    isinstance(name, str) and isinstance(value, str)
+                    for name, value in locale_env.items()
+                )
+                or _shell_locale_env(locale_env) != locale_env
+            ):
+                self._stop_locked()
+                return {"error": "Failed to read the OS helper's shell locale and encoding"}
+            metadata = (encoding, locale_env)
+            self._shell_metadata = metadata
+        encoding, locale_env = metadata
+        assert self._prepared is not None
+        prepared = self._prepared
+        env = _child_shell_env(prepared.env)
+        for name in _shell_locale_env(env):
+            env.pop(name)
+        env.update(locale_env)
+        _authorize_proxy_env(env, self._egress_auth_token)
+        try:
+            completed = request.run(
+                argv=_shell_argv(self.shell_path, command),
+                cwd=prepared.cwd,
+                policy=prepared.sandbox,
+                command_env=env,
+                timeout=timeout,
+                max_output=max_output,
+                output_encoding=encoding,
+                spawn=self._spawn_shell_request,
+            )
+            if completed.encoding is None:
+                raise OSError("Shell request did not identify its output encoding")
+            if not isinstance(completed.stdout, CapturedOutput) or not isinstance(
+                completed.stderr, CapturedOutput
+            ):
+                raise OSError("Shell request did not bound its output")
+        except OSError as exc:
+            if not request.admitted:
+                return {"error": f"Failed to start isolated shell request: {exc}"}
+            return {
+                "error": (
+                    "Lost the isolated shell request; it may already have run, "
+                    f"so it was not sent again: {exc}"
+                )
+            }
+        stdout, stderr = completed.stdout, completed.stderr
+        decoding_error = stdout.decoding_error or stderr.decoding_error
+        if decoding_error is not None:
+            if not completed.timed_out:
+                return {"error": f"os_env helper exception: {decoding_error}"}
+            # Timeout cleanup cannot decode either complete stream after a decoding failure.
+            stdout = stderr = CapturedOutput("")
+        detail = ""
+        if not completed.timed_out and completed.exit_code != 0:
+            detail = next(
+                (
+                    _truncate_output(value.text, label, max_output, omitted=value.omitted).strip()
+                    for label, value in (("stderr", stderr), ("stdout", stdout))
+                    if value.nonblank or value.text.strip()
+                ),
+                "",
+            )
+        return _shell_result(
+            stdout=stdout.text,
+            stderr=stderr.text,
+            stdout_omitted=stdout.omitted,
+            stderr_omitted=stderr.omitted,
+            error_detail=detail,
+            exit_code=completed.exit_code,
+            timed_out=completed.timed_out,
+            timeout=timeout,
+            shell_path=self.shell_path,
+            cwd=prepared.cwd,
+            max_output=max_output,
+        )
+
+    def _read_shell_metadata_locked(self, request: BwrapShellRequest, timeout: int) -> OpResult:
+        assert self._proc is not None
+        assert self._proc.stdin is not None and self._proc.stdout is not None
+        outgoing = memoryview(b'{"op":"shell_encoding"}\n')
+        incoming = bytearray()
+        deadline = time.monotonic() + min(timeout, _SHELL_METADATA_TIMEOUT_S)
+        input_fd, output_fd = self._proc.stdin.fileno(), self._proc.stdout.fileno()
+        with contextlib.ExitStack() as restore:
+            for descriptor in (input_fd, output_fd):
+                blocking = os.get_blocking(descriptor)
+                os.set_blocking(descriptor, False)
+                restore.callback(os.set_blocking, descriptor, blocking)
+            while outgoing:
+                _wait_shell_metadata_pipe(input_fd, select.POLLOUT, deadline, request)
+                try:
+                    written = os.write(input_fd, outgoing)
+                except BlockingIOError:
+                    continue
+                if written <= 0:
+                    raise OSError("OS helper closed before shell metadata preparation")
+                outgoing = outgoing[written:]
+            while b"\n" not in incoming:
+                _wait_shell_metadata_pipe(output_fd, select.POLLIN, deadline, request)
+                try:
+                    chunk = os.read(output_fd, _MAX_SHELL_METADATA_BYTES + 1 - len(incoming))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise OSError("OS helper closed during shell metadata preparation")
+                incoming.extend(chunk)
+                if len(incoming) > _MAX_SHELL_METADATA_BYTES:
+                    raise OSError("OS helper returned oversized shell metadata")
+        if not incoming.endswith(b"\n") or b"\n" in incoming[:-1]:
+            raise OSError("OS helper returned an invalid shell metadata frame")
+        response = json.loads(incoming)
+        if not isinstance(response, dict):
+            raise OSError("OS helper returned invalid shell metadata")
+        return response
+
+    def _spawn_shell_request(
+        self, argv: list[str], env: dict[str, str], descriptors: tuple[int, ...]
+    ) -> subprocess.Popen[bytes]:
+        return self._spawner.submit(
+            lambda: subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(self.cwd),
+                env=env,
+                pass_fds=descriptors,
+            )
+        ).result()
 
     def _request_locked(
         self,
@@ -467,17 +739,19 @@ class _HelperProcessClient:
             return {"error": "OS environment helper is closed"}
 
         self._ensure_started_locked()
+        if payload.get("op") == "git":
+            remaining = payload["deadline"] - time.monotonic()
+            if remaining <= 0:
+                return {"timed_out": True}
+            payload = {**payload, "timeout": remaining}
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
 
+        encoded_request = json.dumps(payload) + "\n"
         try:
-            self._proc.stdin.write(json.dumps(payload) + "\n")
+            self._proc.stdin.write(encoded_request)
             self._proc.stdin.flush()
-        except OSError as exc:
-            # The helper never received the request, so any op can be sent again.
-            return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
-        try:
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._helper_exit_detail_locked())
@@ -506,14 +780,33 @@ class _HelperProcessClient:
     ) -> OpResult:
         self._stop_locked()
         if allow_retry and not self._closed:
-            self._ensure_started_locked()
             return self._request_locked(payload, allow_retry=False)
         return {"error": f"os_env helper failed: {exc}"}
 
     def _ensure_started_locked(self) -> None:
-        if self._proc is not None and self._proc.poll() is None:
+        if (
+            self._proc is not None
+            and self._proc.poll() is None
+            and not self._launch_is_stale_locked()
+        ):
             return
+        if self._proc is not None:
+            self._stop_locked()
         self._start_locked()
+
+    def _launch_is_stale_locked(self) -> bool:
+        """Whether a fresh launch would have different mounts or inherited values."""
+        # Proxy sources resolve at startup, including values filtered from the helper.
+        if self._relaunch_when_stale and self.sandbox.credential_proxy is not None:
+            return True
+        if self._launch_env is not None and (
+            build_helper_env(os.environ, self.sandbox) != self._launch_env
+        ):
+            return True
+        if self._launch is None:
+            return False
+        recompute, fingerprint = self._launch
+        return fingerprint is None or recompute() != fingerprint
 
     def _start_locked(self) -> None:
         try:
@@ -524,9 +817,15 @@ class _HelperProcessClient:
 
     def _start_unchecked_locked(self) -> None:
         sandbox = self.sandbox
+        if sandbox.active:
+            # Editable installs need the framework inside the helper's mount namespace.
+            sandbox = with_additional_read_roots(sandbox, [Path(__file__).resolve().parents[1]])
+            if self._model_access is not None:
+                sandbox = self._model_access.protect_sources(sandbox, self.cwd)
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
         env = build_helper_env(os.environ, sandbox)
+        self._launch_env = env.copy() if self._relaunch_when_stale else None
         project_root = str(_project_root())
         existing_pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
@@ -562,6 +861,12 @@ class _HelperProcessClient:
                     sandbox=sandbox,
                     cwd=self.cwd,
                 )
+            if self._model_access is not None:
+                home = self._tmpdir / "home"
+                (home / ".claude").mkdir(parents=True)
+                self._model_access.worker_environment(env, home)
+            if credential_runtime is not None:
+                # Restore only the validated placeholders and config after scrubbing.
                 env.update(credential_runtime.helper_env_updates)
                 # Materialize placeholder-only config files (e.g. a
                 # ``.databrickscfg`` listing proxied profiles with
@@ -569,11 +874,9 @@ class _HelperProcessClient:
                 # tool at them. No real secret is written to the sandbox.
                 _write_credential_proxy_files(env, credential_runtime.sandbox_files, self._tmpdir)
 
-        # Start L7 egress proxy if rules are configured. The proxy
-        # listens on a Unix socket in the scratch tmpdir; the helper
-        # starts a relay inside the network namespace that bridges
-        # loopback TCP to this socket.
-        if self._egress_rules and self._tmpdir is not None:
+        # Model inference always uses the relay; ordinary HTTP access needs rules.
+        # The helper bridges private loopback to the parent's Unix socket.
+        if (self._egress_rules or self._model_access is not None) and self._tmpdir is not None:
             sandbox = self._start_egress_proxy_locked(
                 sandbox,
                 env,
@@ -586,8 +889,14 @@ class _HelperProcessClient:
             self._git_ssh_broker = start_git_ssh_broker(sandbox.git_ssh, self._tmpdir)
             apply_git_ssh_env(env, self._git_ssh_broker)
             sandbox = replace(sandbox, git_ssh_socket_path=str(self._git_ssh_broker.socket_path))
+        if sandbox.tcp_egress and self._tmpdir is not None:
+            self._tcp_egress_broker = start_tcp_egress_broker(sandbox.tcp_egress, self._tmpdir)
+            apply_tcp_egress_env(env, self._tcp_egress_broker)
+            sandbox = replace(
+                sandbox, tcp_egress_socket_path=str(self._tcp_egress_broker.socket_path)
+            )
 
-        if self._tmpdir is not None:
+        if sandbox.active and self._tmpdir is not None:
             set_sandbox_env(env, self._tmpdir)
 
         config: dict[str, JsonValue] = {
@@ -630,7 +939,8 @@ class _HelperProcessClient:
         # paths/booleans — but we still keep the file private and ephemeral.
         r_fd: int | None = None
         if IS_WINDOWS:
-            assert self._tmpdir is not None
+            if self._tmpdir is None:
+                self._tmpdir = create_private_tmpdir()
             config_file = self._tmpdir / "helper-config.json"
             config_file.write_bytes(config_bytes)
             config_arg = ["--config-file", str(config_file)]
@@ -664,12 +974,16 @@ class _HelperProcessClient:
         # in resolve_sandbox without going through the registry).
         if sandbox.active:
             backend = get_backend(sandbox.backend_type)
-            spawn_argv = backend.wrap_launcher_argv(
-                helper_argv,
-                sandbox,
-                self.cwd,
-                chdir=helper_cwd if helper_cwd != self.cwd else None,
-            )
+            chdir = helper_cwd if helper_cwd != self.cwd else None
+            if self._relaunch_when_stale:
+                backend.prepare_launcher_filesystem(sandbox, self.cwd)
+                fingerprint = functools.partial(
+                    backend.launch_fingerprint, helper_argv, sandbox, self.cwd, chdir=chdir
+                )
+                # Taken before the wrap so a racing change errs toward a relaunch.
+                launched = fingerprint()
+                self._launch = (fingerprint, launched)
+            spawn_argv = backend.wrap_launcher_argv(helper_argv, sandbox, self.cwd, chdir=chdir)
         else:
             spawn_argv = helper_argv
         # ``pass_fds`` (POSIX only) unsets ``FD_CLOEXEC`` on ``r_fd`` so the
@@ -720,6 +1034,7 @@ class _HelperProcessClient:
         except Exception:
             self._stop_locked()
             raise
+        self._prepared = _PreparedHelper(sandbox, helper_cwd, env.copy())
 
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
@@ -727,7 +1042,16 @@ class _HelperProcessClient:
         stderr = ""
         if self._proc.stderr is not None:
             try:
-                stderr = self._proc.stderr.read().strip()
+                # Descendants can keep stderr open after the launcher exits.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=1)
+                stderr_fd = self._proc.stderr.fileno()
+                os.set_blocking(stderr_fd, False)
+                stderr = (
+                    os.read(stderr_fd, 64 * 1024)
+                    .decode(cast(TextIO, self._proc.stderr).encoding, errors="replace")
+                    .strip()
+                )
             except Exception:  # noqa: BLE001 — stderr read is best-effort for error detail
                 stderr = ""
         returncode = self._proc.poll()
@@ -738,6 +1062,10 @@ class _HelperProcessClient:
     def _stop_locked(self) -> None:
         proc = self._proc
         self._proc = None
+        self._launch = None
+        self._launch_env = None
+        self._prepared = None
+        self._shell_metadata = None
         try:
             if proc is None:
                 return
@@ -763,6 +1091,7 @@ class _HelperProcessClient:
                 except Exception:  # noqa: BLE001 — terminate may fail on already-exited process; escalate to kill
                     with contextlib.suppress(Exception):
                         proc.kill()
+                        proc.wait()
         finally:
             # Release the containment handle (Windows Job Object): with
             # kill-on-close this also reaps any helper descendants that
@@ -778,6 +1107,12 @@ class _HelperProcessClient:
                 except Exception:
                     logger.exception("Git SSH broker stop failed")
                 self._git_ssh_broker = None
+            if self._tcp_egress_broker is not None:
+                try:
+                    self._tcp_egress_broker.stop()
+                except Exception:
+                    logger.exception("TCP egress broker stop failed")
+                self._tcp_egress_broker = None
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
 
@@ -851,6 +1186,7 @@ class _HelperProcessClient:
             config FD to pick up.
         """
 
+        from .claude_gateway_shim import gateway_body_transform
         from .egress import apply_egress_env, start_egress_proxy
 
         assert self._tmpdir is not None
@@ -867,6 +1203,10 @@ class _HelperProcessClient:
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,
             credential_rewrites=credential_rewrites,
+            model_access=self._model_access,
+            request_body_transform=gateway_body_transform(self._model_access.base_url)
+            if self._model_access is not None
+            else None,
         )
 
         # S4 (security): hold the controller refs on the client so
@@ -898,6 +1238,7 @@ class _HelperProcessClient:
 
         return replace(
             sandbox,
+            allow_network=False if self._model_access is not None else sandbox.allow_network,
             egress_relay_port=handle.relay_port,
             egress_socket_path=str(handle.socket_path),
         )
@@ -937,6 +1278,10 @@ class CallerProcessOSEnvironment(OSEnvironment):
 
     _copy_on_write_environment: CopyOnWriteEnvironment | None = None
     _owns_copy_on_write: bool = False
+    _relaunch_when_stale: bool = False
+
+    def isolate_model_credentials(self, access: ClaudeModelAccess) -> None:
+        self.sandbox = self._helper.isolate_model_credentials(access)
 
     @property
     def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
@@ -970,6 +1315,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             egress_rules=self._egress_rules,
             egress_allow_private_destinations=self._egress_allow_private_destinations,
             copy_on_write_environment=self._copy_on_write_environment,
+            relaunch_when_stale=self._relaunch_when_stale,
         )
 
     async def read(
@@ -978,6 +1324,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -991,6 +1339,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "offset": offset,
                 "limit": limit,
                 "max_bytes": max_bytes,
+                "regular_only": regular_only,
             },
         )
         return cast(OpResult, result)
@@ -1032,11 +1381,10 @@ class CallerProcessOSEnvironment(OSEnvironment):
         timeout: int | None = None,
         max_output: int | None = None,
     ) -> OpResult:
-        if not isinstance(command, str) or not command.strip():
-            return {"error": "command must be a non-empty string"}
+        invalid = validate_shell_arguments(command, timeout)
+        if invalid is not None:
+            return invalid
         resolved_timeout = 120 if timeout is None else timeout
-        if resolved_timeout < 1:
-            return {"error": "timeout must be >= 1"}
         request: dict[str, object] = {
             "op": "shell",
             "command": command,
@@ -1046,6 +1394,85 @@ class CallerProcessOSEnvironment(OSEnvironment):
             request["max_output"] = max_output
         result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
+
+    async def isolated_shell(
+        self,
+        command: str,
+        timeout: int | None = None,
+        max_output: int | None = None,
+        *,
+        launcher: str | None = None,
+    ) -> OpResult:
+        from ._bwrap_shell_request import BwrapShellRequest
+
+        invalid = validate_shell_arguments(command, timeout)
+        if invalid is not None:
+            return invalid
+        resolved_timeout = 120 if timeout is None else timeout
+        if max_output is not None and (not isinstance(max_output, int) or max_output < 1):
+            return {"error": "max_output must be >= 1"}
+        if (
+            not self._relaunch_when_stale
+            or self.spec.fork
+            or self._start_in_scratch
+            or self._copy_on_write_environment is not None
+        ):
+            return {"error": "This environment does not support reusable shell requests"}
+        request = BwrapShellRequest(launcher=launcher)
+        result: Future[OpResult] = Future()
+
+        def run() -> None:
+            try:
+                result.set_result(
+                    self._helper.shell_request(
+                        command,
+                        resolved_timeout if isinstance(resolved_timeout, int) else 120,
+                        min(
+                            max_output if max_output is not None else _MAX_TOOL_OUTPUT_CHARS,
+                            5_000_000,
+                        ),
+                        request,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 — forward the owned worker's failure
+                result.set_exception(exc)
+
+        # Start before awaiting so loop-wide cancellation cannot discard the worker's owner.
+        worker = threading.Thread(target=run, name="os-env-shell-request", daemon=True)
+        worker.start()
+        wrapped = asyncio.wrap_future(result)
+        try:
+            return await asyncio.shield(wrapped)
+        except BaseException:
+            try:
+                request.cancel()
+            finally:
+                # Repeated cancellation cannot return a lease while its worker owns resources.
+                with contextlib.suppress(BaseException):
+                    await run_sync_cleanup(worker.join, component="os_env_shell_request")
+                # The caller may leave before the loop delivers the worker's exception.
+                wrapped.cancel()
+                if not wrapped.cancelled():
+                    wrapped.exception()
+            raise
+
+    def run_git(
+        self, argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Use the persistent sandbox helper; callers must use a worker thread."""
+        result = self._helper.request(
+            {"op": "git", "argv": argv, "cwd": str(cwd), "timeout": timeout}
+        )
+        if result.get("timed_out"):
+            raise subprocess.TimeoutExpired(["git", *argv], timeout)
+        if result.get("error"):
+            raise OSError(result["error"])
+        return subprocess.CompletedProcess(
+            ["git", *argv],
+            result["returncode"],
+            base64.b64decode(result["stdout"]),
+            base64.b64decode(result["stderr"]),
+        )
 
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
         result = await run_sync_on_thread(
@@ -1072,8 +1499,16 @@ def create_os_environment(
     copy_on_write_environment: CopyOnWriteEnvironment | None = None,
     sandbox_policy: SandboxPolicy | None = None,
     additional_read_roots: Sequence[Path] = (),
+    relaunch_when_stale: bool = False,
+    model_access: ClaudeModelAccess | None = None,
 ) -> OSEnvironment | None:
-    """Instantiate the configured OS environment."""
+    """Instantiate the configured OS environment.
+
+    :param relaunch_when_stale: Relaunch the helper before a request once a
+        fresh launch would have different mounts or inherited environment
+        values. Credential-proxy helpers relaunch for every request to resolve
+        their sources again. A relaunch discards the helper's scratch dir.
+    """
     if spec is None:
         return None
     if spec.type != "caller_process":
@@ -1082,6 +1517,10 @@ def create_os_environment(
     cwd = Path(spec.cwd or os.getcwd()).resolve(strict=False)
     fork_dir: Path | None = None
     if spec.fork:
+        if model_access is not None:
+            original_policy = sandbox_policy or resolve_sandbox(spec, cwd)
+            if original_policy.active:
+                model_access.protect_sources(original_policy, cwd)
         fork_dir = Path(tempfile.mkdtemp(prefix="omnigent-fork-"))
         effective_cwd = fork_dir / "root"
         _copy_tree(cwd, effective_cwd)
@@ -1103,7 +1542,7 @@ def create_os_environment(
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
     )
-    return CallerProcessOSEnvironment(
+    environment = CallerProcessOSEnvironment(
         spec=spec,
         cwd=cwd,
         sandbox=sandbox,
@@ -1113,7 +1552,11 @@ def create_os_environment(
         _start_in_scratch=spec.start_in_scratch,
         _egress_rules=egress_rules,
         _egress_allow_private_destinations=egress_allow_private,
+        _relaunch_when_stale=relaunch_when_stale,
     )
+    if model_access is not None:
+        environment.isolate_model_credentials(model_access)
+    return environment
 
 
 def default_os_env_spec_for_type(env_type: str) -> OSEnvSpec:
@@ -1137,6 +1580,73 @@ def _handle_helper_request(
     sandbox: SandboxPolicy,
 ) -> OpResult:
     op = request.get("op")
+    if op == "shell_encoding":
+        return {
+            "encoding": "utf-8" if sys.flags.utf8_mode else locale.getencoding(),
+            "locale": _shell_locale_env(os.environ),
+        }
+    if op == "git":
+        from omnigent.runtime.filesystem_registry import (
+            _LOCK_FREE_GIT_READ_OPTIONS,
+            _anchored_git_env,
+        )
+
+        args, target, timeout = request.get("argv"), request.get("cwd"), request.get("timeout")
+        if (
+            not isinstance(args, list)
+            or not args
+            or not all(isinstance(arg, str) for arg in args)
+            or args[0] not in {"status", "diff", "show"}
+            or not isinstance(target, str)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            return {"error": "Invalid Git read request"}
+        try:
+            git_cwd = _resolve_path(cwd, target)
+            _assert_within_reach(cwd, sandbox, git_cwd, need_write=False)
+            _assert_read_allowed(sandbox, git_cwd, cwd)
+            options = ["--no-ext-diff", "--no-textconv"] if args[0] == "diff" else []
+            argv = [
+                "git",
+                *_LOCK_FREE_GIT_READ_OPTIONS,
+                "-c",
+                "core.fsmonitor=false",
+                args[0],
+                *options,
+                *args[1:],
+            ]
+            git_env = _anchored_git_env()
+            if args[0] == "show":
+                # Baseline reads distinguish missing HEAD paths from other Git failures.
+                git_env["LC_ALL"] = "C"
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                completed = subprocess.run(
+                    argv,
+                    cwd=git_cwd,
+                    env=git_env,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=timeout,
+                )
+                stdout.seek(0)
+                stderr.seek(0)
+                output, errors = (
+                    stdout.read(10 * 1024 * 1024 + 1),
+                    stderr.read(10 * 1024 * 1024 + 1),
+                )
+            if max(len(output), len(errors)) > 10 * 1024 * 1024:
+                return {"error": "Git output exceeds the 10 MiB read limit"}
+            return {
+                "returncode": completed.returncode,
+                "stdout": base64.b64encode(output).decode("ascii"),
+                "stderr": base64.b64encode(errors).decode("ascii"),
+            }
+        except subprocess.TimeoutExpired:
+            return {"timed_out": True}
+        except OSError as exc:
+            return {"error": str(exc)}
+
     if op == "read":
         raw_path = request.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -1151,6 +1661,20 @@ def _handle_helper_request(
         offset = offset_raw if isinstance(offset_raw, int) else 1
         max_bytes_raw = request.get("max_bytes")
         max_bytes = max_bytes_raw if isinstance(max_bytes_raw, int) else None
+        if request.get("regular_only"):
+            if not max_bytes or max_bytes < 0 or not hasattr(os, "O_NONBLOCK"):
+                return {"error": "A bounded regular-file read is unavailable"}
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                with os.fdopen(descriptor, "rb") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        return {"error": "Original content requires a regular file"}
+                    content = source.read(max_bytes + 1)
+                if len(content) > max_bytes or b"\0" in content:
+                    return {"error": "Original content exceeds the text read limit"}
+                return {"content": content.decode("utf-8"), "encoding": "utf-8"}
+            except (OSError, UnicodeError) as exc:
+                return {"error": str(exc)}
         return _read_impl(
             path,
             offset,
@@ -1749,7 +2273,9 @@ def _edit_impl(
     }
 
 
-def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS) -> str:
+def _truncate_output(
+    text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS, *, omitted: int = 0
+) -> str:
     """
     Truncate a tool output field to ``limit`` characters.
 
@@ -1761,14 +2287,15 @@ def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS)
         e.g. ``"stdout"``.
     :param limit: Maximum number of characters to return. Defaults to
         :data:`_MAX_TOOL_OUTPUT_CHARS`.
+    :param omitted: Characters already discarded while draining the process pipes.
     :returns: The original string if within the limit, otherwise the
         first ``limit`` characters followed by a ``"[truncated: ...]"``
         sentinel.
     """
-    if len(text) <= limit:
+    if len(text) <= limit and not omitted:
         return text
     truncated = text[:limit]
-    dropped = len(text) - limit
+    dropped = max(0, len(text) - limit) + omitted
     return (
         truncated + f"\n[{label} truncated: {dropped:,} characters omitted."
         " Use a more targeted command to see the full output.]"
@@ -1800,7 +2327,7 @@ def _shell_impl(
     """
     argv = _shell_argv(shell_path, command)
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             argv,
             cwd=str(cwd),
             env=_child_shell_env(),
@@ -1815,34 +2342,61 @@ def _shell_impl(
         # consumers treat as a plain string.
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return {
-            "stdout": _truncate_output(stdout, "stdout", max_output),
-            "stderr": _truncate_output(stderr, "stderr", max_output),
-            "exit_code": None,
-            "timed_out": True,
-            "error": f"Command timed out after {timeout} seconds",
-            "shell": shell_path,
-            "cwd": str(cwd),
-        }
+        return _shell_result(
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=None,
+            timed_out=True,
+            timeout=timeout,
+            shell_path=shell_path,
+            cwd=cwd,
+            max_output=max_output,
+        )
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
-    stdout = _truncate_output(completed.stdout, "stdout", max_output)
-    stderr = _truncate_output(completed.stderr, "stderr", max_output)
+    return _shell_result(
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        exit_code=completed.returncode,
+        timed_out=False,
+        timeout=timeout,
+        shell_path=shell_path,
+        cwd=cwd,
+        max_output=max_output,
+    )
+
+
+def _shell_result(
+    *,
+    stdout: str,
+    stderr: str,
+    exit_code: int | None,
+    timed_out: bool,
+    timeout: int,
+    shell_path: str,
+    cwd: Path,
+    max_output: int,
+    stdout_omitted: int = 0,
+    stderr_omitted: int = 0,
+    error_detail: str | None = None,
+) -> OpResult:
     result: OpResult = {
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": completed.returncode,
-        "timed_out": False,
+        "stdout": _truncate_output(stdout, "stdout", max_output, omitted=stdout_omitted),
+        "stderr": _truncate_output(stderr, "stderr", max_output, omitted=stderr_omitted),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
         "shell": shell_path,
         "cwd": str(cwd),
     }
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    if timed_out:
+        result["error"] = f"Command timed out after {timeout} seconds"
+    elif exit_code != 0:
+        detail = error_detail if error_detail is not None else stderr.strip() or stdout.strip()
         if detail:
-            result["error"] = f"Command exited with status {completed.returncode}: {detail}"
+            result["error"] = f"Command exited with status {exit_code}: {detail}"
         else:
-            result["error"] = f"Command exited with status {completed.returncode}"
+            result["error"] = f"Command exited with status {exit_code}"
     return result
 
 
@@ -1904,7 +2458,7 @@ def _same_path(entry: str, root: Path) -> bool:
         return os.path.normpath(entry) == os.path.normpath(str(root))
 
 
-def _child_shell_env() -> dict[str, str]:
+def _child_shell_env(helper_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """
     Environment for agent shell commands, minus omnigent's own package root.
 
@@ -1917,7 +2471,7 @@ def _child_shell_env() -> dict[str, str]:
     project). Strip only omnigent's entry — any other ``PYTHONPATH`` the caller
     set is preserved, in order.
     """
-    env = os.environ.copy()
+    env = dict(os.environ if helper_env is None else helper_env)
     raw = env.get("PYTHONPATH")
     if not raw:
         return env
@@ -1928,6 +2482,31 @@ def _child_shell_env() -> dict[str, str]:
     else:
         env.pop("PYTHONPATH", None)
     return env
+
+
+def _shell_locale_env(env: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in env.items()
+        if name in {"LANG", "LANGUAGE"} or name.startswith("LC_")
+    }
+
+
+def _authorize_proxy_env(env: MutableMapping[str, str], token: str | None) -> None:
+    """Add broker authorization only to an in-process or FD-delivered environment."""
+    if not token:
+        return
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        current = env.get(key)
+        if not current:
+            continue
+        parts = urlparse(current)
+        if not parts.hostname:
+            continue
+        netloc = f"omnigent:{token}@{parts.hostname}"
+        if parts.port is not None:
+            netloc += f":{parts.port}"
+        env[key] = urlunparse(parts._replace(netloc=netloc))
 
 
 def _read_config_from_fd(fd: int) -> JsonValue:
@@ -2012,20 +2591,7 @@ def _run_helper(config: JsonValue) -> int:
     # any external observer's view.
     token_value = config.get("egress_auth_token")
     if isinstance(token_value, str) and token_value:
-        # ``urllib.parse`` correctly handles ``http://127.0.0.1:5678``
-        # and leaves us a hostname+port we can re-anchor with the
-        # auth token spliced into the userinfo.
-        for env_key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-            current = os.environ.get(env_key)
-            if not current:
-                continue
-            parts = urlparse(current)
-            if not parts.hostname:
-                continue
-            netloc = f"omnigent:{token_value}@{parts.hostname}"
-            if parts.port is not None:
-                netloc += f":{parts.port}"
-            os.environ[env_key] = urlunparse(parts._replace(netloc=netloc))
+        _authorize_proxy_env(os.environ, token_value)
 
     cwd = Path(cwd_value)
     os.chdir(cwd)

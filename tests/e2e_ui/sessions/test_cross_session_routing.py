@@ -194,6 +194,8 @@ async def _drive_cross_session_image_flush(base_url: str, session_a: str, sessio
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
+        # Queue busy follow-ups instead of steering them (Always steer defaults on).
+        await page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
         try:
             # Every (session_id, content-blocks) POSTed to a /events endpoint,
             # and every session_id an upload (/resources/files) was addressed to.
@@ -318,6 +320,8 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
+        # Queue busy follow-ups instead of steering them (Always steer defaults on).
+        await page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
         try:
             # Every (session_id, text) POSTed to a /events endpoint.
             event_posts: list[tuple[str, str]] = []

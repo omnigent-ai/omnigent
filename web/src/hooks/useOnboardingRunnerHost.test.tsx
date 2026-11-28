@@ -1,10 +1,14 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Host } from "@/hooks/useHosts";
-import { ONBOARDING_RUNNER_GRACE_MS, useOnboardingRunnerHost } from "./useOnboardingRunnerHost";
+import {
+  ONBOARDING_RUNNER_GRACE_MS,
+  resolveRunnerHost,
+  useOnboardingRunnerHost,
+} from "./useOnboardingRunnerHost";
 
 const bridge = vi.hoisted(() => ({
-  takeOnboardingRunner: vi.fn<() => Promise<"local" | "remote" | null>>(),
+  takeOnboardingRunner: vi.fn<(consumer: string) => Promise<"local" | "remote" | null>>(),
   getHostIdentity: vi.fn<() => Promise<{ cliInstalled: boolean; hostId: string | null } | null>>(),
 }));
 vi.mock("@/lib/nativeBridge", () => ({
@@ -36,17 +40,27 @@ describe("useOnboardingRunnerHost", () => {
     await waitFor(() => expect(result.current.pending).toBe(false));
     expect(result.current.hostId).toBeNull();
     expect(bridge.takeOnboardingRunner).toHaveBeenCalledOnce();
+    expect(bridge.takeOnboardingRunner).toHaveBeenCalledWith("hostPicker");
   });
 
   it("resolves 'local' to this machine's host once it's online", async () => {
     bridge.takeOnboardingRunner.mockResolvedValue("local");
+    // The shell names this machine after its host comes online, as it can on a slow start.
+    let nameMachine!: () => void;
+    bridge.getHostIdentity.mockReturnValue(
+      new Promise((resolve) => {
+        nameMachine = () => resolve({ cliInstalled: true, hostId: "laptop" });
+      }),
+    );
     const { result, rerender } = renderHook(({ hosts }) => useOnboardingRunnerHost(hosts), {
       initialProps: { hosts: [host("laptop", "offline"), host("box")] },
     });
     await waitFor(() => expect(bridge.takeOnboardingRunner).toHaveBeenCalled());
     expect(result.current).toMatchObject({ pending: true, hostId: null });
     rerender({ hosts: [host("laptop"), host("box")] });
-    expect(result.current).toEqual({ pending: false, hostId: "laptop" });
+    expect(result.current).toMatchObject({ pending: true, hostId: null });
+    nameMachine();
+    await waitFor(() => expect(result.current).toEqual({ pending: false, hostId: "laptop" }));
   });
 
   it("resolves 'remote' to the only other online host, and gives up with several", async () => {
@@ -154,5 +168,42 @@ describe("useOnboardingRunnerHost", () => {
     expect(result.current).toEqual({ pending: true, hostId: null });
     rerender({ hosts: [host("laptop"), host("box")] });
     expect(result.current).toEqual({ pending: false, hostId: "box" });
+  });
+});
+
+describe("resolveRunnerHost", () => {
+  it("names this machine for local and the only other online host for remote", () => {
+    const hosts = [host("laptop"), host("box"), host("old", "offline")];
+    expect(resolveRunnerHost("local", "laptop", hosts)).toEqual({
+      hostId: "laptop",
+      ambiguous: false,
+      waiting: false,
+    });
+    expect(resolveRunnerHost("remote", "laptop", hosts)).toEqual({
+      hostId: "box",
+      ambiguous: false,
+      waiting: false,
+    });
+  });
+
+  it("flags remote as ambiguous with several other online hosts", () => {
+    expect(resolveRunnerHost("remote", null, [host("a"), host("b")])).toEqual({
+      hostId: null,
+      ambiguous: true,
+      waiting: false,
+    });
+  });
+
+  it("waits while no candidate is online", () => {
+    expect(resolveRunnerHost("remote", "laptop", [host("laptop")])).toEqual({
+      hostId: null,
+      ambiguous: false,
+      waiting: true,
+    });
+    expect(resolveRunnerHost("local", "laptop", [host("laptop", "offline")])).toEqual({
+      hostId: null,
+      ambiguous: false,
+      waiting: true,
+    });
   });
 });

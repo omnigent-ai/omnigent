@@ -11,7 +11,13 @@ import { SidebarDataProvider } from "./useSidebarData";
 import { useAgents } from "./useAgents";
 import { refreshScopeWindow } from "@/lib/sidebarData";
 import type { Conversation } from "./useConversations";
-import { useAvailableAgents, prefetchAvailableAgentDetails } from "./useAvailableAgents";
+import {
+  fetchUserAgents,
+  useAgentCatalog,
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+} from "./useAvailableAgents";
+import { useCuratedOutHarnesses } from "./useCuratedOutHarnesses";
 
 // The template catalog and sidebar Mine cache load through authenticatedFetch.
 // URL-keyed stubs exercise the real fetch and mapping path.
@@ -27,7 +33,8 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
-const MINE_URL = "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine";
+const MINE_URL =
+  "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine&expand_families=true";
 const HARNESSES_URL = "/v1/harnesses";
 
 /**
@@ -47,9 +54,10 @@ function routeFetch(routes: Record<string, Response>) {
 
 function wrapper({ children }: { children: ReactNode }) {
   // retry off so the no-network/error case resolves on the first
-  // attempt instead of stalling the test on TanStack's backoff.
+  // attempt instead of stalling the test on TanStack's backoff. Queries
+  // that set their own retry policy still retry, so make that immediate.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return (
     <QueryClientProvider client={client}>
@@ -154,10 +162,11 @@ describe("useAvailableAgents", () => {
     client.setQueryData(mineKey, cache(rows));
     routeFetch({
       [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
-      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared": mockResponse({
-        data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
-        has_more: false,
-      }),
+      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared&expand_families=true":
+        mockResponse({
+          data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
+          has_more: false,
+        }),
     });
     const { result } = renderHook(
       () => ({
@@ -1671,5 +1680,435 @@ describe("useAvailableAgents user agents (scope=user)", () => {
 
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
+  });
+});
+
+describe("useAgentCatalog", () => {
+  it("lists the caller's agents and flags ACP harnesses without a sidebar provider", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [
+          { id: "ag_jcode", name: "jcode", harness: "jcode", builtin: true },
+          { id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true },
+        ],
+        has_more: false,
+      }),
+      "/v1/agents?scope=user&limit=50": mockResponse({
+        data: [{ id: "ag_helper", name: "my-helper", harness: "claude-sdk", builtin: false }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "jcode", label: "Jcode", capabilities: { integration_mode: "acp-subprocess" } },
+        ],
+      }),
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: true }}>
+            {children}
+          </CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+
+    await waitFor(() => {
+      expect(result.current.data?.find((a) => a.name === "my-helper")?.mine).toBe(true);
+      expect(result.current.data?.find((a) => a.name === "jcode")?.acpHarness).toBe(true);
+    });
+  });
+
+  it("reports a failed catalog and loads it on retry", async () => {
+    const harnesses = mockResponse({ data: [] });
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+      [HARNESSES_URL]: harnesses,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>{children}</CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [{ id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: harnesses,
+    });
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.data?.map((a) => a.name)).toEqual(["polly"]));
+    expect(result.current.isError).toBe(false);
+  });
+});
+
+const OWN_AGENTS_URL = "/v1/agents?scope=user&limit=50";
+
+/**
+ * Routes for reads of the caller's own agents: each page in turn, as
+ * `[distinct names, has_more]`, chained by its last id.
+ */
+function ownAgentPages(pages: readonly (readonly [number, boolean])[]): Record<string, Response> {
+  const routes: Record<string, Response> = {};
+  let next = 0;
+  let url = OWN_AGENTS_URL;
+  for (const [count, hasMore] of pages) {
+    const data = Array.from({ length: count }, () => {
+      next += 1;
+      return { id: `ag_own_${next}`, name: `own-agent-${next}`, harness: "claude-sdk" };
+    });
+    routes[url] = mockResponse({ data, has_more: hasMore, last_id: data.at(-1)?.id });
+    url = `${OWN_AGENTS_URL}&after=ag_own_${next}`;
+  }
+  return routes;
+}
+
+describe("fetchUserAgents", () => {
+  it.each([
+    ["49 names, then the end", [[49, false]], false],
+    ["exactly 50 names, then the end", [[50, false]], false],
+    ["the 50-name cap", [[50, true]], true],
+    [
+      "names skipped on the last page",
+      [
+        [49, true],
+        [2, false],
+      ],
+      true,
+    ],
+    [
+      "5 pages the server trimmed to copies",
+      [
+        [1, true],
+        [1, true],
+        [1, true],
+        [1, true],
+        [1, true],
+      ],
+      true,
+    ],
+  ] as const)("reports whether it read every own agent: %s", async (_, pages, truncated) => {
+    routeFetch(ownAgentPages(pages));
+
+    const list = await fetchUserAgents();
+
+    expect(list.truncated).toBe(truncated);
+    expect(list.agents.length).toBe(
+      Math.min(
+        50,
+        pages.reduce((sum, [count]) => sum + count, 0),
+      ),
+    );
+  });
+
+  it.each([
+    ["is missing", [{ last_id: undefined }]],
+    ["repeats", [{ last_id: "ag_own_1" }, { last_id: "ag_own_1" }]],
+  ])("reports a read cut short when a continuation cursor %s", async (_, cursors) => {
+    // The read stops on a cursor it can't follow, before the list says it ended.
+    const routes: Record<string, Response> = {};
+    let url = OWN_AGENTS_URL;
+    cursors.forEach(({ last_id }, index) => {
+      const row = {
+        id: `ag_own_${index + 1}`,
+        name: `own-agent-${index + 1}`,
+        harness: "claude-sdk",
+      };
+      routes[url] = mockResponse({ data: [row], has_more: true, last_id });
+      url = `${OWN_AGENTS_URL}&after=${last_id}`;
+    });
+    routeFetch(routes);
+
+    expect((await fetchUserAgents()).truncated).toBe(true);
+  });
+});
+
+describe("useCuratedOutHarnesses", () => {
+  const USER_AGENTS_URL = "/v1/agents?scope=user&limit=50";
+  const USER_AGENTS_KEY = ["available-agents-user"];
+  const CATALOG_KEY = ["available-agents-catalog"];
+  // The deployment hides Codex's built-in; a user's own Codex agent still needs it.
+  const HIDES_CODEX = mockResponse({
+    data: [{ id: "ag_claude", name: "claude-native-ui", harness: "claude-native", builtin: true }],
+    has_more: false,
+    suppressed_agent_names: ["codex-native-ui"],
+  });
+  const OWN_CODEX_AGENT = mockResponse({
+    data: [{ id: "ag_mine", name: "my-codex", harness: "codex-native", builtin: false }],
+    has_more: false,
+  });
+
+  /** The providers Settings renders a hook under: queries, capabilities and the sidebar. */
+  function settingsProviders(client: QueryClient, agentInstall: boolean) {
+    return function SettingsProviders({ children }: { children: ReactNode }) {
+      return (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: agentInstall }}>
+            <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
+              {children}
+            </SidebarDataProvider>
+          </CapabilitiesProvider>
+        </QueryClientProvider>
+      );
+    };
+  }
+
+  function renderCuration(agentInstall: boolean) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = renderHook(() => useCuratedOutHarnesses(), {
+      wrapper: settingsProviders(client, agentInstall),
+    });
+    return { client, result: view.result };
+  }
+
+  it("hides nothing until the user's own agents load, then keeps the harness they use", async () => {
+    let answerUserAgents: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((url: string) => {
+      if (url === BUILTINS_URL) return Promise.resolve(HIDES_CODEX);
+      if (url === HARNESSES_URL) return Promise.resolve(mockResponse({ data: [] }));
+      if (url === MINE_URL || url.includes("pinned=true")) return Promise.resolve(EMPTY_MINE);
+      if (url === USER_AGENTS_URL)
+        return new Promise<Response>((resolve) => {
+          answerUserAgents = resolve;
+        });
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+    const { client, result } = renderCuration(true);
+
+    await waitFor(() => expect(client.getQueryState(CATALOG_KEY)?.status).toBe("success"));
+    expect([...result.current]).toEqual([]);
+    act(() => answerUserAgents(OWN_CODEX_AGENT));
+    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+    expect([...result.current]).toEqual([]);
+  });
+
+  // Each read returns these pages in turn, as `[agent names, has_more]`; the
+  // traversal itself is covered by the fetchUserAgents cases above.
+  it.each([
+    ["every own agent read", [[49, false]], ["codex-native"]],
+    ["the read stopped at its cap", [[50, true]], []],
+  ] as const)("hides a suppressed harness only once %s", async (_, pages, expected) => {
+    routeFetch({
+      [BUILTINS_URL]: HIDES_CODEX,
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+      [MINE_URL]: EMPTY_MINE,
+      ...ownAgentPages(pages),
+    });
+    const { client, result } = renderCuration(true);
+
+    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+    await waitFor(() => expect([...result.current]).toEqual(expected));
+  });
+
+  it.each([
+    ["on Codex", mockResponse({ id: "ag_one_off", name: "my-codex", harness: "codex-native" }), []],
+    [
+      "on Claude",
+      mockResponse({ id: "ag_one_off", name: "my-claude", harness: "claude-native" }),
+      ["codex-native"],
+    ],
+    [
+      "whose harness the server reports unknown",
+      mockResponse({ id: "ag_one_off", name: "my-codex", harness: null }),
+      [],
+    ],
+    [
+      "whose harness can't be read",
+      mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+      [],
+    ],
+  ])(
+    "keeps a suppressed harness required by a selectable session-discovered custom agent %s",
+    async (_, sessionAgent, expected) => {
+      // A one-off upload: in a recent session only, neither built-in nor one of the user's own.
+      routeFetch({
+        [BUILTINS_URL]: HIDES_CODEX,
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+        [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
+        "/v1/sessions/session_0/agent": sessionAgent,
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result } = renderHook(
+        () => ({ curated: useCuratedOutHarnesses(), picker: useAvailableAgents() }),
+        { wrapper: settingsProviders(client, true) },
+      );
+
+      // New Chat still offers the agent.
+      await waitFor(() =>
+        expect(result.current.picker.data?.some((agent) => agent.id === "ag_one_off")).toBe(true),
+      );
+      await waitFor(() =>
+        expect(["success", "error"]).toContain(
+          client.getQueryState(["session-agent-harness", "ag_one_off"])?.status,
+        ),
+      );
+      await waitFor(() => expect([...result.current.curated]).toEqual(expected));
+    },
+  );
+
+  it.each(["session-only agents", "own agents", "a catalog template"] as const)(
+    "keeps the harness of a pinned older agent from %s",
+    async (source) => {
+      const older = {
+        id: "ag_pinned",
+        name: "my-agent",
+        harness: "codex-native",
+        builtin: false,
+        created_at: 100,
+      };
+      const newer = { ...older, id: "ag_newer", harness: "claude-native", created_at: 200 };
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          data: source === "a catalog template" ? [older] : [],
+          has_more: false,
+          suppressed_agent_names: ["codex-native-ui"],
+        }),
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({
+          data:
+            source === "session-only agents"
+              ? []
+              : source === "own agents"
+                ? [newer, older]
+                : [newer],
+          has_more: false,
+        }),
+        [MINE_URL]: sessionResponse({
+          data: source === "session-only agents" ? [newer, older] : [],
+          has_more: false,
+        }),
+        "/v1/sessions/session_0/agent": mockResponse(newer),
+        "/v1/sessions/session_1/agent": mockResponse(older),
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result } = renderHook(
+        () => ({
+          curated: useCuratedOutHarnesses(),
+          picker: useAvailableAgents({ pinnedAgentIds: [older.id] }),
+          catalog: useAgentCatalog(true, { sessionAgents: true }),
+        }),
+        { wrapper: settingsProviders(client, true) },
+      );
+
+      await waitFor(() => {
+        expect(result.current.catalog.complete).toBe(true);
+        expect(result.current.picker.isPlaceholderData).toBe(false);
+        expect(result.current.picker.data?.map((agent) => agent.id)).toContain(older.id);
+      });
+      expect([...result.current.curated]).toEqual([]);
+    },
+  );
+
+  it.each([
+    [null, "claude-native", "error", [], ["codex-native"]],
+    ["claude-native", "codex-native", "success", ["codex-native"], []],
+  ] as const)(
+    "refreshes a session agent's harness from %s to %s when Settings reopens",
+    async (initialHarness, nextHarness, initialStatus, before, after) => {
+      const routes = {
+        [BUILTINS_URL]: HIDES_CODEX,
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+        [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
+        "/v1/sessions/session_0/agent": mockResponse({
+          id: "ag_one_off",
+          name: "my-one-off",
+          harness: initialHarness,
+        }),
+      };
+      routeFetch(routes);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const queryKey = ["session-agent-harness", "ag_one_off"];
+      const { result, rerender } = renderHook(({ enabled }) => useCuratedOutHarnesses(enabled), {
+        initialProps: { enabled: true },
+        wrapper: settingsProviders(client, true),
+      });
+      await waitFor(() => expect(client.getQueryState(queryKey)?.status).toBe(initialStatus));
+      expect([...result.current]).toEqual(before);
+      rerender({ enabled: false });
+
+      routeFetch({
+        ...routes,
+        "/v1/sessions/session_0/agent": mockResponse({
+          id: "ag_one_off",
+          name: "my-one-off",
+          harness: nextHarness,
+        }),
+      });
+      rerender({ enabled: true });
+      await waitFor(() => {
+        expect(client.getQueryData(queryKey)).toBe(nextHarness);
+        expect([...result.current]).toEqual(after);
+      });
+    },
+  );
+
+  it.each([
+    ["nothing", []],
+    ["only non-native built-ins", ["polly"]],
+  ])(
+    "looks up no session agent's harness when the deployment hides %s",
+    async (_, suppressedNames) => {
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          data: [],
+          has_more: false,
+          suppressed_agent_names: suppressedNames,
+        }),
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+        [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
+      });
+      const { client, result } = renderCuration(true);
+
+      await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+      await waitFor(() => expect(client.getQueryState(CATALOG_KEY)?.status).toBe("success"));
+      expect([...result.current]).toEqual([]);
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/agent"))).toBe(false);
+    },
+  );
+
+  it("hides nothing while the user's own agents fail to load", async () => {
+    routeFetch({
+      [BUILTINS_URL]: HIDES_CODEX,
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+      [MINE_URL]: EMPTY_MINE,
+      [USER_AGENTS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+    });
+    const { client, result } = renderCuration(true);
+
+    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("error"));
+    expect([...result.current]).toEqual([]);
+  });
+
+  it.each([
+    ["the catalog", BUILTINS_URL, CATALOG_KEY],
+    ["the user's own agents", USER_AGENTS_URL, USER_AGENTS_KEY],
+  ])("stops hiding a harness when a refetch of %s fails", async (_, failingUrl, queryKey) => {
+    const routes = {
+      [BUILTINS_URL]: HIDES_CODEX,
+      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+      [MINE_URL]: EMPTY_MINE,
+    };
+    routeFetch(routes);
+    const { client, result } = renderCuration(true);
+    await waitFor(() => expect([...result.current]).toEqual(["codex-native"]));
+
+    routeFetch({
+      ...routes,
+      [failingUrl]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+    });
+    await act(() => client.refetchQueries({ queryKey }));
+    await waitFor(() => expect([...result.current]).toEqual([]));
   });
 });

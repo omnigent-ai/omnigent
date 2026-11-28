@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -968,6 +969,8 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         "different_thread",
         "launch_error",
         "launch_cancelled",
+        "rotated",
+        "rotated_exited",
     ],
 )
 @pytest.mark.asyncio
@@ -981,6 +984,9 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
 
     session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    # A forwarder rotation onto a fresh thread's session keeps the backend keyed by session_id.
+    rotated_session_id = "5c0e2f8b9d7a4e61b3f2a1c0d9e8f7a6"
+    rotated_thread_id = "019e96aa-0be2-7343-8d3b-6f914d6093a1"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -999,7 +1005,10 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             :returns: HTTP 200 response carrying launch config or items.
             """
             del kwargs
-            if url == f"/v1/sessions/{session_id}/items":
+            if url in {
+                f"/v1/sessions/{session_id}/items",
+                f"/v1/sessions/{rotated_session_id}/items",
+            }:
                 return httpx.Response(
                     200,
                     json={
@@ -1013,6 +1022,17 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
                             }
                         ],
                         "has_more": False,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            if url == f"/v1/sessions/{rotated_session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "external_session_id": rotated_thread_id,
+                        "labels": {
+                            codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id
+                        },
                     },
                     request=httpx.Request("GET", url),
                 )
@@ -1083,6 +1103,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -1173,27 +1194,30 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
         bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
         assert bridge_state is not None
-        if recovery_state == "exited":
+        rotated = recovery_state in {"rotated", "rotated_exited"}
+        recovered_session_id = rotated_session_id if rotated else session_id
+        if recovery_state in {"exited", "rotated_exited"}:
             original_server.proc.returncode = 1
         elif recovery_state == "forwarder_done":
             original_forwarder.cancel()
             await asyncio.gather(original_forwarder, return_exceptions=True)
         elif recovery_state == "missing_bridge":
             codex_native_bridge.clear_bridge_state(bridge_dir)
-        elif recovery_state == "different_thread":
+        if recovery_state == "different_thread" or rotated:
             codex_native_bridge.write_bridge_state(
                 bridge_dir,
                 codex_native_bridge.CodexNativeBridgeState(
-                    session_id=session_id,
+                    session_id=rotated_session_id if rotated else session_id,
                     socket_path=bridge_state.socket_path,
-                    thread_id="another-thread",
+                    thread_id=rotated_thread_id if rotated else "another-thread",
                     codex_home=bridge_state.codex_home,
                     cwd=bridge_state.cwd,
                 ),
             )
+        recovered_bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
 
         recovery = runner_app_mod._auto_create_codex_terminal(
-            session_id,
+            recovered_session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             agent_spec=agent_spec,
@@ -1209,7 +1233,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             await recovery
         await asyncio.sleep(0)
 
-        reused = recovery_state in {"live", "launch_error", "launch_cancelled"}
+        reused = recovery_state in {"live", "launch_error", "launch_cancelled", "rotated"}
         assert len(app_servers) == (1 if reused else 2)
         assert len(runs) == (1 if reused else 2)
         assert runs[0].cancelled is not reused
@@ -1217,26 +1241,32 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is original_server
             assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is original_forwarder
             assert not original_server.closed
-            assert codex_native_bridge.read_bridge_state(bridge_dir) == bridge_state
+            assert codex_native_bridge.read_bridge_state(bridge_dir) == recovered_bridge_state
         else:
-            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is app_servers[1]
+            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[recovered_session_id] is app_servers[1]
             assert runs[1].cancelled is False
+        recovered_thread_id = rotated_thread_id if rotated else thread_id
         assert len(launched_specs) == 2
-        for spec in launched_specs:
+        for spec, launched_thread_id in zip(
+            launched_specs, [thread_id, recovered_thread_id], strict=True
+        ):
             assert spec.keep_alive_after_exit is True
-            assert thread_id in spec.args
+            assert launched_thread_id in spec.args
             assert "check_for_update_on_startup=false" in spec.args
             assert spec.env["CODEX_HOME"] == str(original_server.codex_home)
         live_runs = [run for run in runs if not run.cancelled]
         # Exactly one live forwarder mirrors the thread for the session.
         assert len(live_runs) == 1
-        registered = runner_app_mod._AUTO_FORWARDER_TASKS.get(session_id)
+        registered = runner_app_mod._AUTO_FORWARDER_TASKS.get(
+            session_id if reused else recovered_session_id
+        )
         assert registered is live_runs[0].task
         # Still running: a done survivor would leave the session unmirrored.
         assert not registered.done()
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
-        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        for registered_session_id in (session_id, rotated_session_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(registered_session_id, None)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(registered_session_id, None)
         await _drain_forwarder_runs(runs)
 
 
@@ -1413,6 +1443,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1467,19 +1498,39 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
-async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        {"code": -32600, "message": "no rollout found for thread id {thread_id}"},
+        {
+            "code": -32600,
+            "message": "This chat uses openai, but your current provider is Databricks.",
+            "data": {
+                "type": "modelProviderMismatch",
+                "modelProvider": "openai",
+                "currentModelProvider": "Databricks",
+            },
+        },
+    ],
+    ids=["missing_rollout", "managed_provider_mismatch"],
+)
+async def test_auto_create_codex_terminal_retries_refused_resume_on_same_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    refusal: dict[str, Any],
 ) -> None:
     """
-    A resume that briefly finds no rollout retries and keeps the thread.
+    A resume Codex refuses once retries and keeps the thread.
 
     Codex can answer ``no rollout found`` for a rollout the runner just wrote
-    until it indexes the file; one retry must resume the same thread, with no
-    reset notice and no fresh-thread discovery.
+    until it indexes the file. Codex 0.166+ also refuses a thread recorded under
+    a provider other than its effective one, which a managed config can force.
+    Either way the same thread must resume, with no reset notice and no
+    fresh-thread discovery.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param refusal: JSON-RPC error Codex returns for the first resume.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
     import omnigent.runner.native.orchestration as orchestration_mod
@@ -1581,30 +1632,33 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         async def close(self) -> None:
             """:returns: None."""
 
-    preloads: list[str] = []
+    resumes: list[dict[str, Any]] = []
 
-    async def _late_rollout_preload(
-        transport: str,
-        loaded_thread_id: str,
-        *,
-        terminal_launch_args: list[str] | None = None,
-        retain_client: bool = False,
-        cwd: Path | None = None,
-        model_provider: str | None = None,
-    ) -> None:
-        """
-        Report the rollout missing on the first resume only.
+    class _RefuseFirstResumeClient:
+        """Preload client whose first ``thread/resume`` Codex refuses."""
 
-        :param transport: App-server transport URL (ignored).
-        :param loaded_thread_id: Thread id passed to ``thread/resume``.
-        :raises CodexAppServerResponseError: On the first call.
-        """
-        del transport, terminal_launch_args
-        preloads.append(loaded_thread_id)
-        if len(preloads) == 1:
-            raise codex_app_mod.CodexAppServerResponseError(
-                {"code": -32600, "message": f"no rollout found for thread id {loaded_thread_id}"}
-            )
+        async def connect(self) -> None:
+            """:returns: None."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """
+            Refuse the first resume with the parametrized error.
+
+            :param method: JSON-RPC method, always ``"thread/resume"``.
+            :param params: Resume params.
+            :returns: Empty resume result after the first call.
+            :raises CodexAppServerResponseError: On the first call.
+            """
+            assert method == "thread/resume"
+            resumes.append(params)
+            if len(resumes) == 1:
+                raise codex_app_mod.CodexAppServerResponseError(
+                    {**refusal, "message": refusal["message"].format(thread_id=thread_id)}
+                )
+            return {"result": {}}
+
+        async def close(self) -> None:
+            """:returns: None."""
 
     runs: list[_ForwarderRun] = []
 
@@ -1650,7 +1704,9 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         _fake_build_codex_native_server,
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
-    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _late_rollout_preload)
+    monkeypatch.setattr(
+        codex_app_mod, "client_for_transport", lambda *_args, **_kwargs: _RefuseFirstResumeClient()
+    )
     monkeypatch.setattr(
         runner_app_mod, "_codex_forward_known_thread", _parking_forward_known_thread
     )
@@ -1674,7 +1730,17 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         )
         await asyncio.sleep(0)
 
-        assert preloads == [thread_id, thread_id]
+        assert [resume["threadId"] for resume in resumes] == [thread_id, thread_id]
+        current_provider = refusal.get("data", {}).get("currentModelProvider")
+        if current_provider is None:
+            assert resumes[1] == resumes[0]
+        else:
+            assert resumes[1] == {**resumes[0], "modelProvider": current_provider}
+            (rollout,) = codex_native_bridge.codex_home_for_bridge_dir(
+                codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+            ).glob(f"sessions/**/rollout-*-{thread_id}.jsonl")
+            session_meta = json.loads(rollout.read_text().splitlines()[0])["payload"]
+            assert session_meta["model_provider"] == current_provider
         assert posted == [], "a resume that succeeds on retry must not post a reset notice"
         assert launched_args and thread_id in launched_args[0]
         assert len(runs) == 1 and runs[0].cancelled is False
@@ -1858,6 +1924,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Refuse the resume with the parametrized error payload.

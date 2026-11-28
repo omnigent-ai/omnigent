@@ -1,11 +1,25 @@
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
-import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
+import type { BrowserNavigationResult } from "@/lib/nativeBridge";
+import {
+  maybeOpenLinkInApp,
+  onInAppLinkOpen,
+  openLink,
+  openLinkInSidebar,
+  openLinkWithOutcome,
+  parseHttpUrl,
+} from "@/lib/openLinkInApp";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
+
+const getSessionSlim = vi.fn();
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
 
 const CONV = "conv-1";
 const URL_ = "https://example.com/page";
@@ -17,6 +31,11 @@ let surfaced: { conversationId: string; tabId: string }[];
 let unsubscribe: () => void;
 
 beforeEach(() => {
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: "local-host",
+    parentSessionId: null,
+  }));
   openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
   hasView = vi.fn().mockResolvedValue({ exists: false });
   closeView = vi.fn().mockResolvedValue({ ok: true });
@@ -53,16 +72,20 @@ it.each([true, false])(
       vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
     }
     expect(maybeOpenLinkInApp(CONV, URL_)).toBe(true);
-    expect(openOrNavigate).toHaveBeenCalledOnce();
-    // Model-authored links get the agent navigation policy (no internal hosts).
+    expect(surfaced).toEqual([]);
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
     const firstViewId = openOrNavigate.mock.calls[0][0];
     expect(firstViewId).toMatch(/^browser-tab:conv-1:[^:]+$/);
-    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, { agent: true });
-    expect(surfaced).toEqual([]);
+    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, {
+      agent: true,
+      sourceHostId: "local-host",
+      sessionHostProtocol: 1,
+    });
     await vi.waitFor(() =>
       expect(surfaced).toEqual([{ conversationId: CONV, tabId: firstViewId.split(":")[2] }]),
     );
     expect(maybeOpenLinkInApp(CONV, "https://example.com/other")).toBe(true);
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledTimes(2));
     const secondViewId = openOrNavigate.mock.calls[1][0];
     expect(secondViewId).not.toBe(firstViewId);
     await vi.waitFor(() => expect(surfaced).toHaveLength(2));
@@ -119,7 +142,7 @@ it("coalesces repeated clicks before the first navigation is accepted", async ()
 
   maybeOpenLinkInApp(CONV, URL_);
   maybeOpenLinkInApp(CONV, URL_);
-  expect(openOrNavigate).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
   accept({ ok: true });
   await vi.waitFor(() => expect(surfaced).toHaveLength(1));
 });
@@ -245,4 +268,166 @@ it.each([
   ["http://[", null],
 ])("parseHttpUrl(%j) keeps only http(s) URLs", (href, expected) => {
   expect(parseHttpUrl(href)?.href ?? null).toBe(expected);
+});
+
+it("omits host options when the owning session has no resolvable host", async () => {
+  getSessionSlim.mockRejectedValue(new Error("host unavailable"));
+  maybeOpenLinkInApp(CONV, URL_);
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenCalledWith(expect.any(String), URL_, undefined, {
+      agent: true,
+    }),
+  );
+  expect(getSessionSlim).toHaveBeenCalledWith(CONV);
+});
+
+it.each([false, true])(
+  "resolves the current host for a new link after the session moves (during consent: %s)",
+  async (movesDuringConsent) => {
+    let hostId = "local-host";
+    getSessionSlim.mockImplementation(async (id: string) => ({
+      id,
+      hostId,
+      parentSessionId: null,
+    }));
+    maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/before");
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+    hostId = "remote-host";
+    let answerConsent!: (result: BrowserNavigationResult) => void;
+    const consent = new Promise<BrowserNavigationResult>((resolve) => {
+      answerConsent = resolve;
+    });
+    if (movesDuringConsent) {
+      Object.assign(window, {
+        omnigentDesktop: {
+          kind: "electron",
+          browserOpenOrNavigate: openOrNavigate,
+          browserHasView: hasView,
+          browserClose: closeView,
+          getDesktopFeatures: async () => ({ sshLocalhostPreview: true }),
+        },
+      });
+      openOrNavigate.mockReturnValueOnce(consent);
+    }
+    maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/after");
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledTimes(2));
+    expect(openOrNavigate).toHaveBeenLastCalledWith(
+      expect.any(String),
+      "http://127.0.0.1:5173/after",
+      undefined,
+      {
+        agent: true,
+        sourceHostId: "remote-host",
+        sessionHostProtocol: 1,
+        ...(movesDuringConsent ? { sshPreviewProtocol: 1 } : {}),
+      },
+    );
+    if (movesDuringConsent) {
+      expect(surfaced).toHaveLength(1);
+      hostId = "ungranted-host";
+      answerConsent({ ok: false, retryWithFreshHost: true, navigationRetryToken: "link" });
+      await vi.waitFor(() => expect(closeView).toHaveBeenCalledOnce());
+      expect(showToast).toHaveBeenCalledWith(expect.stringContaining("session host changed"));
+    } else {
+      await vi.waitFor(() => expect(surfaced).toHaveLength(2));
+    }
+    expect(openOrNavigate).toHaveBeenCalledTimes(2);
+    expect(getSessionSlim).toHaveBeenCalledTimes(movesDuringConsent ? 3 : 2);
+    expect(surfaced).toHaveLength(movesDuringConsent ? 1 : 2);
+  },
+);
+
+describe("opening a link with its outcome", () => {
+  const PR = "https://github.com/acme/app/pull/7";
+
+  it("is routed, never blocked, where the in-app browser or the desktop shell takes it", async () => {
+    expect(openLinkWithOutcome(CONV, PR)).toBe("routed");
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+    expect(window.open).not.toHaveBeenCalled();
+    writeOpenLinksInApp(false);
+    // The shell's window-open policy answers null though it opens the link.
+    expect(openLinkWithOutcome(CONV, PR)).toBe("routed");
+    expect(window.open).toHaveBeenCalledWith(PR, "_blank", "noopener,noreferrer");
+  });
+
+  it("opens a blank tab in a plain browser, cut off from this page, then leads it to the link", () => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    const tab = document.implementation.createHTMLDocument("");
+    const clicked: { href: string; rel: string; target: string; opener: unknown }[] = [];
+    const opened = { opener: window as unknown, document: tab };
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clicked.push({ href: this.href, rel: this.rel, target: this.target, opener: opened.opener });
+    });
+    vi.mocked(window.open).mockReturnValue(opened as unknown as Window);
+    expect(openLinkWithOutcome(CONV, PR)).toBe("opened");
+    expect(window.open).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(clicked).toEqual([
+      { href: PR, rel: "noopener noreferrer", target: "_self", opener: null },
+    ]);
+  });
+
+  it("is blocked only when the browser refuses the blank tab", () => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    expect(openLinkWithOutcome(CONV, PR)).toBe("blocked");
+    expect(window.open).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the blank tab and reads as blocked when it can't be led to the link", () => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    const close = vi.fn();
+    const opened = {
+      opener: window as unknown,
+      close,
+      get document(): Document {
+        throw new DOMException("Blocked a frame", "SecurityError");
+      },
+    };
+    vi.mocked(window.open).mockReturnValue(opened as unknown as Window);
+    expect(openLinkWithOutcome(CONV, PR)).toBe("blocked");
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["javascript:alert(1)", "data:text/html,hi", "mailto:a@example.com"])(
+    "opens nothing for %s",
+    (href) => {
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+      expect(openLinkWithOutcome(CONV, href)).toBe("blocked");
+      expect(window.open).not.toHaveBeenCalled();
+    },
+  );
+});
+
+it("opens a link in a new window unless the in-app browser takes it", () => {
+  openLink(CONV, URL_);
+  expect(window.open).not.toHaveBeenCalled();
+  writeOpenLinksInApp(false);
+  openLink(CONV, URL_);
+  expect(window.open).toHaveBeenCalledWith(URL_, "_blank", "noopener,noreferrer");
+});
+
+describe("openLinkInSidebar", () => {
+  it("opens the link in a sidebar browser tab with the link preference off", async () => {
+    writeOpenLinksInApp(false);
+    expect(openLinkInSidebar(CONV, URL_)).toBe(true);
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+    expect(openOrNavigate.mock.calls[0][1]).toBe(URL_);
+    expect(window.open).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "the shell has no browser bridge",
+      CONV,
+      URL_,
+      () => Reflect.deleteProperty(window, "omnigentDesktop"),
+    ],
+    ["there is no conversation", undefined, URL_, () => {}],
+    ["the scheme is not web", CONV, "mailto:a@example.com", () => {}],
+  ])("does nothing when %s", (_label, conv, href, arrange) => {
+    arrange();
+    expect(openLinkInSidebar(conv, href)).toBe(false);
+    expect(openOrNavigate).not.toHaveBeenCalled();
+  });
 });

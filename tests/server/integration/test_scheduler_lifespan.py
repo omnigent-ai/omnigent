@@ -39,7 +39,9 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
 )
 from tests._helpers.polling import poll_until_async
 
-pytestmark = pytest.mark.asyncio
+# Every test here creates RRULE tasks; the frozen clock keeps a stalled CI worker
+# from tripping the production elapsed-time search budget.
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("frozen_recurrence_clock")]
 
 
 def _uid(seed: str) -> str:
@@ -75,8 +77,15 @@ def _build_app(
     )
 
 
+@pytest.fixture
+def legacy_timers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opts out of the database scheduler, the default, to test the per-task timers."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-automations_v2")
+
+
 async def test_lifespan_starts_and_stops_scheduler(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
 ) -> None:
@@ -106,6 +115,7 @@ async def test_lifespan_starts_and_stops_scheduler(
 
 async def test_lifespan_arms_active_task_from_non_default_workspace(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
 ) -> None:
@@ -132,6 +142,7 @@ async def test_lifespan_arms_active_task_from_non_default_workspace(
 
 async def test_lifespan_survives_scheduler_start_failure(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -169,6 +180,7 @@ async def test_lifespan_without_store_has_no_scheduler(
 
 async def test_lifespan_skips_paused_task(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
 ) -> None:
@@ -280,18 +292,45 @@ async def test_lifespan_database_switch_dispatches_claim_and_drains(
     assert store.list_runs(task.id)[0][0].status == "starting"
 
 
-@pytest.mark.parametrize("features", [None, "-automations_v2", "automations_v2,-automations_v2"])
+async def test_dispatch_hooks_pass_the_live_switch_and_interval_to_the_scheduler(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+
+    def dispatch_enabled() -> bool:
+        return False
+
+    def poll_interval() -> float:
+        return 5
+
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        dispatch=ScheduledTaskDispatchHooks(
+            dispatch_enabled=dispatch_enabled, poll_interval=poll_interval
+        ),
+    )
+    async with app.router.lifespan_context(app):
+        scheduler = app.state.scheduled_task_scheduler
+        assert isinstance(scheduler, PersistentTaskScheduler)
+        assert scheduler._dispatch_enabled is dispatch_enabled
+        assert scheduler._poll_interval is poll_interval
+
+
+@pytest.mark.parametrize("features", ["-automations_v2", "automations_v2,-automations_v2"])
 async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    features: str | None,
+    features: str,
 ) -> None:
-    if features is None:
-        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
-    else:
-        monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
     fire, recover = AsyncMock(), AsyncMock()
     store = SqlAlchemyScheduledTaskStore(db_uri)
     store.configure_dispatch(True)
@@ -338,22 +377,36 @@ async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
         recover.assert_not_awaited()
 
 
+async def test_the_database_scheduler_is_the_default(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri))
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.scheduled_task_scheduler, PersistentTaskScheduler)
+
+
 @pytest.mark.parametrize("has_hooks", [True, False])
-async def test_automations_v2_flag_requires_a_scheduled_task_store(
+async def test_automations_v2_without_a_scheduled_task_store_starts_no_scheduler(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     has_hooks: bool,
 ) -> None:
+    """With no store there are no automations, so the app starts without a scheduler."""
     monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
-    with pytest.raises(ValueError, match="automations_v2 requires"):
-        _build_app(
-            db_uri,
-            tmp_path,
-            scheduled_task_store=None,
-            dispatch=ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock()) if has_hooks else None,
-        )
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=None,
+        dispatch=ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock()) if has_hooks else None,
+    )
+    async with app.router.lifespan_context(app):
+        assert getattr(app.state, "scheduled_task_scheduler", None) is None
 
 
 async def test_automations_v2_records_claims_with_the_built_in_executor(
@@ -389,7 +442,7 @@ async def test_automations_v2_records_claims_with_the_built_in_executor(
     assert run.trigger_key is not None
 
 
-async def test_automations_v2_run_now_starts_a_claimed_manual_run(
+async def test_automations_v2_run_now_records_a_manual_run_that_the_poll_starts(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
@@ -403,10 +456,20 @@ async def test_automations_v2_run_now_starts_a_claimed_manual_run(
         _uid("run-now"), "run now", "prompt", "FREQ=DAILY", None, _uid("agent"), "UTC"
     )
     store.update(task.id, state="paused")
-    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+    # Run now only records the run; a short poll starts it promptly.
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        scheduler_config=ScheduledTaskSchedulerConfig(poll_seconds=0.1),
+    )
 
     def finished_runs() -> list:
-        return [run for run in store.list_runs(task.id)[0] if run.status != "starting"]
+        return [
+            run
+            for run in store.list_runs(task.id)[0]
+            if run.status not in ("scheduled", "starting")
+        ]
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)

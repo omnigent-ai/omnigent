@@ -99,6 +99,13 @@ deploy/
 ├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
 │   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
+├── aws-lambda-microvm/ ← AWS Lambda MicroVMs sandbox-provider guide + MicroVM
+│   ├── Dockerfile        image build inputs (hooks shim on the host image);
+│   ├── entrypoint.sh     server-managed only. NOT a server deploy target.
+│   ├── hooks_server.py
+│   ├── start_host.sh
+│   └── README.md
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
@@ -219,6 +226,30 @@ to browsers (e.g. `docker compose up` with no proxy, reached over
 plain HTTP). That's fine for a single window; put a proxy in front once
 you or your team routinely open several.
 
+## Turning on gadget sharing
+
+Gadgets (the `gadgets` feature) can be shared when the server's permission
+store keeps gadget grants (the server reports `gadget_sharing: true`). A grant
+names a username, and a store that keeps grants removes an account's grants
+when it is deleted and refuses to register that username again until they are
+gone. So:
+
+1. Upgrade every server replica first, then turn on `gadgets`. If it is already
+   on, finish the rolling upgrade before anyone shares a gadget: an older
+   replica can delete an account and register its username again without
+   removing the grants, and the new account inherits them.
+2. Once anyone has shared a gadget, don't run a release without gadget sharing
+   against that store, even with `gadgets` turned off: turning the feature off
+   leaves the grants in place, and that release's account deletion and
+   registration would let a new account inherit them. Roll back further only
+   after removing the grants, which drops every share.
+
+Gadgets with per-viewer collections are refused by releases from before them,
+so while replicas are mixed, or after a rollback, those gadgets don't load there
+rather than keep private records as shared ones.
+
+See [`designs/GADGETS.md`](../designs/GADGETS.md) for details.
+
 ## Execution model
 
 Omnigent runs in two pieces that talk to each other over a
@@ -279,7 +310,9 @@ fallback.
 
 Before deploying the server, make client builds containing the PKCE update
 available through your CLI, mobile, and Slack distribution channels, and
-announce that older clients must upgrade to sign in again. Test both an old
+announce that older clients must upgrade to sign in again. Confirm the live
+App Store and Play Store builds contain the PKCE client, not just the version
+number in the repository: mobile builds are released by hand and can lag main. Test both an old
 and an updated client against a staging server with your actual identity
 provider. The old client must show the upgrade page without signing in; the
 updated client must complete fresh sign-in and browser approval. Preserve
@@ -293,13 +326,18 @@ session authenticated for that specific ticket; ordinary browser sessions,
 runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
 remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
 and a signed ID token with `auth_time` at or after the reauthentication request.
-Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
+Verify that your IdP honors `prompt=login` with a positive `max_age` (300 seconds
+by default; `OMNIGENT_OIDC_REAUTH_MAX_AGE` changes it) and supplies `auth_time`;
 missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
 but still requires ticket-specific browser sign-in and approval.
 For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
 Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
 `prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
 no longer verifies that the IdP asked for credentials again.
+If the IdP fails the sign-in when asked to re-authenticate (for example,
+self-managed GitLab), also set `OMNIGENT_OIDC_REAUTH_PROMPT=0` to stop sending
+`prompt=login` and `max_age`. The IdP then reuses its session, so only the
+ticket-specific approval screen confirms the request.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
@@ -368,13 +406,62 @@ All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
+**Host token expiry.** Set `sandbox.token_ttl_s` to control the token validity
+window in seconds. Omitted or `null` keeps the provider default (seven days
+for most providers; Modal uses 25 hours, and Blaxel, E2B, and CoreWeave derive
+it from sandbox lifetime). Values must be integers from `300` to `31536000`
+(5 minutes to 365 days). Allow enough time for sandbox startup and repository
+setup before the first host connection.
+
+```yaml
+sandbox:
+  server_url: https://your-host
+  token_ttl_s: 86400                 # shared default: 1 day
+  providers:
+    - provider: daytona
+    - provider: kubernetes
+      token_ttl_s: 604800            # override: 7 days
+```
+
+With a single `provider`, put `token_ttl_s` beside it. In a `providers` list,
+an entry can override the shared value or use `null` to restore its provider
+default. Restart the server after editing the configuration. The setting
+applies to newly issued tokens and future renewals; lowering it does not
+shorten an expiry already granted to an existing token.
+
+Connected hosts renew the same token halfway through this window, on the next
+heartbeat. Ordinary heartbeats keep their existing cost. Expiry is measured
+from the last renewal; disconnected hosts receive no renewals, and an expired
+token cannot open a new connection. Renewal also extends the validity of any
+leaked copy of that token. This setting does not change sandbox lifetime or
+Mac/Arca user-login credentials.
+
+**Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
+(off by default) to stop a session's sandbox when the session is archived, after
+its runner is stopped. It is a per-provider setting: in a `providers:` list, a
+value next to `providers` is every entry's default, and an entry can override it.
+The sandbox is stopped, not deleted, so unarchiving the session and sending a
+message resumes the same sandbox. It applies only to providers that can resume
+a stopped sandbox (`capabilities.resume_stopped`) and implement `stop()`; on a
+provider whose `stop()` raises `SandboxCapabilityError`, the option has no
+effect (the server logs that at debug level). Only a sandbox no other session
+uses is stopped: another session on the same host, or a side chat or sub-agent
+of the session, keeps it running even when archived, and so does a scheduled
+task run's sandbox. Deleting the session still terminates the sandbox, and so does
+the reaper below once a stopped sandbox's host passes its offline limit; the
+next message then starts a fresh sandbox instead.
+
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and
 detaches a sandbox generation only after its host has stayed offline past
 `terminate_after_offline_days`. Provider termination failures remain recorded
 for a later sweep, while the session history and durable host binding stay
-available for a fresh sandbox generation. Both
-`terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
+available for a fresh sandbox generation. Every server process sweeps on its
+own schedule: the first sweep runs at a random point within the first
+`sweep_interval_s` after startup, and later sweeps follow every
+`sweep_interval_s` ±10%, so replicas restarted together by a rollout don't scan
+the host table at the same moment. Both `terminate_after_offline_days` and
+`sweep_interval_s` must be positive integers.
 
 **The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
 
@@ -580,8 +667,16 @@ admins: [you@yourcompany.com]         # who can manage members
 across when you switch, so they keep their sessions and admin rights:
 
 ```bash
-omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com
+omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com \
+  --gadget-dir /data/gadgets
 ```
+
+`--gadget-dir` is the server's gadget directory (`<data dir>/gadgets` unless
+the config sets `gadget_location`), so the command can refuse users who own
+gadgets instead of cutting them off. A `--config` whose file sets
+`gadget_location` works too; pass `--no-gadgets` instead for a server that
+never kept any. Without any of these it checks only this machine's default
+gadget directory, and warns when there is none.
 
 For the provider-specific walkthroughs (GitHub OAuth, Google Workspace,
 generic OIDC), see
@@ -674,9 +769,33 @@ shows the Omnigent mascot, never your logo.
 `server_name` names this particular server, so people who connect the desktop
 app to several servers can tell them apart. It is published in the
 unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
-Desktop builds that read it always show the host next to it, and an MDM-provided
-name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
+Desktop builds that read it always show the host next to it, and a name set by
+device policy (`omnigentServerName`) takes precedence. When unset, the desktop shows the
 host; it does not fall back to `app_name`.
+
+## Curating the New Chat picker
+
+Limit and order what New Chat offers, and choose where a fresh chat starts, with
+two optional keys in the same server config as `branding:` (`omnigent server -c
+config.yaml`, `OMNIGENT_CONFIG`, or `<data_dir>/config.yaml` — `/data/config.yaml`
+in the Docker stack). Takes effect on the next server start.
+
+```yaml
+restrict_to_agent_names: [polly, claude-native-ui]  # New Chat offers only these, in this order
+default_agent_name: polly                            # where a user with no history starts
+```
+
+With `restrict_to_agent_names` set, New Chat shows one flat list: no Harnesses
+heading, no "Other..." submenus, no "Create custom agent" and no Smart Routing.
+A user's own earlier pick wins over `default_agent_name` while it is still
+offered. The server logs a warning at startup for a name it can't offer.
+
+This is display only, not access control: the API, the CLI, the automation and
+project-default pickers, and existing sessions still reach every agent. To
+remove packaged agents everywhere, use `OMNIGENT_SEEDED_AGENTS` ([Trimming the
+packaged built-in agents](docker/README.md#trimming-the-packaged-built-in-agents));
+an agent it removes stays hidden even when `restrict_to_agent_names` lists it.
+Both keys are served on the unauthenticated `GET /v1/info`.
 
 ## Adding a new deploy target
 

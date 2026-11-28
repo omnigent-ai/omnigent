@@ -1,10 +1,23 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isPageHiding } from "@/lib/pageLifecycle";
 import { isTempConvId } from "@/lib/tempConversationId";
-import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import { randomUUID } from "@/lib/randomUUID";
+import {
+  anyTerminalLaunching,
+  clearClosedDuringLaunch,
+  isClosedDuringLaunch,
+  requestCloseDuringLaunch,
+  setTerminalLaunching,
+  subscribeTerminalLaunches,
+  terminalInfoFromResource,
+  terminalResourceId,
+  terminalsQueryKey,
+  type TerminalInfo,
+} from "@/lib/terminals";
 import { showToast } from "@/components/ui/toast";
 
 export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -215,10 +228,37 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
   return (await fetchTerminalList(conversationId)) ?? [];
 }
 
+/**
+ * How long a shell-list read may take, body included, before it fails. Longer than a shell tab's
+ * wait, so a Try Again then joins the read, and the next one after it fails starts afresh.
+ */
+export const TERMINAL_LIST_TIMEOUT_MS = 30_000;
+
 /** {@link fetchTerminals}, but null when the runner could not answer (a soft status). */
 async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[] | null> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`terminals fetch timed out after ${TERMINAL_LIST_TIMEOUT_MS} ms`);
+      controller.abort(error);
+      reject(error);
+    }, TERMINAL_LIST_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([readTerminalList(conversationId, controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readTerminalList(
+  conversationId: string,
+  signal: AbortSignal,
+): Promise<TerminalInfo[] | null> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
+    { signal },
   );
   if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return null;
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);
@@ -248,6 +288,7 @@ async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[]
  * :param terminal: Declared terminal name from the agent spec,
  *     e.g. ``"shell"`` (or a shell basename like ``"zsh"`` for a native
  *     session offering the host's installed shells).
+ * :param sessionKey: Launch key, e.g. ``"u-ab12cd"``; a fresh one by default.
  * :returns: The created terminal mapped to :class:`TerminalInfo`.
  * :raises Error: When the server rejects the create (e.g. the agent
  *     has no terminal access) or the launch fails.
@@ -255,11 +296,8 @@ async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[]
 export async function createTerminal(
   conversationId: string,
   terminal: string,
+  sessionKey: string = newTerminalSessionKey(),
 ): Promise<TerminalInfo> {
-  // Random session key so repeated clicks launch fresh terminals —
-  // the runner's launch is idempotent per (terminal, session_key), so
-  // a fixed key would silently return the same terminal every time.
-  const sessionKey = `u-${Math.random().toString(36).slice(2, 8)}`;
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals`,
     {
@@ -286,6 +324,33 @@ export async function createTerminal(
 }
 
 /**
+ * A fresh launch key, e.g. ``"u-ab12cd"``.
+ *
+ * Random so repeated clicks launch fresh terminals — the runner's launch is
+ * idempotent per (terminal, session_key), so a fixed key would silently
+ * return the same terminal every time.
+ */
+function newTerminalSessionKey(): string {
+  return `u-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+}
+
+interface TerminalCreateRequest {
+  terminal: string;
+  sessionKey: string;
+}
+
+/** Callbacks for {@link useCreateTerminal}'s ``launch``. */
+export interface TerminalLaunchCallbacks {
+  /** The shell's tab can open; called at once, before the create returns. */
+  onOpen?: (info: TerminalInfo) => void;
+  /**
+   * The create failed. *opened* is the terminal handed to ``onOpen`` early, if
+   * any; it is already gone from the terminal list.
+   */
+  onError?: (error: Error, opened?: TerminalInfo) => void;
+}
+
+/**
  * Mutation hook around :func:`createTerminal`.
  *
  * On success the created terminal is merged into the terminals query
@@ -293,20 +358,105 @@ export async function createTerminal(
  * waiting for the ``session.resource.created`` SSE round-trip — which
  * still arrives and dedupes as a no-op.
  *
+ * ``launch`` is the UI entry point. It adds the terminal under its predicted
+ * id and opens its tab at once. With the runner online the attach WebSocket
+ * (``await_launch``) runs alongside the create; otherwise (runner asleep or
+ * unknown, where the create may wake it) the tab shows "Starting shell…"
+ * and attaches once the create returns. Only one launch per conversation
+ * runs at a time across its entry points: ``isPending`` covers any launch in
+ * flight there, and ``launch`` ignores a request while one is.
+ *
  * :param conversationId: Session/conversation identifier.
- * :returns: TanStack mutation taking the declared terminal name.
+ * :returns: TanStack mutation taking the declared terminal name, plus ``launch``.
  */
 export function useCreateTerminal(conversationId: string) {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (terminal: string) => createTerminal(conversationId, terminal),
+  const runnerOnline = useSessionRunnerOnline(conversationId || undefined);
+  const key = terminalsQueryKey(conversationId);
+  const addToCache = (info: TerminalInfo) => {
+    const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+    if (current.some((t) => t.id === info.id)) return;
+    queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
+  };
+  const removeFromCache = (terminalId: string) => {
+    const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+    queryClient.setQueryData<TerminalInfo[]>(
+      key,
+      current.filter((t) => t.id !== terminalId),
+    );
+  };
+  const mutation = useMutation({
+    mutationFn: (request: string | TerminalCreateRequest) =>
+      typeof request === "string"
+        ? createTerminal(conversationId, request)
+        : createTerminal(conversationId, request.terminal, request.sessionKey),
+    // A shell the user closed while its create was in flight stays closed.
     onSuccess: (info) => {
-      const key = terminalsQueryKey(conversationId);
-      const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
-      if (current.some((t) => t.id === info.id)) return;
-      queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
+      if (!isClosedDuringLaunch(info.id)) addToCache(info);
     },
   });
+  // Every entry point (rail menu, shortcut, split controls) has its own hook
+  // instance; this per-conversation flag keeps their launches from
+  // overlapping, so a failed create's rollback never races another launch.
+  const launchInFlight = useSyncExternalStore(subscribeTerminalLaunches, () =>
+    anyTerminalLaunching(conversationId),
+  );
+  const launch = (terminal: string, callbacks: TerminalLaunchCallbacks = {}) => {
+    if (anyTerminalLaunching(conversationId)) return;
+    const sessionKey = newTerminalSessionKey();
+    const predicted: TerminalInfo = {
+      id: terminalResourceId(terminal, sessionKey),
+      name: terminal,
+      session: sessionKey,
+      running: true,
+    };
+    setTerminalLaunching(predicted.id, runnerOnline === true ? "attach" : "wait", conversationId);
+    addToCache(predicted);
+    callbacks.onOpen?.(predicted);
+    mutation
+      .mutateAsync({ terminal, sessionKey })
+      .then((info) => {
+        if (isClosedDuringLaunch(predicted.id)) {
+          // Closed before the create returned: the DELETE was deferred to now.
+          removeFromCache(info.id);
+          deleteTerminal(conversationId, info.id)
+            .catch(() => {
+              // The shell survived: list it again so the user can retry the close.
+              clearClosedDuringLaunch(predicted.id);
+              addToCache(info);
+              showToast("Couldn't close the shell — it's still running.", { duration: 0 });
+            })
+            .finally(() => clearClosedDuringLaunch(predicted.id));
+          return;
+        }
+        if (info.id === predicted.id) {
+          // Keep the tab's slot and take the server's fields over the
+          // prediction, without dropping list-only fields (the direct-attach
+          // URL) a list refresh may have added meanwhile.
+          const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+          queryClient.setQueryData<TerminalInfo[]>(
+            key,
+            current.map((t) =>
+              t.id === info.id
+                ? { ...t, ...info, directAttachUrl: info.directAttachUrl ?? t.directAttachUrl }
+                : t,
+            ),
+          );
+          return;
+        }
+        removeFromCache(predicted.id);
+        callbacks.onOpen?.(info);
+      })
+      .catch((error: unknown) => {
+        clearClosedDuringLaunch(predicted.id);
+        // A page going away cuts the create off, but the shell may exist; leave its tab saved.
+        if (isPageHiding()) return;
+        removeFromCache(predicted.id);
+        callbacks.onError?.(error instanceof Error ? error : new Error(String(error)), predicted);
+      })
+      .finally(() => setTerminalLaunching(predicted.id, null));
+  };
+  return { ...mutation, isPending: mutation.isPending || launchInFlight, launch };
 }
 
 /**
@@ -343,12 +493,22 @@ export async function deleteTerminal(conversationId: string, terminalId: string)
  * dedupes as a no-op).
  *
  * :param conversationId: Session/conversation identifier.
+ * :param options: ``reportsFailure: false`` leaves a failed close for the caller to report,
+ *   such as a surface that names the shells one close couldn't end in a single message.
  * :returns: TanStack mutation taking the terminal resource id.
  */
-export function useDeleteTerminal(conversationId: string) {
+export function useDeleteTerminal(
+  conversationId: string,
+  { reportsFailure = true }: { reportsFailure?: boolean } = {},
+) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (terminalId: string) => deleteTerminal(conversationId, terminalId),
+    // A shell still being created has nothing to DELETE yet: its launch
+    // deletes it once the create returns.
+    mutationFn: async (terminalId: string) => {
+      if (requestCloseDuringLaunch(terminalId)) return;
+      await deleteTerminal(conversationId, terminalId);
+    },
     onSuccess: (_result, terminalId) => {
       const key = terminalsQueryKey(conversationId);
       const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
@@ -361,7 +521,9 @@ export function useDeleteTerminal(conversationId: string) {
     // a non-editor, 500). Surface it — otherwise the tab silently reappears
     // once ``isPending`` clears and the user has no idea the shell survived.
     onError: () => {
-      showToast("Couldn't close the shell — it's still running.", { duration: 0 });
+      if (reportsFailure) {
+        showToast("Couldn't close the shell — it's still running.", { duration: 0 });
+      }
     },
   });
 }
@@ -426,7 +588,9 @@ export function useTerminals(
       const byId = new Map<string, TerminalInfo>();
       for (const t of queryClient.getQueryData<TerminalInfo[]>(key) ?? []) byId.set(t.id, t);
       for (const t of fetched) byId.set(t.id, t);
-      return [...byId.values()];
+      // A shell closed while its create was in flight stays closed; its
+      // launch deletes it once the create returns.
+      return [...byId.values()].filter((t) => !isClosedDuringLaunch(t.id));
     },
     enabled: conversationId !== null,
     staleTime: Infinity,

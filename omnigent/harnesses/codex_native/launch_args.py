@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import tomlkit
+from ftfy.fixes import fix_surrogates
 from tomlkit.exceptions import ParseError, TOMLKitError
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -213,6 +214,24 @@ def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
     return canonical
 
 
+def codex_config_overrides(args: Sequence[str]) -> list[str]:
+    """Read config assignments in argv order without interpreting other option values."""
+    overrides: list[str] = []
+    tokens = iter(canonical_codex_launch_args(args))
+    for token in tokens:
+        if token == "--":
+            break
+        if token in {"-c", "--config"}:
+            value = next(tokens, None)
+            if value is not None:
+                overrides.append(value)
+        elif token.startswith(("-c=", "--config=")):
+            overrides.append(token.partition("=")[2])
+        elif token in _CODEX_VALUE_FLAGS:
+            next(tokens, None)
+    return overrides
+
+
 def codex_config_profile(args: Sequence[str]) -> str | None:
     """Read the file-profile selector, rejecting ambiguous or missing selectors."""
     canonical = canonical_codex_launch_args(args)
@@ -341,7 +360,8 @@ def _write_private_config(path: Path, content: str) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(content)
+            # TOML requires Unicode scalars; preserve paired UTF-16 characters.
+            handle.write(fix_surrogates(content))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)

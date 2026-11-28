@@ -3,11 +3,13 @@ import {
   HIDDEN_RECONNECT_JITTER_MS,
   HIDDEN_RECONNECT_MS,
   RECONNECT_BASE_MS,
+  RECONNECT_MAX_MS,
 } from "./reconnectBackoff";
 import {
   HEALTHY_CONNECTION_MS,
   HEARTBEAT_WATCHDOG_MS,
   nextPushedSession,
+  SessionUpdatesSocket,
   sessionUpdatesSocket,
 } from "./sessionUpdatesSocket";
 
@@ -87,11 +89,32 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     const { resolveModalHost, setSessionHost } = await import("./sessionHost");
     const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
     setSessionHost("sess_oss", "host_oss");
-    resolveModalHost();
+    resolveModalHost(["host_oss"]);
     try {
       socket.start();
       const first = latestWs();
       expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+      first.open();
+      first.close();
+      vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+      expect(latestWs()).not.toBe(first);
+      expect(latestWs().url).toBe(first.url);
+    } finally {
+      socket.stop();
+      vi.resetModules();
+    }
+  });
+
+  it("routes by the per-client key when no modal host was picked", async () => {
+    vi.resetModules();
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    const { resolveModalHost } = await import("./sessionHost");
+    const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
+    resolveModalHost([]);
+    try {
+      socket.start();
+      const first = latestWs();
+      expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toMatch(/^[0-9a-f]{32}$/);
       first.open();
       first.close();
       vi.advanceTimersByTime(RECONNECT_CEILING_MS);
@@ -290,6 +313,44 @@ describe("sessionUpdatesSocket visibility-aware reconnect", () => {
     expect(FakeWebSocket.instances.length).toBe(1);
   });
 
+  it("keeps backing off when every socket is dropped right after it opens", () => {
+    // An overloaded or crash-looping server can accept each socket and drop it
+    // at once. Opening alone must not reset the ramp, or the client redials
+    // every 250 ms and each reopen costs the server a full snapshot.
+    sessionUpdatesSocket.start();
+    for (let i = 0; i < 5; i += 1) {
+      latestWs().open();
+      latestWs().close();
+      vi.advanceTimersByTime(RECONNECT_MAX_MS);
+    }
+    const dials = FakeWebSocket.instances.length;
+
+    latestWs().open();
+    latestWs().close();
+    // The sixth failure's delay is the cap, jittered to no less than half.
+    vi.advanceTimersByTime(RECONNECT_MAX_MS / 2 - 1);
+    expect(FakeWebSocket.instances.length).toBe(dials);
+    vi.advanceTimersByTime(RECONNECT_MAX_MS / 2 + 1);
+    expect(FakeWebSocket.instances.length).toBe(dials + 1);
+  });
+
+  it("restarts the ramp from the base once a connection stays up", () => {
+    sessionUpdatesSocket.start();
+    for (let i = 0; i < 5; i += 1) {
+      latestWs().open();
+      latestWs().close();
+      vi.advanceTimersByTime(RECONNECT_MAX_MS);
+    }
+    latestWs().open();
+    vi.advanceTimersByTime(HEALTHY_CONNECTION_MS);
+    const dials = FakeWebSocket.instances.length;
+
+    latestWs().close();
+    // A healthy connection's drop retries within the first base delay again.
+    vi.advanceTimersByTime(RECONNECT_BASE_MS);
+    expect(FakeWebSocket.instances.length).toBe(dials + 1);
+  });
+
   it("drops a pending hidden retry on stop() and ramps from the base after start()", () => {
     setPageHidden(true);
     sessionUpdatesSocket.start();
@@ -356,5 +417,50 @@ describe("nextPushedSession", () => {
     // already committed to the authoritative id would be handed a second one.
     latestWs().emit({ type: "changed", items: [{ id: "conv_late" }] });
     await expect(mine).resolves.toBeNull();
+  });
+});
+
+describe("SessionUpdatesSocket.isWatching", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("follows the watch-set the server has reached, not the one last asked for", () => {
+    const socket = new SessionUpdatesSocket();
+    socket.setWatched(["a"]);
+    socket.start();
+    // Opening sends the set once; nothing is watched until the server answers.
+    latestWs().open();
+    expect(socket.isWatching("a")).toBe(false);
+
+    // A second request goes out before the first is answered.
+    socket.setWatched(["b"]);
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("a")).toBe(true);
+    expect(socket.isWatching("b")).toBe(false);
+    // A delta between the two answers still comes from the first set.
+    latestWs().emit({ type: "changed", items: [] });
+    expect(socket.isWatching("a")).toBe(true);
+
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("a")).toBe(false);
+    expect(socket.isWatching("b")).toBe(true);
+
+    // A new connection starts over: the server watches nothing until it answers.
+    latestWs().close();
+    vi.advanceTimersByTime(60_000);
+    latestWs().open();
+    expect(socket.isWatching("b")).toBe(false);
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("b")).toBe(true);
+    socket.stop();
   });
 });

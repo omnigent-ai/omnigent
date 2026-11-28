@@ -24,21 +24,28 @@ and deletes owned agents.
   and a server card opens its read-only summary.
 - Direct links: `/settings/custom-agents`, `/settings/custom-agents/new`, and
   `/settings/custom-agents/<agent-id>` open those same pages.
+- Settings search: the create form's fields are `#custom-agent-create:<part>` targets,
+  such as `instructions` or an MCP server's `command`. Picking one in Settings search
+  opens `/settings/custom-agents#custom-agent-create:<part>`, which lands on the Custom
+  agents list with Search agents focused, as the form isn't open there. Only a same-page
+  link, where just the hash changes on `/settings/custom-agents/new`, focuses the field
+  itself. An MCP server's fields are named after it ("Command for docs"), or after its
+  place ("Command for server 1") until it has a name.
 - Creation and review pages: Custom agents returns to the list; Cancel also
   returns from creation and configuration review. Owned agents open directly in
   an editable form with Save changes and Delete when the server supports them.
 
 ## Driving it with the repro environment
 
-Preconditions: follow [Verify Omnigent](skills/verify-omnigent/SKILL.md). Enable
-`OMNIGENT_FEATURES=custom_agents_settings_ui` before starting the isolated server.
+Preconditions: follow [Verify Omnigent](skills/verify-omnigent/SKILL.md).
 The server must advertise `agent_install: true` and `agent_detail: true`.
 Deletion on a detail page also needs the response to include `user_owned`. Editing
 requires `user_owned: true` and `agent_config_edit: true`.
 
 - Desktop and mobile: open Settings through navigation and select Custom agents.
-  Confirm Customize contains Harnesses and Custom agents, and General no longer
-  contains Harnesses. Confirm server cards and the empty owned state; capture
+  Confirm Customize contains Custom agents, and Harnesses while the deployment
+  offers at least one harness, and General no longer contains Harnesses.
+  Confirm server cards and the empty owned state; capture
   both viewport sizes.
 - Create: enter a unique name, a configured model, instructions, and an MCP
   server. Save, verify the summary, reload, and verify persistence through
@@ -68,8 +75,9 @@ requires `user_owned: true` and `agent_config_edit: true`.
   deletion reports the count and waits for Remove anyway. Only that action
   should force removal.
 - Gating: remove the feature flag, restart the isolated server, and reload.
-  Customize must disappear, Harnesses must return to General, and Custom agents
-  URLs must show General.
+  Customize must disappear, Harnesses must return to General (while the
+  deployment offers at least one harness), and Custom agents URLs must show
+  General.
   Repeat against a server without the installation capability. With the feature
   and installation enabled but `agent_detail` absent or false, every Custom
   agents URL must show an update notice with no agent requests or management

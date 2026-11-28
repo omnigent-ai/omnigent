@@ -1,13 +1,16 @@
 // Tests for usePullRequests' pure helpers: the 404 → "update your host" classifier, the
 // payload normalizer (and that the info fetch applies it), the poll interval, and label edits.
 
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyPullRequestLabelChange,
   applyPullRequestReviewerChange,
+  computeLinkedPullRequestPollInterval,
   computePullRequestPollInterval,
   fetchPullRequestInfo,
   normalizePullRequestInfo,
+  pollAcceptsCachedAnswer,
   pullRequestNotFoundReason,
   type PullRequestAccount,
   type PullRequestAuth,
@@ -263,6 +266,75 @@ describe("fetchPullRequestInfo", () => {
   });
 });
 
+describe("fetchPullRequestInfo's allow_cached", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("is sent only when the caller polls", async () => {
+    const fetchMock = vi.fn<typeof fetch>(
+      async () => new Response(JSON.stringify({ object: "session.github.info" }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const prUrl = "https://github.com/org/repo/pull/1";
+    await fetchPullRequestInfo("conv", prUrl);
+    await fetchPullRequestInfo("conv", prUrl, undefined, true);
+    await fetchPullRequestInfo("conv", undefined, undefined, true);
+    const urls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(urls[0]).toMatch(/\?pr_url=[^&]+$/);
+    expect(urls[1]).toMatch(/\?pr_url=[^&]+&allow_cached=true$/);
+    expect(urls[2]).toMatch(/\/resources\/github\?allow_cached=true$/);
+  });
+});
+
+describe("pollAcceptsCachedAnswer", () => {
+  const key = ["github-info", "conv"];
+  const info = { object: "session.github.info", available: true } as PullRequestInfo;
+
+  const prInfoStaleTime = 30_000;
+
+  function polledQuery(refetchInterval: number | false, staleTime = prInfoStaleTime) {
+    const client = new QueryClient();
+    client.setQueryData(key, info);
+    const observer = new QueryObserver(client, {
+      queryKey: key,
+      queryFn: () => info,
+      staleTime,
+      refetchInterval,
+    });
+    const unsubscribe = observer.subscribe(() => undefined);
+    const query = client.getQueryCache().find<PullRequestInfo>({ queryKey: key, exact: true })!;
+    return { query, unsubscribe };
+  }
+
+  it("accepts a poll of data that is still fresh", () => {
+    const { query, unsubscribe } = polledQuery(10_000);
+    expect(pollAcceptsCachedAnswer(query, query.state.dataUpdatedAt + 10_000)).toBe(true);
+    unsubscribe();
+  });
+
+  it("reads the forge now after an invalidation, for stale data, or without a poller", () => {
+    const polled = polledQuery(10_000);
+    // Mount, focus and reopen refetches run only once data is stale.
+    expect(pollAcceptsCachedAnswer(polled.query, polled.query.state.dataUpdatedAt + 30_000)).toBe(
+      false,
+    );
+    // Refresh, the turn-end refetch and edits invalidate before they refetch.
+    polled.query.invalidate();
+    expect(pollAcceptsCachedAnswer(polled.query, polled.query.state.dataUpdatedAt)).toBe(false);
+    polled.unsubscribe();
+
+    // A 30 s list row polls once its data is stale, so each of its polls reads fresh.
+    const row = polledQuery(30_000);
+    expect(pollAcceptsCachedAnswer(row.query, row.query.state.dataUpdatedAt + 30_000)).toBe(false);
+    expect(pollAcceptsCachedAnswer(row.query, row.query.state.dataUpdatedAt + 32_000)).toBe(false);
+    row.unsubscribe();
+
+    const resting = polledQuery(false);
+    expect(pollAcceptsCachedAnswer(resting.query, resting.query.state.dataUpdatedAt)).toBe(false);
+    resting.unsubscribe();
+    expect(pollAcceptsCachedAnswer(undefined)).toBe(false);
+  });
+});
+
 describe("computePullRequestPollInterval", () => {
   const checks = (over: Partial<PullRequestChecks> = {}): PullRequestChecks => ({
     passing: 0,
@@ -304,6 +376,39 @@ describe("computePullRequestPollInterval", () => {
       );
     }
   });
+
+  it("does not poll for linked PRs before receiving metadata", () => {
+    expect(computeLinkedPullRequestPollInterval(undefined)).toBe(false);
+  });
+
+  it.each([
+    { states: [], selected: null, interval: false },
+    { states: ["MERGED", "closed"], selected: null, interval: false },
+    { states: [], selected: "MERGED", interval: false },
+    { states: ["OPEN"], selected: "CLOSED", interval: false },
+    { states: ["MERGED", "OPEN"], selected: null, interval: 30_000 },
+    { states: ["CLOSED", "UNKNOWN"], selected: null, interval: 30_000 },
+    { states: [null], selected: null, interval: 30_000 },
+    { states: [undefined], selected: null, interval: 30_000 },
+    { states: ["CLOSED"], selected: "UNKNOWN", interval: 30_000 },
+    { states: ["CLOSED", "OPEN"], selected: "MERGED", interval: 30_000 },
+  ])(
+    "linked polling for $states with selection $selected is $interval",
+    ({ states, selected, interval }) => {
+      const info = ready({
+        pr: selected ? { ...ready().pr!, url: "pr-0", state: selected } : null,
+        prs: states.map((state, index) => ({
+          url: `pr-${index}`,
+          host: "github.com",
+          repository: "org/repo",
+          number: index + 1,
+          relationship: "attached",
+          state,
+        })),
+      });
+      expect(computeLinkedPullRequestPollInterval(info)).toBe(interval);
+    },
+  );
 
   it("polls setup/availability states the user fixes outside the app", () => {
     // No info yet (initial error / transient failure with no cache).
@@ -390,5 +495,12 @@ describe("computePullRequestPollInterval", () => {
     expect(computePullRequestPollInterval(ready({ pr: { ...ready().pr!, state: "CLOSED" } }))).toBe(
       false,
     );
+    for (const state of ["OPEN", "MERGED", "CLOSED"]) {
+      expect(
+        computePullRequestPollInterval(
+          ready({ pr: { ...ready().pr!, state, timeline_partial: true } }),
+        ),
+      ).toBe(false);
+    }
   });
 });

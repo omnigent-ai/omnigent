@@ -11,6 +11,7 @@
 		B10000000000000000000002 /* AppRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* AppRootView.swift */; };
 		B10000000000000000000003 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* ConnectView.swift */; };
 		B10000000000000000000004 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DesignTokens.swift */; };
+		B1000000000000000000002A /* WelcomeBlobBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000002A /* WelcomeBlobBackground.swift */; };
 		B10000000000000000000005 /* SettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* SettingsStore.swift */; };
 		B10000000000000000000006 /* ServerURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* ServerURL.swift */; };
 		B10000000000000000000014 /* DeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* DeepLink.swift */; };
@@ -30,6 +31,7 @@
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
 		B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* PrivacyInfo.xcprivacy */; };
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
+		B20000000000000000000108 /* WelcomeBlobBackgroundTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
@@ -101,6 +103,7 @@
 		A10000000000000000000002 /* AppRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRootView.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
 		A10000000000000000000004 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
+		A1000000000000000000002A /* WelcomeBlobBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeBlobBackground.swift; sourceTree = "<group>"; };
 		A10000000000000000000005 /* SettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000006 /* ServerURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURL.swift; sourceTree = "<group>"; };
 		A10000000000000000000014 /* DeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLink.swift; sourceTree = "<group>"; };
@@ -122,6 +125,7 @@
 		A10000000000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		A10000000000000000000018 /* OidcLoginManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcLoginManager.swift; sourceTree = "<group>"; };
 		A20000000000000000000001 /* ServerURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeBlobBackgroundTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000004 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
@@ -227,6 +231,7 @@
 				A10000000000000000000002 /* AppRootView.swift */,
 				A10000000000000000000003 /* ConnectView.swift */,
 				A10000000000000000000004 /* DesignTokens.swift */,
+				A1000000000000000000002A /* WelcomeBlobBackground.swift */,
 				A10000000000000000000005 /* SettingsStore.swift */,
 				A10000000000000000000006 /* ServerURL.swift */,
 				A10000000000000000000014 /* DeepLink.swift */,
@@ -271,6 +276,7 @@
 			isa = PBXGroup;
 			children = (
 				A20000000000000000000001 /* ServerURLTests.swift */,
+				A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */,
 				A20000000000000000000002 /* SettingsStoreTests.swift */,
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
 				A20000000000000000000004 /* DeepLinkTests.swift */,
@@ -455,6 +461,7 @@
 				B10000000000000000000002 /* AppRootView.swift in Sources */,
 				B10000000000000000000003 /* ConnectView.swift in Sources */,
 				B10000000000000000000004 /* DesignTokens.swift in Sources */,
+				B1000000000000000000002A /* WelcomeBlobBackground.swift in Sources */,
 				B10000000000000000000005 /* SettingsStore.swift in Sources */,
 				B10000000000000000000006 /* ServerURL.swift in Sources */,
 				B10000000000000000000014 /* DeepLink.swift in Sources */,
@@ -494,6 +501,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B20000000000000000000001 /* ServerURLTests.swift in Sources */,
+				B20000000000000000000108 /* WelcomeBlobBackgroundTests.swift in Sources */,
 				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
 				B20000000000000000000004 /* DeepLinkTests.swift in Sources */,

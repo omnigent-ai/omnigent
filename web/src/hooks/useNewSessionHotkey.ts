@@ -2,20 +2,19 @@ import { useEffect } from "react";
 
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { pickListOwnsKey } from "@/lib/listNavigationKeys";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
-/** Browser Cmd/Ctrl+Shift+O; preserve the native Cmd/Ctrl+Alt+N chord. */
+/** Browser Cmd/Ctrl+Shift+O; native shells Cmd/Ctrl+N. */
 export function isNewSessionHotkey(
   e: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
   native = isNativeShell(),
 ): boolean {
-  if (!hasCommandModifier(e, isMac) || e.getModifierState("AltGraph")) return false;
-  return native
-    ? e.altKey && !e.shiftKey && e.code === "KeyN"
-    : !e.altKey && e.shiftKey && e.key.toLowerCase() === "o";
+  return matchesShortcut(e, "session.new", { mac: isMac, native });
 }
 
 /** Navigate to the same new-session route used by the command palette. */
@@ -26,7 +25,10 @@ export function useNewSessionHotkey(enabled = true, isMac = isMacPlatform()): vo
   useEffect(() => {
     if (!enabled) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
-      if (e.repeat || !isNewSessionHotkey(e, isMac)) return;
+      // A list that already stepped on Ctrl-N (it listens first) keeps it.
+      if (e.repeat || e.defaultPrevented || !isNewSessionHotkey(e, isMac)) return;
+      // Ctrl-N steps an open pick list; off macOS it's also this chord.
+      if (pickListOwnsKey(e)) return;
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
       e.preventDefault();

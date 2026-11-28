@@ -4,6 +4,9 @@ import * as ContextMenuPrimitive from "radix-ui/context-menu";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
+import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
+import { describedWithShortcut } from "./menu-item";
 
 function ContextMenu({ ...props }: React.ComponentProps<typeof ContextMenuPrimitive.Root>) {
   return <ContextMenuPrimitive.Root data-slot="context-menu" {...props} />;
@@ -27,6 +30,7 @@ function ContextMenuTrigger({
 
 function ContextMenuContent({
   className,
+  children,
   ...props
 }: React.ComponentProps<typeof ContextMenuPrimitive.Content>) {
   // Context menus position at the pointer (no trigger anchor), so there's no
@@ -36,11 +40,15 @@ function ContextMenuContent({
       <ContextMenuPrimitive.Content
         data-slot="context-menu-content"
         className={cn(
+          "mobile-menu-glass max-md:relative",
           "menu-surface z-50 max-h-(--radix-context-menu-content-available-height) w-max min-w-32 origin-(--radix-context-menu-content-transform-origin) overflow-x-hidden overflow-y-auto whitespace-nowrap rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-[state=closed]:overflow-hidden data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className,
         )}
         {...props}
-      />
+      >
+        <MobileMenuGlassSurface />
+        {children}
+      </ContextMenuPrimitive.Content>
     </ContextMenuPrimitive.Portal>
   );
 }
@@ -53,11 +61,23 @@ function ContextMenuItem({
   className,
   inset,
   variant = "default",
+  shortcut,
+  description,
+  children,
   ...props
 }: React.ComponentProps<typeof ContextMenuPrimitive.Item> & {
   inset?: boolean;
   variant?: "default" | "destructive";
+  /** A binding whose chord runs this row's action on this row's target; its keys end the row. */
+  shortcut?: ShortcutId;
+  /** A quieter line under the label, such as why a disabled item can't run; read as its description. */
+  description?: React.ReactNode;
 }) {
+  const descriptionId = React.useId();
+  const row = describedWithShortcut(children, description, descriptionId, shortcut);
+  // The caller's own description reads first; keys it names replace the binding's.
+  const describedBy =
+    [props["aria-describedby"], row["aria-describedby"]].filter(Boolean).join(" ") || undefined;
   return (
     <ContextMenuPrimitive.Item
       data-slot="context-menu-item"
@@ -68,6 +88,9 @@ function ContextMenuItem({
         className,
       )}
       {...props}
+      {...row}
+      aria-describedby={describedBy}
+      aria-keyshortcuts={props["aria-keyshortcuts"] ?? row["aria-keyshortcuts"]}
     />
   );
 }
@@ -218,6 +241,7 @@ function ContextMenuSubTrigger({
 
 function ContextMenuSubContent({
   className,
+  children,
   sideOffset = 6,
   collisionPadding = 8,
   ...props
@@ -237,11 +261,15 @@ function ContextMenuSubContent({
         sideOffset={sideOffset}
         collisionPadding={collisionPadding}
         className={cn(
+          "mobile-menu-glass max-md:relative",
           "menu-surface z-50 w-max min-w-[96px] origin-(--radix-context-menu-content-transform-origin) overflow-hidden whitespace-nowrap rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className,
         )}
         {...props}
-      />
+      >
+        <MobileMenuGlassSurface />
+        {children}
+      </ContextMenuPrimitive.SubContent>
     </ContextMenuPrimitive.Portal>
   );
 }

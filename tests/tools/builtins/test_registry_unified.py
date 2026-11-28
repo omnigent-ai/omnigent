@@ -18,6 +18,7 @@ import pkgutil
 
 import omnigent.tools.builtins as _builtins_pkg
 from omnigent.tools.base import Tool
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.builtins import (
     BUILTIN_NAMES,
     INSTANTIABLE_BUILTINS,
@@ -121,9 +122,6 @@ def test_builtin_names_size_matches_registry() -> None:
                 "web_read",
                 "nimble_research",
                 "nimble_extract",
-                "upload_file",
-                "list_files",
-                "download_file",
                 "search_conversations",
                 "export_agent",
                 # Hindsight long-term memory tools (optional `hindsight`
@@ -145,6 +143,11 @@ def test_builtin_names_size_matches_registry() -> None:
                 # ToolContext.conversation_id.
                 "list_comments",
                 "update_comment",
+                # Session file tools: registered by ToolManager only when
+                # the spec sets ``tool_groups.files: true``.
+                "sys_files_upload",
+                "sys_files_list",
+                "sys_files_download",
                 # sys_list_models / sys_advise_models: auto-registered
                 # by ToolManager alongside the sub-agent dispatch grant.
                 # sys_advise_models is only included when smart routing
@@ -161,6 +164,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 "browser_screenshot",
                 "ui_open_file",
             }
+            | ADVANCED_BROWSER_TOOL_NAMES
         )
         == BUILTIN_NAMES
     )
