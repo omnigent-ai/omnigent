@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.host.frames import HostHelloFrame, HostStopRunnerFrame, decode_host_frame
@@ -292,6 +294,44 @@ async def test_sweep_leaves_intent_for_a_matching_live_relay(
     finally:
         gate.set()
         await task
+
+
+async def test_sweep_reports_stopped_child_to_parent_on_another_runner(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    sessions._intentional_stop_sessions[child_id] = "runner-other"
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+    parent_runner_posts: list[tuple[str, object]] = []
+
+    def record_parent_runner(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(record_parent_runner), base_url="http://parent-runner"
+    ) as parent_runner:
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await sessions._mark_runner_sessions_offline(
+            store.list_conversations_by_runner_id("runner-other"), error, store
+        )
+
+    assert sessions._session_status_cache[child_id] == "idle"
+    assert parent_runner_posts == [
+        (
+            f"/v1/sessions/{child_id}/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "idle", "turn_outcome": "cancelled"},
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize("delivered", [True, False])

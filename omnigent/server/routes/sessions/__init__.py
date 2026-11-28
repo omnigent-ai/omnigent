@@ -645,6 +645,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _forward_event_to_runner as _forward_event_to_runner,
     _forward_native_subagent_terminal_failure as _forward_native_subagent_terminal_failure,
     _forward_native_terminal_message as _forward_native_terminal_message,
+    _forward_subagent_status_to_parent_runner as _forward_subagent_status_to_parent_runner,
     _get_session_snapshot as _get_session_snapshot,
     _handle_mcp_tools_call as _handle_mcp_tools_call,
     _harness_elicitation_request_fingerprint as _harness_elicitation_request_fingerprint,

@@ -562,6 +562,28 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
 
 
 @pytest.mark.asyncio
+async def test_nested_subagent_parent_on_another_runner_is_not_acked(
+    _clean_subagent_registry: None,
+) -> None:
+    """A sub-agent parent on its own runner keeps the retry so the server can route there."""
+    parent_body = {
+        **_parent_snapshot(parent_session_id="conv_top_level"),
+        "runner_id": "runner_parent_elsewhere",
+        "runner_online": True,
+        "labels": {WRAPPER_LABEL_KEY: "claude-code-native-ui"},
+    }
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=False,
+        register_work=False,
+        parent_body=parent_body,
+    )
+
+    assert http == 503
+    assert items == []
+
+
+@pytest.mark.asyncio
 async def test_retained_result_is_delivered_when_parent_inbox_is_created(
     _clean_subagent_registry: None,
 ) -> None:

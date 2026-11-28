@@ -1426,6 +1426,82 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("intentional", "reported"),
+    [
+        (False, {"status": "failed", "output": "Runner disconnected unexpectedly."}),
+        (True, {"status": "idle", "turn_outcome": "cancelled"}),
+    ],
+)
+async def test_relay_drop_mid_turn_reports_subagent_to_parent_on_another_runner(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    intentional: bool,
+    reported: dict[str, str],
+) -> None:
+    """The child's runner is gone, so its stop reaches the parent's runner from the server."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    assert store.set_runner_id(parent.id, "runner-parent")
+    assert store.set_runner_id(child.id, "runner-child")
+    store.set_session_live_status(child.id, "running")
+    sessions_module._session_status_cache[child.id] = "running"
+    parent_runner_posts: list[tuple[str, object]] = []
+
+    def record_parent_runner(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    gate = asyncio.Event()
+    runner = _ScriptedThenDropRunnerClient([], gate)
+    handle = None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(record_parent_runner), base_url="http://parent-runner"
+        ) as parent_runner:
+
+            async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+                return parent_runner if session_id == parent.id else None
+
+            monkeypatch.setattr(sessions_module, "_get_runner_client", resolve_runner)
+            handle = await sessions_module._ensure_runner_relay_ready(
+                child.id,
+                "runner-child",
+                runner,  # type: ignore[arg-type]
+                conversation_store=store,
+            )
+            assert handle is not None
+            if intentional:
+                sessions_module._intentional_stop_sessions[child.id] = "runner-child"
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert parent_runner_posts == [
+            (
+                f"/v1/sessions/{child.id}/events",
+                {"type": "external_session_status", "data": reported},
+            )
+        ]
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.pop(child.id, None)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._intentional_stop_sessions.pop(child.id, None)
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(child.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mark_before_rebind", [True, False])
 async def test_relay_ignores_stop_intent_for_a_different_runner(
     monkeypatch: pytest.MonkeyPatch, mark_before_rebind: bool

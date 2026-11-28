@@ -5161,6 +5161,23 @@ def _require_external_status_forward(
         )
 
 
+def _subagent_delivery_not_confirmed(runner_result: _RunnerForwardResult | None) -> bool:
+    """
+    Return whether a runner refused a sub-agent terminal status it could not deliver.
+
+    :param runner_result: HTTP result returned by the child's runner, or ``None``.
+    :returns: ``True`` for the runner's ``subagent_delivery_not_confirmed`` 503,
+        e.g. when the parent's inbox is not on that runner.
+    """
+    if runner_result is None or runner_result.status_code != 503:
+        return False
+    try:
+        body = json.loads(runner_result.body)
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
+
+
 def _require_collaboration_mode_forward(
     session_id: str,
     enabled: bool,
@@ -13613,6 +13630,7 @@ __all__ = [
     "_stored_file_to_resource",
     "_stream_live_events",
     "_structured_ask_user_question",
+    "_subagent_delivery_not_confirmed",
     "_targeted_elicitation_event",
     "_title_content_from_item",
     "_truncate_label",
