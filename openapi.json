@@ -4287,6 +4287,66 @@
         "title": "HostModelOptionsResponse",
         "type": "object"
       },
+      "HostSessionDefaults": {
+        "additionalProperties": false,
+        "description": "The caller's defaults for new sessions on one of their hosts.\n\nEvery field is optional; an unset field leaves that choice to the other\nsources. Explicit request values, then project settings, then the agent's\nown declared settings win over these.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Agent to bind when neither the request nor its project names one.",
+            "title": "Agent Id"
+          },
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Reasoning effort for `agent_id`, e.g. `\"high\"`. A client hint like `model`.",
+            "title": "Effort"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model for `agent_id`, e.g. `\"opus\"`. A client hint the new-session composer pre-fills; the server does not apply it.",
+            "title": "Model"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absolute directory on the host, used when neither the request nor its project names one, e.g. `\"/home/me/app\"`.",
+            "title": "Workspace"
+          }
+        },
+        "title": "HostSessionDefaults",
+        "type": "object"
+      },
       "ImportFailureRef": {
         "description": "One session that could not be imported, with a user-facing reason.\n\n`external_session_id` / `source` name the source session when known (a\nhost that reports only a count leaves them `None`); `reason` explains the\nfailure so the UI can show it instead of an anonymous \"N failed\". Also the\nshape of each `{\"event\": \"failed\", ...}` line on the stream endpoint.",
         "properties": {
@@ -8214,6 +8274,11 @@
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
+            "type": "boolean"
+          },
+          "host_session_defaults": {
+            "default": false,
+            "title": "Host Session Defaults",
             "type": "boolean"
           },
           "inbox_items_available": {
@@ -21390,6 +21455,100 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/session-defaults": {
+      "get": {
+        "description": "Read the caller's defaults for new sessions on one of their hosts.",
+        "operationId": "get_host_session_defaults_v1_hosts__host_id__session_defaults_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSessionDefaults"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Session Defaults",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "put": {
+        "description": "Replace the caller's defaults for one of their hosts; `{}` clears them.",
+        "operationId": "save_host_session_defaults_v1_hosts__host_id__session_defaults_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostSessionDefaults"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSessionDefaults"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Host Session Defaults",
         "tags": [
           "hosts"
         ]

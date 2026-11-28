@@ -44,6 +44,7 @@ from omnigent.db.utils import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.util.uuid import normalize_uuid
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -58,6 +59,19 @@ HOST_LIVENESS_TTL_S = 90
 
 # Expire recovery ownership after a minute without renewal.
 _MANAGED_RECOVERY_LEASE_S = 60
+
+_HOST_SESSION_DEFAULTS_KEY_PREFIX = "host_session_defaults:"
+
+
+def host_session_defaults_key(host_id: str) -> str:
+    """Name the owner's ``preferences`` row holding a host's new-session defaults.
+
+    Dashed and legacy-prefixed spellings of one host id share a key.
+
+    :param host_id: Host identifier, e.g. ``"a1ed1ab71de2311e20488a989e61701c"``.
+    :returns: The preference key, e.g. ``"host_session_defaults:a1ed1ab7..."``.
+    """
+    return _HOST_SESSION_DEFAULTS_KEY_PREFIX + (normalize_uuid(host_id) or host_id)
 
 
 class _HostOwnershipError(IntegrityError):
@@ -214,6 +228,13 @@ def _delete_host_row(session: Session, row: SqlHost) -> None:
             SqlPreference.workspace_id == current_workspace_id(),
             SqlPreference.user_id == "__host_lifecycle__",
             SqlPreference.key.in_(["recovery:" + row.host_id, "retained_sandbox:" + row.host_id]),
+        )
+    )
+    session.execute(
+        sql_delete(SqlPreference).where(
+            SqlPreference.workspace_id == current_workspace_id(),
+            SqlPreference.user_id == row.user_id,
+            SqlPreference.key == host_session_defaults_key(row.host_id),
         )
     )
 
@@ -589,6 +610,24 @@ class HostStore:
         )
         session.add(new_row)
         session.flush()
+
+        # The owner's new-session defaults follow the host to its new id.
+        session.execute(
+            sql_delete(SqlPreference).where(
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == user_id,
+                SqlPreference.key == host_session_defaults_key(new_host_id),
+            )
+        )
+        session.execute(
+            update(SqlPreference)
+            .where(
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == user_id,
+                SqlPreference.key == host_session_defaults_key(old_host_id),
+            )
+            .values(key=host_session_defaults_key(new_host_id))
+        )
 
         if bound_ids:
             session.execute(

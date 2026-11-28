@@ -7,6 +7,7 @@ Account deletion already removes a user's ``preferences`` rows.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections.abc import Callable
@@ -30,12 +31,15 @@ from omnigent.server.server_config import (
     SESSION_TITLE_INSTRUCTIONS_MAX_CHARS,
     normalize_session_title_instructions,
 )
+from omnigent.stores.host_store import host_session_defaults_key
 
 _logger = logging.getLogger(__name__)
 
 SESSION_TITLE_INSTRUCTIONS_PREFERENCE_KEY = "session_title_instructions"
 # UTF-8 needs at most four bytes per character.
 _MAX_DECODED_BYTES = SESSION_TITLE_INSTRUCTIONS_MAX_CHARS * 4
+# Serialized cap for one host's new-session defaults (a few short fields).
+HOST_SESSION_DEFAULTS_MAX_BYTES = 8192
 
 
 class UserSettingsStore:
@@ -117,6 +121,73 @@ class UserSettingsStore:
 
         run_write_transaction(self._session_immediate, "save_session_title_instructions", write)
         return value or None
+
+    def get_host_session_defaults(self, host_id: str, *, user_id: str | None) -> dict[str, str]:
+        """Return the user's new-session defaults for a host, or ``{}`` when unset or invalid.
+
+        :param host_id: Host identifier as the host store reports it.
+        :param user_id: The authenticated user, or ``None`` in single-user mode.
+        :returns: Field name to value, e.g. ``{"workspace": "/work/app"}``.
+        """
+        preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
+        with self._session("read_host_session_defaults") as session:
+            raw = session.scalar(
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == preference_user_id,
+                    SqlPreference.key == host_session_defaults_key(host_id),
+                )
+            )
+        if raw is None:
+            return {}
+        try:
+            decoded = json.loads(
+                decode(raw, max_decoded_bytes=HOST_SESSION_DEFAULTS_MAX_BYTES) or ""
+            )
+        except (ValueError, zstandard.ZstdError):
+            _logger.warning("stored host session defaults are unreadable — ignoring them")
+            return {}
+        if not isinstance(decoded, dict):
+            return {}
+        return {key: value for key, value in decoded.items() if isinstance(value, str)}
+
+    def save_host_session_defaults(
+        self, host_id: str, defaults: dict[str, str], *, user_id: str | None
+    ) -> dict[str, str]:
+        """Replace the user's new-session defaults for a host; ``{}`` clears them.
+
+        Callers validate the field vocabulary; the store persists the object whole.
+
+        :param host_id: Host identifier as the host store reports it.
+        :param defaults: Field name to value, e.g. ``{"agent_id": "..."}``.
+        :param user_id: The authenticated user, or ``None`` in single-user mode.
+        :returns: The stored defaults.
+        :raises ValueError: If the serialized defaults exceed
+            :data:`HOST_SESSION_DEFAULTS_MAX_BYTES`.
+        """
+        value = json.dumps(defaults, separators=(",", ":"), sort_keys=True) if defaults else ""
+        if len(value.encode("utf-8")) > HOST_SESSION_DEFAULTS_MAX_BYTES:
+            raise ValueError(
+                f"Host session defaults exceed {HOST_SESSION_DEFAULTS_MAX_BYTES} bytes"
+            )
+        preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
+        key = host_session_defaults_key(host_id)
+
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            if value:
+                upsert_preference_row(session, user_id=preference_user_id, key=key, value=value)
+                return
+            session.execute(
+                delete(SqlPreference).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == preference_user_id,
+                    SqlPreference.key == key,
+                )
+            )
+
+        run_write_transaction(self._session_immediate, "save_host_session_defaults", write)
+        return dict(defaults)
 
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows

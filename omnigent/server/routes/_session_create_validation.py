@@ -32,10 +32,23 @@ _logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ProjectCreateResolution:
-    """Project-aware request values after defaulting."""
+    """Project-aware request values after defaulting.
+
+    :param body: The request with project and host defaults filled in.
+    :param project_id: The project the session is filed in, or ``None``.
+    :param host_default_fields: Request fields filled from the host's session
+        defaults, so a failure on one can name where its value came from.
+    """
 
     body: Any
     project_id: str | None = None
+    host_default_fields: frozenset[str] = frozenset()
+
+
+# Host session defaults the server applies, keyed by request field. ``model`` and
+# ``effort`` are composer hints: an agent's own model outranks them, and the
+# create route cannot see it yet.
+_HOST_DEFAULT_REQUEST_FIELDS = ("agent_id", "workspace")
 
 
 def server_sandbox_providers(request: Any) -> tuple[str, ...]:
@@ -48,27 +61,84 @@ def server_sandbox_providers(request: Any) -> tuple[str, ...]:
     return sandbox_config.launchable_providers() if sandbox_config is not None else ()
 
 
+async def host_session_defaults_for_create(
+    body: Any, *, user_id: str | None, conversation_store: Any
+) -> dict[str, str]:
+    """Load the caller's defaults for the host a new top-level session targets.
+
+    Children, nested agents and managed sandboxes take their placement elsewhere,
+    so they get none. Ownership is not checked here: the defaults are read from
+    the caller's own settings, and the create validates the host afterwards.
+
+    :param body: The validated create request.
+    :param user_id: The authenticated caller, or ``None`` in single-user mode.
+    :param conversation_store: The server's store; settings live beside it.
+    :returns: The stored defaults, or ``{}`` when none apply.
+    """
+    from omnigent.stores.user_settings_store import open_user_settings_store
+
+    host_id = getattr(body, "host_id", None)
+    if (
+        host_id is None
+        or getattr(body, "host_type", "external") != "external"
+        or getattr(body, "parent_session_id", None) is not None
+        or getattr(body, "sibling_source_id", None) is not None
+    ):
+        return {}
+    store = open_user_settings_store(conversation_store)
+    if store is None:
+        return {}
+    return await asyncio.to_thread(store.get_host_session_defaults, host_id, user_id=user_id)
+
+
+def host_default_error(exc: OmnigentError, field: str) -> OmnigentError:
+    """Say that a failing value came from the host's session defaults.
+
+    :param exc: The validation failure for that value.
+    :param field: The request field the default filled, e.g. ``"workspace"``.
+    :returns: An error with the same code and an actionable message.
+    """
+    return OmnigentError(
+        f"{exc.message} (the {field} comes from this host's session defaults; "
+        f"update or clear them, or choose a {field} for this session)",
+        code=exc.code,
+    )
+
+
 async def resolve_project_session_create(
     *,
     body: Any,
     user_id: str | None,
     project_store: ProjectStore | None,
     launchable_sandbox_providers: Collection[str] = (),
+    host_defaults: dict[str, str] | None = None,
 ) -> ProjectCreateResolution:
-    """Apply opt-in project defaults before any create-side validation.
+    """Apply opt-in project and host defaults before any create-side validation.
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
-    hint.  Unknown and foreign projects deliberately share one 404 response.
-    A saved sandbox provider is inherited only when it is in
+    or host hint.  Unknown and foreign projects deliberately share one 404
+    response.  A saved sandbox provider is inherited only when it is in
     ``launchable_sandbox_providers``; an unconfigured one is ignored.
+
+    Precedence per field: the request, then the project's config (a key the
+    project sets blocks the host even when the server does not apply it), then
+    ``host_defaults`` (see :func:`host_session_defaults_for_create`).
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
-    if "project_id" not in fields_set or project_id is None:
-        if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
-            raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
-        return ProjectCreateResolution(body=body)
+    has_project = "project_id" in fields_set and project_id is not None
+    if not has_project:
+        project_id = None
+        host_updates = _host_default_updates(body, fields_set, {}, host_defaults)
+        if not host_updates:
+            if (
+                getattr(body, "agent_id", None) is None
+                and "agent_id" in body.__class__.model_fields
+            ):
+                raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+            return ProjectCreateResolution(body=body)
+        return _resolved_create(body, {}, host_updates, project_id=None)
     if project_store is None:
         raise OmnigentError(
             "Project not found",
@@ -102,8 +172,56 @@ async def resolve_project_session_create(
         and saved_provider in launchable_sandbox_providers
     ):
         updates["sandbox_provider"] = saved_provider
+    host_updates = _host_default_updates(body, fields_set, config, host_defaults)
+    return _resolved_create(body, updates, host_updates, project_id=project_id)
+
+
+def _host_default_updates(
+    body: Any,
+    fields_set: set[str],
+    project_config: dict[str, Any],
+    host_defaults: dict[str, str] | None,
+) -> dict[str, str]:
+    """The request fields the host's defaults fill: those no higher source names.
+
+    :param body: The create request.
+    :param fields_set: Fields the caller sent, including explicit nulls.
+    :param project_config: The project's opaque config, or ``{}`` without one.
+    :param host_defaults: The caller's defaults for the target host.
+    :returns: Request field to default value.
+    """
+    if not host_defaults:
+        return {}
+    return {
+        field: host_defaults[field]
+        for field in _HOST_DEFAULT_REQUEST_FIELDS
+        if field in host_defaults
+        and field not in fields_set
+        and field not in project_config
+        and field in body.__class__.model_fields
+    }
+
+
+def _resolved_create(
+    body: Any,
+    project_updates: dict[str, Any],
+    host_updates: dict[str, str],
+    *,
+    project_id: str | None,
+) -> ProjectCreateResolution:
+    """Re-validate *body* with defaults filled in and check the merged request.
+
+    :param body: The create request as the caller sent it.
+    :param project_updates: Fields filled from the project's config.
+    :param host_updates: Fields filled from the host's session defaults.
+    :param project_id: The project the session is filed in, or ``None``.
+    :returns: The resolved request.
+    :raises OmnigentError: ``INVALID_INPUT`` when a filled value does not fit
+        the request schema or the merged request is inconsistent.
+    """
     resolved_data = body.model_dump()
-    resolved_data.update(updates)
+    resolved_data.update(project_updates)
+    resolved_data.update(host_updates)
     # Re-validate project hints because config is intentionally stored as
     # opaque JSON and may not match the session-create field types.
     try:
@@ -111,16 +229,17 @@ async def resolve_project_session_create(
     except ValidationError as exc:
         first = exc.errors(include_context=False)[0]
         field = ".".join(str(part) for part in first.get("loc", ())) or "configuration"
+        source = "host session defaults" if field in host_updates else "project config"
         raise OmnigentError(
-            f"Invalid project config field {field!r}: {first['msg']}",
+            f"Invalid {source} field {field!r}: {first['msg']}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
 
     if getattr(resolved, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
         raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
-    if "agent_id" in updates:
-        # The request's own agent_id was checked by its route; a project's saved
-        # agent is the caller's to edit, so it must not name the hidden agent either.
+    if "agent_id" in project_updates or "agent_id" in host_updates:
+        # The request's own agent_id was checked by its route; a saved agent is
+        # the caller's to edit, so it must not name the hidden agent either.
         reject_proactive_agent_id(resolved.agent_id)
     if getattr(resolved, "git", None) is not None and getattr(resolved, "host_id", None) is None:
         raise OmnigentError(
@@ -128,7 +247,11 @@ async def resolve_project_session_create(
             code=ErrorCode.INVALID_INPUT,
         )
 
-    return ProjectCreateResolution(body=resolved, project_id=project_id)
+    return ProjectCreateResolution(
+        body=resolved,
+        project_id=project_id,
+        host_default_fields=frozenset(host_updates),
+    )
 
 
 def _saved_managed_repository(config: dict[str, Any]) -> str | None:

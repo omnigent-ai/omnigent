@@ -568,6 +568,34 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     )
 
 
+def test_host_session_defaults_follow_rotation_and_go_with_deletion(
+    host_store: HostStore, db_uri: str
+) -> None:
+    """The owner's new-session defaults move to a rotated host_id and are deleted with the host."""
+    from omnigent.stores.user_settings_store import UserSettingsStore
+
+    settings = UserSettingsStore(db_uri)
+    old_id, new_id = "a1ed1ab71de2311e20488a989e61701c", "b1b5efd7dfc33b5a6241f1866ffb00e6"
+    host_store.upsert_on_connect(host_id=old_id, name="dev-laptop", user_id="dana@example.com")
+    settings.save_host_session_defaults(
+        old_id, {"workspace": "/Users/dana/proj"}, user_id="dana@example.com"
+    )
+    # A stale row under the new id must not block the move.
+    settings.save_host_session_defaults(
+        new_id, {"workspace": "/stale"}, user_id="dana@example.com"
+    )
+
+    host_store.upsert_on_connect(host_id=new_id, name="dev-laptop", user_id="dana@example.com")
+
+    assert settings.get_host_session_defaults(old_id, user_id="dana@example.com") == {}
+    assert settings.get_host_session_defaults(new_id, user_id="dana@example.com") == {
+        "workspace": "/Users/dana/proj"
+    }
+
+    assert host_store.delete_host(new_id) is not None
+    assert settings.get_host_session_defaults(new_id, user_id="dana@example.com") == {}
+
+
 def test_reown_host_id_across_owner_change_preserves_conversation_binding(
     host_store: HostStore,
     db_uri: str,
