@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
     BackgroundTitleContext,
@@ -46,14 +47,25 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         temp_root = Path(temp_dir)
         codex_home = temp_root / "codex-home"
         title_workdir = temp_root / "workspace"
-        codex_home.mkdir(mode=0o700)
-        title_workdir.mkdir()
-        _populate_codex_home_config(
-            codex_home,
-            _codex_home_config_source_from_env(),
-            minimal_config=True,
-            supported_efforts=CODEX_NATIVE_EFFORTS,
-        )
+
+        def prepare_home() -> None:
+            codex_home.mkdir(mode=0o700)
+            title_workdir.mkdir()
+            _populate_codex_home_config(
+                codex_home,
+                _codex_home_config_source_from_env(),
+                minimal_config=True,
+                supported_efforts=CODEX_NATIVE_EFFORTS,
+            )
+
+        preparation = asyncio.create_task(asyncio.to_thread(prepare_home))
+        try:
+            await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            # Finish writes before the temporary directory is removed.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await await_cleanup_task(preparation)
+            raise
         # Profile/model discovery can block in SDK initialization; keep the runner responsive.
         native_server = await asyncio.to_thread(
             build_codex_native_server,
