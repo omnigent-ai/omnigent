@@ -3,7 +3,6 @@
 
 import { queryOptions, skipToken, useQuery } from "@tanstack/react-query";
 
-import { STACK_MEMBERS_POLL_MS } from "@/hooks/usePullRequestStackMembers";
 import {
   fetchNativeStackOnHost,
   NATIVE_STACK_HOST_METHOD,
@@ -47,15 +46,6 @@ export type NativeStackState =
    */
   | ({ kind: "settled"; readAt: number } & NativeStackData);
 
-/** Read again while any member is open, as the description stack's members are. */
-function nativeStackPollInterval(data: NativeStackData | undefined): number | false {
-  return data?.read?.answer.stack?.entries.nodes.some(
-    ({ pullRequest }) => pullRequest?.state === "OPEN",
-  )
-    ? STACK_MEMBERS_POLL_MS
-    : false;
-}
-
 /** The read of GitHub's own stack for `prUrl` at `revision` through `sessionId`'s host. */
 export function pullRequestNativeStackQueryOptions(
   sessionId: string,
@@ -78,6 +68,9 @@ export function pullRequestNativeStackQueryOptions(
           : skipToken,
       staleTime: 30_000,
       retry: false,
+      // Read on open, Refresh and Reload only: never on a timer, focus or reconnect.
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
     }),
   };
 }
@@ -100,8 +93,6 @@ export function usePullRequestNativeStack(
   const query = useQuery({
     ...options,
     queryFn: wanted ? options.queryFn : skipToken,
-    refetchInterval: (current) => nativeStackPollInterval(current.state.data),
-    refetchIntervalInBackground: false,
   });
   if (!wanted) return { kind: "off" };
   if (query.isPending) return { kind: "loading" };

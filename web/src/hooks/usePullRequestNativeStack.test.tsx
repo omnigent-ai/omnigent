@@ -1,8 +1,8 @@
 // GitHub's own stack reads only through a session host that serves the read, with a test-only
-// host answer standing in for the method the host doesn't serve yet.
+// host answer standing in for the host.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -19,6 +19,7 @@ vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => ({
     host.served && capability === "GetPullRequestNativeStack",
 }));
 
+import { refreshPullRequestStackMembers } from "./usePullRequestStackMembers";
 import { usePullRequestNativeStack } from "./usePullRequestNativeStack";
 
 const SESSION = "s1";
@@ -78,11 +79,12 @@ function render(head: string | null = HEAD, enabled = true) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);
-  return renderHook(
+  const view = renderHook(
     ({ head: current }: { head: string | null }) =>
       usePullRequestNativeStack(SESSION, PR_URL, current, enabled),
     { wrapper, initialProps: { head } },
   );
+  return Object.assign(view, { client });
 }
 
 describe("usePullRequestNativeStack", () => {
@@ -104,6 +106,30 @@ describe("usePullRequestNativeStack", () => {
       missing: [],
       unread: [],
     });
+  });
+
+  it("reads an open member's stack again only on Refresh, never on a timer or focus", async () => {
+    // Real time still runs; the polling and staleness timers can be skipped ahead.
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "setInterval", "Date"] });
+    try {
+      hostRead.mockResolvedValue(wire("alice"));
+      const { result, client } = render();
+      await waitFor(() => expect(result.current.kind).toBe("settled"));
+      expect(hostRead).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        vi.advanceTimersByTime(10 * 60_000);
+        window.dispatchEvent(new Event("visibilitychange"));
+        window.dispatchEvent(new Event("focus"));
+        window.dispatchEvent(new Event("online"));
+      });
+      expect(hostRead).toHaveBeenCalledTimes(1);
+
+      await act(() => refreshPullRequestStackMembers(client));
+      expect(hostRead).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reads again for a new head, never showing the old head's answer", async () => {
