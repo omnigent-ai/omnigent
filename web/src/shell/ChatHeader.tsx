@@ -197,6 +197,10 @@ interface ChatHeaderProps {
    * for the default folder glyph. Shown as the breadcrumb's leading segment.
    */
   projectIcon?: string | null;
+  /** The filed project's lucide icon name, or ``null`` for the folder glyph. */
+  projectLucideIcon?: string | null;
+  /** The filed project's palette color, or ``null`` for a muted folder. */
+  projectColor?: string | null;
   /**
    * Route the title links to (the parent session, when inside a sub-agent),
    * making the title a way back out. ``undefined`` renders it as plain text.
@@ -381,6 +385,8 @@ export function ChatHeader({
   conversationTitle,
   projectName,
   projectIcon,
+  projectLucideIcon,
+  projectColor,
   titleLinkTo,
   pageTitle,
   pageActions,
@@ -615,6 +621,8 @@ export function ChatHeader({
         conversationId={actionConversation.id}
         projectName={projectName}
         projectIcon={projectIcon}
+        projectLucideIcon={projectLucideIcon}
+        projectColor={projectColor}
       />
     ) : null;
   // Click-to-rename on the breadcrumb title, same gating as the folder tag:
@@ -695,6 +703,8 @@ export function ChatHeader({
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
             projectIcon={projectIcon}
+            projectLucideIcon={projectLucideIcon}
+            projectColor={projectColor}
             projectTag={projectTag ?? undefined}
             titleSlot={titleSlot ?? undefined}
             titleLinkTo={titleLinkTo}

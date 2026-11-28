@@ -45,7 +45,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 
 vi.mock("@/components/ProjectIconPicker", () => ({
-  EmojiPicker: () => null,
+  ProjectAppearanceButton: () => null,
 }));
 
 vi.mock("./WorkspacePickerDialog", () => ({
