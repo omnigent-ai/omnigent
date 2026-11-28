@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const host = vi.hoisted(() => ({
   served: new Set<string>(),
   write: vi.fn(),
+  read: vi.fn(),
   toast: vi.fn(),
 }));
 vi.mock("sonner", async (importOriginal) => ({
@@ -29,9 +30,11 @@ vi.mock("@/lib/workspaceApi", async (importOriginal) => ({
 vi.mock("@/lib/pullRequestRpc", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   writePullRequestRpc: host.write,
+  readPullRequestRpc: host.read,
 }));
 
 import { pullRequestRecordKey, sessionRecordOwner } from "@/lib/pullRequestRecord";
+import { usePullRequestMergeOptions } from "@/newPullRequestPage/hooks/usePullRequests";
 import type { WorkspaceClient } from "@/lib/workspaceApi";
 
 import { resetLifecycleActionsForTests } from "./pullRequestLifecycleActions";
@@ -114,6 +117,7 @@ async function sent(): Promise<[string, unknown][]> {
 beforeEach(() => {
   listed.clear();
   host.write.mockReset();
+  host.read.mockReset();
   host.toast.mockReset();
 });
 afterEach(() => {
@@ -198,7 +202,7 @@ describe("turning auto-merge on from a row", () => {
         auto_merge: null,
       },
     );
-    const view = await renderRows([...READS, "EnableAutoMerge"], queryClient);
+    const view = await renderRows([...READS, "EnableAutoMerge", "GetMergeOptions"], queryClient);
     const enable = actionsOf(view, row()).find(
       (action) => action.id === "lifecycle:enable_auto_merge",
     );
@@ -216,6 +220,51 @@ describe("turning auto-merge on from a row", () => {
     act(() => screen.getByRole("button", { name: "Cancel" }).click());
     await waitFor(() => expect(view.result.current.rows.dialog).toBeNull());
     expect(host.write).not.toHaveBeenCalled();
+  });
+});
+
+describe("turning auto-merge on where the host can't read the merge options", () => {
+  it("hands the row's Enable auto-merge off to GitHub", async () => {
+    const view = await renderRows([...READS, "EnableAutoMerge"]);
+    const enable = actionsOf(view, row()).find(
+      (action) => action.id === "lifecycle:enable_auto_merge",
+    );
+    expect(enable?.href).toBe(PR);
+    expect(host.write).not.toHaveBeenCalled();
+  });
+
+  it("never asks that host for the merge options, and asks one that serves them", async () => {
+    host.read.mockResolvedValue({ methods: ["squash"], default: "squash" });
+    async function readOptions(served: readonly string[]) {
+      host.served = new Set(served);
+      resetPullRequestPageRoutesForTests();
+      const queryClient = newQueryClient();
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      );
+      const view = renderHook(
+        () => ({
+          route: usePullRequestPageRoute(SESSION),
+          options: usePullRequestMergeOptions(SESSION, PR, true),
+        }),
+        { wrapper },
+      );
+      await waitFor(() => expect(view.result.current.route).not.toBe("loading"));
+      view.rerender();
+      return view;
+    }
+
+    const unserved = await readOptions([...READS, "EnableAutoMerge"]);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(unserved.result.current.options.fetchStatus).toBe("idle");
+    expect(host.read).not.toHaveBeenCalled();
+    unserved.unmount();
+
+    const served = await readOptions([...READS, "EnableAutoMerge", "GetMergeOptions"]);
+    await waitFor(() => expect(served.result.current.options.data?.methods).toEqual(["squash"]));
+    expect(host.read).toHaveBeenCalledWith(SESSION, "getMergeOptions", expect.any(Function));
   });
 });
 

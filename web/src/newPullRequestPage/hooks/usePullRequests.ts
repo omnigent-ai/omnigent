@@ -2130,8 +2130,10 @@ export function usePullRequestMergeOptions(
   enabled: boolean,
 ) {
   const priority = useSecondaryReadPriority();
+  // A host that doesn't serve the read is never asked; the read stays idle there.
+  const served = usePullRequestMethodServed(conversationId, "getMergeOptions");
   return useQuery({
-    ...mergeOptionsQueryOptions(conversationId, prUrl, enabled),
+    ...mergeOptionsQueryOptions(conversationId, prUrl, enabled && served),
     meta: readPriorityMeta(priority),
   });
 }

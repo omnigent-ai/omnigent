@@ -10,6 +10,7 @@ import type {
   PullRequestMergeMethod,
 } from "@/newPullRequestPage/hooks/usePullRequests";
 import type { NativeStackMergeHandoff } from "@/pullRequestPage/nativeStackMerge";
+import type * as PullRequestPageRouteModule from "@/pullRequestPage/pullRequestPageRoute";
 import { resetPullRequestStateHoldsForTests } from "@/lib/pullRequestStateHolds";
 import {
   mergeButtonState,
@@ -21,6 +22,15 @@ import {
 vi.mock("@/lib/pullRequestRpc", async (importOriginal) =>
   (await import("@/test/pullRequestRpcOverRest")).pullRequestRpcOverRest(await importOriginal()),
 );
+// The merge bar shows only where the host serves merging, so its merge options read is served.
+vi.mock("@/pullRequestPage/pullRequestPageRoute", async (importOriginal) => {
+  const original = await importOriginal<typeof PullRequestPageRouteModule>();
+  return {
+    ...original,
+    usePullRequestMethodServed: (...args: Parameters<typeof original.usePullRequestMethodServed>) =>
+      args[1] === "getMergeOptions" || original.usePullRequestMethodServed(...args),
+  };
+});
 
 const PR_URL = "https://github.com/acme/app/pull/7";
 const MERGE_PATH = "/v1/sessions/conv_1/resources/github/merge";

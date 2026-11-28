@@ -11,23 +11,29 @@ import {
   hostChangeRouteCurrent,
 } from "./pullRequestPageRoute";
 
-/** The host's method for each state change; batch auto-merge stays on this Mac. */
-const HOST_METHODS: Partial<Record<LifecycleStoreOperation, Method>> = {
-  pull_request_close: "setPullRequestState",
-  pull_request_reopen: "setPullRequestState",
-  pull_request_convert_to_draft: "setPullRequestDraft",
-  pull_request_ready_for_review: "setPullRequestDraft",
-  pull_request_auto_merge_enable: "enableAutoMerge",
-  pull_request_auto_merge_disable: "disableAutoMerge",
+/**
+ * The host methods each state change needs; batch auto-merge stays on this Mac. Turning
+ * auto-merge on also reads the merge options, for the methods its dialog offers.
+ */
+const HOST_METHODS: Partial<Record<LifecycleStoreOperation, readonly Method[]>> = {
+  pull_request_close: ["setPullRequestState"],
+  pull_request_reopen: ["setPullRequestState"],
+  pull_request_convert_to_draft: ["setPullRequestDraft"],
+  pull_request_ready_for_review: ["setPullRequestDraft"],
+  pull_request_auto_merge_enable: ["enableAutoMerge", "getMergeOptions"],
+  pull_request_auto_merge_disable: ["disableAutoMerge"],
 };
 
-/** Where `conversationId`'s host makes `operation` now; null where it doesn't. */
+/** Where `conversationId`'s host makes `operation` now; null where it doesn't serve every method. */
 export function hostLifecycleRoute(
   conversationId: string | undefined,
   operation: LifecycleStoreOperation,
 ): HostChangeRoute | null {
-  const method = HOST_METHODS[operation];
-  return conversationId && method ? hostChangeRoute(conversationId, method) : null;
+  const methods = HOST_METHODS[operation];
+  if (!conversationId || !methods) return null;
+  const [first, ...rest] = methods;
+  const route = first ? hostChangeRoute(conversationId, first) : null;
+  return route && rest.every((method) => hostChangeRoute(conversationId, method)) ? route : null;
 }
 
 /** Whether a change captured for `route` would still go there. */
@@ -35,6 +41,6 @@ export function hostLifecycleRouteCurrent(
   route: HostChangeRoute,
   operation: LifecycleStoreOperation,
 ): boolean {
-  const method = HOST_METHODS[operation];
-  return !!method && hostChangeRouteCurrent(route, method);
+  const methods = HOST_METHODS[operation];
+  return !!methods && methods.every((method) => hostChangeRouteCurrent(route, method));
 }
