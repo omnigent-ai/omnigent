@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -10,8 +12,15 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.orm import Session
 
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import ConversationBase, OmnigentBase, SqlConversationMetadata
-from omnigent.db.utils import _build_alembic_config
+from omnigent.db.utils import (
+    _build_alembic_config,
+    _get_current_db_revision,
+    _get_head_db_revision,
+    _initialize_or_verify_schema,
+    get_or_create_engine,
+)
 
 _PREVIOUS = "47d3e8fc3e25"
 _REVISION = "c51f8d9a27b6"
@@ -22,9 +31,12 @@ _SESSION_ID = bytes.fromhex("0123456789abcdef0123456789abcdef")
 
 def _migrate(uri: str, engine: sa.Engine, step: str, revision: str) -> None:
     config = _build_alembic_config(uri)
-    with engine.begin() as connection:
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
         config.attributes["connection"] = connection
         getattr(command, step)(config, revision)
+        connection.commit()
 
 
 @pytest.mark.parametrize(
@@ -158,3 +170,97 @@ def test_launch_pricing_reference_preserves_legacy_rows_and_writes(tmp_path: Pat
             )
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("interruption", ["committed-ddl", "after-ddl"])
+def test_startup_recovers_an_interrupted_pricing_reference_upgrade(
+    db_uri: str, interruption: str, record_property: Callable[[str, object], None]
+) -> None:
+    """Resume committed DDL and a failure immediately after the column is added."""
+    engine = get_or_create_engine(db_uri)
+    head = _get_head_db_revision(db_uri)
+    context_id = bytes.fromhex("fedcba9876543210fedcba9876543210")
+    stopped_after_ddl: list[str] = []
+
+    class MigrationInterrupted(RuntimeError):
+        pass
+
+    def interrupt_after_ddl(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith(f"ALTER TABLE {_TABLE} ADD COLUMN {_COLUMN}"):
+            stopped_after_ddl.append(statement)
+            raise MigrationInterrupted("Stopped after the database accepted the column DDL")
+
+    try:
+        _migrate(db_uri, engine, "downgrade", _REVISION)
+        assert _get_current_db_revision(engine) == _REVISION
+        if interruption == "after-ddl":
+            _migrate(db_uri, engine, "downgrade", _PREVIOUS)
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"INSERT INTO {_TABLE} (workspace_id, id, kind, git_branch) "
+                    "VALUES (0, :id, 1, 'before-restart')"
+                ),
+                {"id": _SESSION_ID},
+            )
+            if interruption == "committed-ddl":
+                connection.execute(
+                    sa.text(f"UPDATE {_TABLE} SET {_COLUMN} = :context WHERE id = :id"),
+                    {"context": context_id, "id": _SESSION_ID},
+                )
+        if interruption == "committed-ddl":
+            _migrate(db_uri, engine, "stamp", _PREVIOUS)
+        else:
+            sa.event.listen(engine, "after_cursor_execute", interrupt_after_ddl)
+            try:
+                with pytest.raises(MigrationInterrupted, match="accepted the column DDL"):
+                    _migrate(db_uri, engine, "upgrade", _REVISION)
+            finally:
+                sa.event.remove(engine, "after_cursor_execute", interrupt_after_ddl)
+            assert len(stopped_after_ddl) == 1
+        assert _get_current_db_revision(engine) == _PREVIOUS
+        column_survived = _COLUMN in {
+            column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
+        }
+        if interruption == "committed-ddl" or engine.dialect.name == "mysql":
+            assert column_survived
+
+        _initialize_or_verify_schema(engine, db_uri)
+        _initialize_or_verify_schema(engine, db_uri)
+
+        assert _get_current_db_revision(engine) == head
+        with engine.begin() as connection:
+            row = connection.execute(
+                sa.text(f"SELECT git_branch, {_COLUMN} FROM {_TABLE} WHERE id = :id"),
+                {"id": _SESSION_ID},
+            ).one()
+            assert tuple(row) == (
+                "before-restart",
+                context_id if interruption == "committed-ddl" else None,
+            )
+            connection.execute(
+                sa.text(f"UPDATE {_TABLE} SET git_branch = 'after-restart' WHERE id = :id"),
+                {"id": _SESSION_ID},
+            )
+        record_property(
+            "launch_pricing_recovery",
+            json.dumps(
+                {
+                    "dialect": engine.dialect.name,
+                    "interruption": interruption,
+                    "column_survived_interruption": column_survived,
+                    "stopped_after_ddl": len(stopped_after_ddl),
+                    "startup_reached_revision": head,
+                    "legacy_row_and_reference_preserved": True,
+                    "legacy_write_accepted": True,
+                    "scope": "Owned test database; not deployment or older-binary acceptance",
+                }
+            ),
+        )
+    finally:
+        if _get_current_db_revision(engine) == _PREVIOUS:
+            present = _COLUMN in {
+                column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
+            }
+            _migrate(db_uri, engine, "stamp" if present else "upgrade", _REVISION)
+        _migrate(db_uri, engine, "upgrade", head)
