@@ -6491,6 +6491,43 @@ class ProjectList(BaseModel):
     data: list[ProjectObject]
 
 
+class ProjectUsage(BaseModel):
+    """Response for ``GET /v1/projects/{project_id}/usage``.
+
+    The summed usage of the project's top-level sessions, each including its
+    sub-agents, in the same fields as a session's usage. A session counts
+    toward the project it is filed under now, archived or not. Sessions created
+    before project totals were stored are not counted.
+
+    :param object: Discriminator; always ``"project.usage"``.
+    :param project_id: The project, e.g. ``"3f2a0c9e5b7d4e1f8a6c2b9d0e4f7a1c"``.
+    :param total_cost_usd: Summed spend in USD, e.g. ``12.34``. ``None`` when
+        no counted session is priced, so clients render "—" rather than a
+        misleading ``$0.00``, or when the operator hides costs.
+    :param cost_hidden: ``True`` when the operator set ``OMNIGENT_HIDE_COST``.
+        ``None`` otherwise.
+    :param input_tokens: Summed non-cached input tokens, e.g. ``12000``.
+        ``None`` when none were recorded; likewise for the other token counts.
+    :param output_tokens: Summed output tokens.
+    :param total_tokens: Summed total tokens.
+    :param cache_read_input_tokens: Summed tokens read from the prompt cache.
+    :param cache_creation_input_tokens: Summed tokens written to the prompt cache.
+    :param usage_by_model: Per-model breakdown, keyed by raw harness model id.
+        ``None`` when no per-model usage was recorded.
+    """
+
+    object: Literal["project.usage"] = "project.usage"
+    project_id: str
+    total_cost_usd: float | None = None
+    cost_hidden: bool | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    usage_by_model: dict[str, ModelUsage] | None = None
+
+
 class SessionProjectSummary(BaseModel):
     """One entry of ``GET /v1/sessions/projects`` — a sidebar project folder.
 

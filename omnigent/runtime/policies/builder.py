@@ -54,6 +54,7 @@ from omnigent.spec.types import (
 )
 from omnigent.stores.conversation_store import (
     SPAWN_TREE_READ_CAP,
+    SUMMABLE_USAGE_KEYS,
     ConversationStore,
     DailyCostState,
 )
@@ -1259,17 +1260,9 @@ def _load_session_state(
 # Bigger trees still page, so none is silently truncated.
 _SUBTREE_USAGE_PAGE_SIZE = SPAWN_TREE_READ_CAP + 1
 
-# Usage counters summed across a conversation subtree. Restricted to the
-# known numeric keys the PolicyEngine reads so an unexpected key in one
-# conversation's persisted usage can't leak into the aggregate.
-_SUMMABLE_USAGE_KEYS = (
-    "input_tokens",
-    "output_tokens",
-    "total_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-    "total_cost_usd",
-)
+# Usage counters summed across a conversation subtree; the stored spawn-tree
+# and project totals sum the same ones (see SUMMABLE_USAGE_KEYS).
+_SUMMABLE_USAGE_KEYS = SUMMABLE_USAGE_KEYS
 
 
 def _merge_by_model(

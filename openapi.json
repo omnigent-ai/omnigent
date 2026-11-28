@@ -7045,6 +7045,133 @@
         "title": "ProjectSessionCreateRequest",
         "type": "object"
       },
+      "ProjectUsage": {
+        "description": "Response for `GET /v1/projects/{project_id}/usage`.\n\nThe summed usage of the project's top-level sessions, each including its\nsub-agents, in the same fields as a session's usage. A session counts\ntoward the project it is filed under now, archived or not. Sessions created\nbefore project totals were stored are not counted.",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Summed tokens written to the prompt cache.",
+            "title": "Cache Creation Input Tokens"
+          },
+          "cache_read_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Summed tokens read from the prompt cache.",
+            "title": "Cache Read Input Tokens"
+          },
+          "cost_hidden": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`True` when the operator set `OMNIGENT_HIDE_COST`. `None` otherwise.",
+            "title": "Cost Hidden"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Summed non-cached input tokens, e.g. `12000`. `None` when none were recorded; likewise for the other token counts.",
+            "title": "Input Tokens"
+          },
+          "object": {
+            "const": "project.usage",
+            "default": "project.usage",
+            "description": "Discriminator; always `\"project.usage\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Summed output tokens.",
+            "title": "Output Tokens"
+          },
+          "project_id": {
+            "description": "The project, e.g. `\"3f2a0c9e5b7d4e1f8a6c2b9d0e4f7a1c\"`.",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "total_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Summed spend in USD, e.g. `12.34`. `None` when no counted session is priced, so clients render \"\u2014\" rather than a misleading `$0.00`, or when the operator hides costs.",
+            "title": "Total Cost Usd"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Summed total tokens.",
+            "title": "Total Tokens"
+          },
+          "usage_by_model": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ModelUsage"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-model breakdown, keyed by raw harness model id. `None` when no per-model usage was recorded.",
+            "title": "Usage By Model"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "ProjectUsage",
+        "type": "object"
+      },
       "PullRequestCommentAnchor": {
         "description": "Immutable PR coordinates for a session-only review comment.",
         "properties": {
@@ -22870,6 +22997,50 @@
           }
         },
         "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/usage": {
+      "get": {
+        "description": "Return the summed usage of one of the caller's projects.\n\nReads the project's stored total, which member sessions keep current as\nthey report usage, so the cost does not grow with the session count.\n\n**Returns:** The project's summed usage.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "operationId": "get_project_usage_v1_projects__project_id__usage_get",
+        "parameters": [
+          {
+            "description": "The project to read.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectUsage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Usage",
         "tags": [
           "projects"
         ]

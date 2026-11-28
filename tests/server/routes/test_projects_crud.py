@@ -454,6 +454,58 @@ async def test_cannot_delete_another_users_project(
     ).status_code == 200
 
 
+async def test_project_usage_reports_member_sessions_to_their_owner(
+    multi_user_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The usage route returns the stored total in session usage fields, owner-only."""
+    monkeypatch.delenv("OMNIGENT_HIDE_COST", raising=False)
+    project_id = (
+        await multi_user_client.post(
+            "/v1/projects", json={"name": "Factory"}, headers=_as_user(ALICE)
+        )
+    ).json()["id"]
+    path = f"/v1/projects/{project_id}/usage"
+    assert (await multi_user_client.get(path, headers=_as_user(ALICE))).json() == {
+        "object": "project.usage",
+        "project_id": project_id,
+    }
+
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation(project_id=project_id)
+    child = store.create_conversation(kind="sub_agent", parent_conversation_id=session.id)
+    store.increment_session_usage(
+        session.id,
+        {
+            "input_tokens": 100,
+            "total_tokens": 100,
+            "total_cost_usd": 1.25,
+            "by_model": {"model-a": {"input_tokens": 100, "total_cost_usd": 1.25}},
+        },
+    )
+    store.set_session_usage(
+        child.id, {"output_tokens": 40, "total_tokens": 40, "total_cost_usd": 0.5}
+    )
+
+    resp = await multi_user_client.get(path, headers=_as_user(ALICE))
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "object": "project.usage",
+        "project_id": project_id,
+        "total_cost_usd": 1.75,
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "total_tokens": 140,
+        "usage_by_model": {"model-a": {"input_tokens": 100, "total_cost_usd": 1.25}},
+    }
+    assert (await multi_user_client.get(path, headers=_as_user(BOB))).status_code == 404
+
+    monkeypatch.setenv("OMNIGENT_HIDE_COST", "1")
+    hidden = (await multi_user_client.get(path, headers=_as_user(ALICE))).json()
+    assert "total_cost_usd" not in hidden
+    assert hidden["cost_hidden"] is True
+    assert hidden["usage_by_model"] == {"model-a": {"input_tokens": 100}}
+
+
 # ── Live broadcast of project changes ────────────────────────────────────────
 #
 # Project mutations must announce on the owner's session-updates discovery
