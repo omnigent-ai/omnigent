@@ -332,11 +332,18 @@ async def _remote_start_point(
     None when the reflog is off or expired, or the start was ``HEAD``, a commit, a tag, a local
     branch, a deleted branch or the branch's own copy on a remote, or its name is now ambiguous.
     """
-    output = await repository.run_unchecked(
-        ["reflog", "show", "--format=%gs", branch_ref, "--"], deadline=deadline
+    # Only the oldest entry is read, so a long-lived branch's reflog stays within the output cap.
+    counted = await repository.run_unchecked(
+        ["rev-list", "--walk-reflogs", "--count", branch_ref, "--"], deadline=deadline
     )
-    lines = output.stdout.decode("utf-8", "replace").splitlines() if output.success else []
-    oldest = lines[-1] if lines else ""
+    count = first_line(counted.stdout) if counted.success else ""
+    if not count.isdecimal() or int(count) == 0:
+        return None
+    entry = await repository.run_unchecked(
+        ["reflog", "show", "-1", "--format=%gs", f"{branch_ref}@{{{int(count) - 1}}}", "--"],
+        deadline=deadline,
+    )
+    oldest = first_line(entry.stdout) if entry.success else ""
     if not oldest.startswith(_CREATED_FROM):
         return None
     start = oldest.removeprefix(_CREATED_FROM)

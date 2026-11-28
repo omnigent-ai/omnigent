@@ -807,6 +807,30 @@ async def test_a_pushed_branch_still_compares_with_the_branch_it_started_from(
     assert _paths(response) == ["feature.txt"]
 
 
+async def test_a_long_lived_branch_still_compares_with_the_branch_it_started_from(
+    tmp_path: Path,
+) -> None:
+    """A reflog far past the runner's output cap still yields its oldest entry."""
+    root, _main, fork_next = _fork_checkout(tmp_path)
+    _git(root, "checkout", "-q", "-b", "feature", "fork/next")
+    _push_upstream(root, "fork", "feature")
+    reflog = root / ".git" / "logs" / "refs" / "heads" / "feature"
+    created = reflog.read_text().splitlines()[0]
+    identity = created.split("\t", 1)[0]
+    subject = "Keep the session list's scroll position when a row above it updates"
+    entries = "".join(
+        f"{identity}\tcommit (amend): {subject} ({index})\n" for index in range(1000)
+    )
+    reflog.write_text(reflog.read_text() + entries)
+    # Every entry's message together is more than the runner reads from one command.
+    assert len(_git(root, "reflog", "show", "--format=%gs", "refs/heads/feature")) > 64 * 1024
+
+    response = await _changes(root, COMPARISON_KIND_BRANCH_POINT)
+    assert _unavailable_problem(response) is None
+    assert response.base.reference == "fork/next"
+    assert response.base.base == fork_next
+
+
 async def test_a_pushed_worktree_branch_still_compares_with_the_branch_it_started_from(
     tmp_path: Path,
 ) -> None:
