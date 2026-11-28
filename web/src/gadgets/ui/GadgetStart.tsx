@@ -95,7 +95,16 @@ function GadgetStartContent({
         errorTitle="Couldn’t create the gadget"
         compact={compact}
       />
-      <GadgetTemplatesSection onCreated={onTemplateCreated} />
+      <GadgetTemplatesSection
+        onCreated={onTemplateCreated}
+        onCreatedFromShared={(gadget) => {
+          if (dismissed.current) return;
+          // A gadget made from a shared template is complete and published, and its owner can
+          // change it from its own gadget session.
+          navigate(gadgetBoardPath(gadget.id), { state: IN_APP_GADGET_OPEN });
+          onLeave?.();
+        }}
+      />
     </>
   );
 }

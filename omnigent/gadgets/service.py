@@ -27,7 +27,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
@@ -437,12 +437,44 @@ def _scope_digest(schema: Any, scope: str) -> str:
     return hashlib.sha256(canonical_bytes({"scope": scope, "schema": schema})).hexdigest()
 
 
+def _starter_collections(
+    value: Any, collections: dict, scopes: dict[str, str], constraints: list[dict]
+) -> list[str]:
+    """The shared collections whose records a gadget made from this one as a template starts
+    with; the rest start empty.
+
+    :raises InvalidInput: For an undeclared or ``viewer`` collection (a viewer's records are
+        their own and never copied), or a starter collection with a ``reference`` rule to a
+        collection that isn't one: its records would point at records the copy doesn't have.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_COLLECTIONS:
+        raise InvalidInput("starter_collections must be a list of collection names")
+    for name in value:
+        if not isinstance(name, str) or name not in collections:
+            raise InvalidInput(f"starter_collections names {name!r}, which is not declared")
+        if name in scopes:
+            raise InvalidInput(f"Collection {name} is per viewer, so it has no starter data")
+    chosen = set(value)
+    for rule in constraints:
+        if rule["kind"] == "reference" and rule["collection"] in chosen:
+            if rule["target"] not in chosen:
+                raise InvalidInput(
+                    f"Starter collection {rule['collection']} references {rule['target']} "
+                    f"(rule {rule['name']}); make {rule['target']} a starter collection too",
+                    details={"constraint": rule["name"]},
+                )
+    return sorted(chosen)
+
+
 # A revision derived from another carries these from it unless the request gives them.
 _REVISION_FIELDS = (
     "sdk_version",
     "capabilities",
     "collections",
     "collection_scopes",
+    "starter_collections",
     "guide",
     "constraints",
     "actions",
@@ -759,34 +791,24 @@ class GadgetService:
             if name is not None
             else ("Copy of " + gadget.name)[:MAX_GADGET_NAME_CHARS]
         )
-        # Read before creating anything, so a refused copy leaves no gadget behind.
-        records: list[tuple[str, str, Any]] = []
-        if include_data:
-            source = ImmutableDocumentStore(self._files(gadget), "data", limits=_DATA_STORE_LIMITS)
-            # Viewer collections' records are each viewer's own and are never copied.
-            shared = set(revision["collections"]) - set(revision.get("collection_scopes", {}))
-            pages = 0
-            for collection in sorted(shared):
-                cursor = None
-                while True:
-                    pages += 1
-                    if pages > MAX_COPY_PAGES:
-                        raise CapacityExceeded(
-                            "This gadget's data has too much history to copy in one go; "
-                            "copy the gadget without its data",
-                            details={"max_pages": MAX_COPY_PAGES},
-                        )
-                    page = source.list(collection, _DATA_STORE_LIMITS.max_list_limit, cursor)
-                    records.extend((collection, item.id, item.value) for item in page.items)
-                    if len(records) > MAX_COPIED_RECORDS:
-                        raise CapacityExceeded(
-                            f"A copy with data can hold at most {MAX_COPIED_RECORDS} records; "
-                            "copy the gadget without its data",
-                            details={"max_records": MAX_COPIED_RECORDS},
-                        )
-                    cursor = page.next_cursor
-                    if cursor is None:
-                        break
+        # Read before creating anything, so a refused copy leaves no gadget behind. Viewer
+        # collections' records are each viewer's own and are never copied.
+        shared = set(revision["collections"]) - set(revision.get("collection_scopes", {}))
+        records = self._records_of(gadget, shared) if include_data else []
+        return self._create_copy(name, revision, records)
+
+    def _create_copy(
+        self,
+        name: str,
+        revision: dict,
+        records: list[tuple[str, str, Any]],
+        source: dict | None = None,
+    ) -> dict:
+        """A new gadget of the viewer's with *revision* published and *records* in it.
+
+        :param source: For a gadget made from a template, ``{"gadget_id", "revision_id"}``
+            of the template, kept with the new gadget.
+        """
         copied = self.store.create(
             self.viewer.user_id, name, owner_registration=self.viewer.registration
         )
@@ -797,6 +819,10 @@ class GadgetService:
             value = {**revision, "id": uuid.uuid4().hex}
             files.mkdirs("code/revisions")
             files.create_json(f"code/revisions/{value['id']}.json", _stored_revision(value))
+            if source is not None:
+                self._state(copied).create(
+                    "template", "source", source, "template-source", self.viewer.user_id
+                )
             # Before publishing, so the copy's rules count these records as existing data.
             target = ImmutableDocumentStore(files, "data", limits=_DATA_STORE_LIMITS)
             for collection, record_id, record in records:
@@ -821,6 +847,110 @@ class GadgetService:
             except Exception:  # noqa: BLE001 - logged; the original error is re-raised
                 _log.warning("could not delete a failed gadget copy", exc_info=True)
             raise
+
+    def _records_of(
+        self, gadget: Gadget, collections: Iterable[str]
+    ) -> list[tuple[str, str, Any]]:
+        """Every record of *collections*, read before anything is created.
+
+        :raises CapacityExceeded: Past :data:`MAX_COPIED_RECORDS` in all.
+        """
+        records: list[tuple[str, str, Any]] = []
+        source = ImmutableDocumentStore(self._files(gadget), "data", limits=_DATA_STORE_LIMITS)
+        pages = 0
+        for collection in sorted(collections):
+            cursor = None
+            while True:
+                pages += 1
+                if pages > MAX_COPY_PAGES:
+                    raise CapacityExceeded(
+                        "This gadget's data has too much history to copy in one go; "
+                        "copy the gadget without its data",
+                        details={"max_pages": MAX_COPY_PAGES},
+                    )
+                page = source.list(collection, _DATA_STORE_LIMITS.max_list_limit, cursor)
+                records.extend((collection, item.id, item.value) for item in page.items)
+                if len(records) > MAX_COPIED_RECORDS:
+                    raise CapacityExceeded(
+                        f"A copy with data can hold at most {MAX_COPIED_RECORDS} records; "
+                        "copy the gadget without its data",
+                        details={"max_records": MAX_COPIED_RECORDS},
+                    )
+                cursor = page.next_cursor
+                if cursor is None:
+                    break
+        return records
+
+    # -- templates ---------------------------------------------------------------
+
+    def templates(self, limit: Any = MAX_SHARED_GADGETS, cursor: Any = None) -> dict:
+        """One page of the gadgets shared with the viewer as templates only, for New gadget:
+        ``{"items": [{"id", "name", "owner_email", "shared_via"}], "next_cursor"}``. Gadgets
+        the viewer can open are in :meth:`shared` instead. A page can be short and continue."""
+        if cursor is not None and not isinstance(cursor, str):
+            raise InvalidInput("Invalid cursor")
+        page = self.access.shared_with(
+            self.viewer.user_id, limit=_page_limit(limit, MAX_SHARED_GADGETS), cursor=cursor
+        )
+        others = [
+            item
+            for item in page.items
+            if not owned_by(item.gadget, self.viewer.user_id, self.viewer.registration)
+        ]
+        found = self.access.permissions_many(self.viewer.user_id, [item.gadget for item in others])
+        usable = [
+            item
+            for item in others
+            if found[item.gadget.id].use_template
+            and not found[item.gadget.id].read
+            and self._publication(item.gadget) is not None
+        ]
+        owners = sorted({item.gadget.owner_id for item in usable})
+        names = self._display_names(owners) if self._display_names and owners else {}
+        return {
+            "items": [
+                {
+                    "id": item.gadget.id,
+                    "name": item.gadget.name,
+                    "owner_email": names.get(item.gadget.owner_id, item.gadget.owner_id),
+                    "shared_via": item.shared_via,
+                }
+                for item in usable
+            ],
+            "next_cursor": page.next_cursor,
+        }
+
+    def create_from_template(self, app_id: str, body: dict) -> dict:
+        """Make a gadget the viewer owns from a published gadget they can use as a template:
+        its current published code, published again, and the records of the collections it
+        marks as starter data; the rest start empty. The new gadget keeps which template
+        and revision it came from, and nothing else links it to the template: revoking or
+        deleting the template leaves it as it is.
+
+        :param body: ``{"name"?}``; the name defaults to the template's.
+        :returns: The new gadget, as :meth:`get` answers it.
+        """
+        if not is_gadget_id(app_id):
+            raise NotFound("Gadget not found")
+        gadget = self.store.get(app_id)
+        found = (
+            NO_ACCESS if gadget is None else self.access.permissions(self.viewer.user_id, gadget)
+        )
+        # Readers can too; a template-only grantee can do nothing else.
+        if gadget is None or not (found.use_template or found.read):
+            raise NotFound("Gadget not found")
+        publication = self._publication(gadget)
+        if publication is None:
+            raise NotFound("This gadget has not been published")
+        revision = self._published(gadget, publication)
+        name = body.get("name")
+        name = _gadget_name(name) if name is not None else gadget.name
+        starters = set(revision.get("starter_collections", [])) - set(
+            revision.get("collection_scopes", {})
+        )
+        records = self._records_of(gadget, starters)
+        source = {"gadget_id": gadget.id, "revision_id": revision["id"]}
+        return self._create_copy(name, revision, records, source)
 
     def gadget_session_status(self, app_id: str) -> dict:
         """Whether the viewer's gadget session, with the sessions it started, is working."""
@@ -1199,6 +1329,11 @@ class GadgetService:
         scopes = _collection_scopes(body.get("collection_scopes"), collections, constraints)
         if scopes:
             value["collection_scopes"] = scopes
+        starters = _starter_collections(
+            body.get("starter_collections"), collections, scopes, constraints
+        )
+        if starters:
+            value["starter_collections"] = starters
         files = self._files(gadget)
         files.mkdirs("code/revisions")
         files.create_json(f"code/revisions/{revision_id}.json", _stored_revision(value))
@@ -1402,6 +1537,7 @@ class GadgetService:
             "capabilities": revision["capabilities"],
             "collections": revision["collections"],
             "collection_scopes": revision.get("collection_scopes", {}),
+            "starter_collections": revision.get("starter_collections", []),
             "guide": revision.get("guide"),
             "constraints": revision.get("constraints", []),
             "actions": revision.get("actions", []),
@@ -1426,6 +1562,8 @@ class GadgetService:
             "collections": revision.get("collections", {}),
             # Collections each viewer keeps their own records of; the rest are shared.
             "collection_scopes": revision.get("collection_scopes", {}),
+            # Collections whose records a gadget made from this one as a template starts with.
+            "starter_collections": revision.get("starter_collections", []),
             "constraints": revision.get("constraints", []),
             "actions": revision.get("actions", []),
             "next_steps": _NEXT_STEPS_UNPUBLISHED if publication is None else _NEXT_STEPS,

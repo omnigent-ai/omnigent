@@ -424,7 +424,10 @@ the header menu), and each place is a separate entry point.
   its data if they check **Copy its data too**) and **Delete gadget**.
   A gadget's collections are shared, or per viewer (`collection_scopes`): in a
   per-viewer collection each viewer, even one who can only view, keeps their own
-  records, which no one else sees and a copy never takes. A gadget that asks to
+  records, which no one else sees and a copy never takes.
+  A gadget can be shared **Can use as template**: the grantee never opens it, and finds it
+  under New gadget's **Shared with you**, where choosing it makes their own gadget from its
+  published code and starter data. A gadget that asks to
   read the viewer's sessions waits for **Allow** / **Don’t allow** first; a gadget
   that navigated itself stops with **Reload gadget**, after which it asks again.
   The Gadget page lists the viewer's gadgets and, with sharing, a **Shared with you** section; each

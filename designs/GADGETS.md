@@ -331,6 +331,35 @@ A copy is for changing the code, sharing it with one's own group, or keeping a g
 owner may delete. For using an app on one's own data, `viewer` collections are preferable:
 the publisher's fixes reach every user, and no one is left on an outdated copy.
 
+## Share as template
+
+Sharing a gadget as a template hands someone the app, not its data or its page: they make a
+gadget of their own from it and never open the original.
+
+- **The grant.** "Can use as template" is a grant level of its own (`0` in
+  `gadget_shares.level`), below Can view and not combined with it: a grantee with it can't
+  open the gadget, read its revisions, records or comments, or see it in Shared with you. A
+  grant at another level, directly or through a group, gives more, as levels always do;
+  readers can make a gadget from it too. Like Share, it is offered only where the server keeps
+  gadget grants (`gadget_sharing`).
+- **Where it shows.** Under New gadget, beside the built-in templates, as "Shared with you"
+  (`GET /v1/gadgets/templates`), with the owner's name. Unpublished gadgets are left out.
+- **Create from template** (`POST /v1/gadgets/{id}/from-template`) makes a gadget the
+  grantee owns with the template's current published revision, published again, and empty
+  data, except the collections the publisher marked as starter data
+  (`starter_collections` in the revision; shared collections only), whose records are copied.
+  The new gadget records the template's ID and the revision it came from
+  (`code/state/template/source`), for a later "newer version available"; nothing reads it
+  yet.
+- **Independence.** Nothing else links the two: revoking the grant or deleting the template
+  leaves gadgets made from it as they are, and their owner changes them from their own gadget
+  session right away, as with any gadget they own.
+- **On the seam.** `GadgetPermissions.use_template` carries it, and `TEMPLATE_ONLY` is what a
+  template-only grantee gets. The server reads the published revision and the starter
+  collections on the grantee's behalf, so a store backed by folder permissions maps the level
+  to read on the gadget's code alone (its revisions and publication), never its data,
+  comments, sessions or action ledger.
+
 ## Not in scope
 
 - Server-side execution of gadget code (gadgets run only in the viewer's browser).

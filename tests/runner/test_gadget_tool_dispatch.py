@@ -567,6 +567,21 @@ async def test_viewer_scopes_round_trip_and_an_older_server_that_drops_them_is_r
         "collection_scopes": {"cards": "viewer"},
     }
     gadget_id = (await _call(server, "sys_gadget_create", name="Course"))["id"]
+    # Starter data goes through too, for a gadget shared as a template.
+    starter = {
+        **args,
+        "collections": {**_CARDS, "lessons": {"type": "object"}},
+        "starter_collections": ["lessons"],
+    }
+    jsonschema.validate(
+        {"gadget_id": gadget_id, **starter},
+        SysGadgetRevisionCreateTool().get_schema()["function"]["parameters"],
+    )
+    made = await _call(server, "sys_gadget_revision_create", gadget_id=gadget_id, **starter)
+    fetched = await _call(
+        server, "sys_gadget_revision_get", gadget_id=gadget_id, revision_id=made["id"]
+    )
+    assert fetched["starter_collections"] == ["lessons"]
     jsonschema.validate(
         {"gadget_id": gadget_id, **args},
         SysGadgetRevisionCreateTool().get_schema()["function"]["parameters"],

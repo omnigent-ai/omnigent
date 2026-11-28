@@ -5,7 +5,7 @@
  * toggling public visibility. Only accessible to users with
  * manage-level (3) permission on the session. An automation or a workflow
  * is shared by its owner at read access only, with no public or link sharing.
- * A gadget is shared by its managers at Can view, Can edit or Can manage, also
+ * A gadget is shared by its managers at Can use as template, Can view, Can edit or Can manage, also
  * without public or link sharing.
  */
 
@@ -90,8 +90,12 @@ export type SharedWorkflow = Pick<SavedWorkflow, "id" | "name">;
 export type SharedGadget = Pick<Gadget, "id" | "name"> &
   Partial<Pick<Gadget, "owner_id" | "viewer_id">>;
 
-/** The levels a gadget can be shared at (read, edit, manage), as its share dialog names them. */
+/**
+ * The levels a gadget can be shared at, as its share dialog names them. "Can use as template"
+ * lets someone make their own gadget from it under New gadget, without opening it.
+ */
 const GADGET_LEVELS = [
+  { value: 0, label: "Can use as template" },
   { value: 1, label: "Can view" },
   { value: 2, label: "Can edit" },
   { value: 3, label: "Can manage" },
@@ -160,6 +164,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
   // server as "on" (fail open) so the modal renders its full controls; the
   // server-side gate is the real enforcement point regardless.
   const info = useServerInfo();
+  // Can use as template only where the server says it supports it; an older server refuses 0.
+  const gadgetLevels =
+    info !== "loading" && info.gadget_templates === true
+      ? GADGET_LEVELS
+      : GADGET_LEVELS.filter((level) => level.value !== 0);
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
@@ -200,7 +209,9 @@ export function PermissionsModal(props: PermissionsModalProps) {
   const [showQr, setShowQr] = useState(false);
   const [checkingPermissions, setCheckingPermissions] = useState(false);
   // A change that takes the viewer's own Can manage away waits for them to confirm it.
-  const [selfChange, setSelfChange] = useState<{ level: number } | null>(null);
+  // `level` is the level the viewer chose for themselves; `remove` means taking their access
+  // away, kept apart because 0 is a level too (Can use as template).
+  const [selfChange, setSelfChange] = useState<{ level: number; remove?: true } | null>(null);
   const blockedNoticeId = useId();
 
   // Whether the owner shared the workspace files with view-level collaborators.
@@ -323,7 +334,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
         await grantAccess(
           trimmed,
           parseInt(newLevel, 10),
-          existingGrant?.level,
+          // No grant is below every level, "Can use as template" (0) included.
+          existingGrant?.level ?? -1,
           !!filePath || !!gadget,
         )
       ) {
@@ -354,7 +366,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
   function handleRevoke(userId: string, confirmed = false) {
     setError(null);
     if (!confirmed && isViewerManage(userId)) {
-      setSelfChange({ level: 0 });
+      setSelfChange({ level: 0, remove: true });
       return;
     }
     revoke.mutate(userId, {
@@ -372,7 +384,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
       setSelfChange({ level });
       return;
     }
-    if ((await grantAccess(userId, level)) && confirmed) afterSelfChange();
+    // A changed row is always sent: no grant is below every level, Can use as template (0) too.
+    if ((await grantAccess(userId, level, -1)) && confirmed) afterSelfChange();
   }
 
   async function handlePublicLevel(value: string) {
@@ -619,10 +632,10 @@ export function PermissionsModal(props: PermissionsModalProps) {
                       gadget
                         ? sharingReadOnly
                           ? // Read-only sharing still lets a grant go down to Can view.
-                            GADGET_LEVELS.filter(
+                            gadgetLevels.filter(
                               (level) => level.value === 1 || level.value === p.level,
                             )
-                          : GADGET_LEVELS
+                          : gadgetLevels
                         : undefined
                     }
                     youLabel={p.user_id === viewerId ? "you" : undefined}
@@ -646,11 +659,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
           <Alert role="alertdialog" aria-label="Change your own access" className="bg-muted/50">
             <InfoIcon />
             <AlertTitle>
-              {selfChange.level === 0 ? "Remove your own access?" : "Give up Can manage?"}
+              {selfChange.remove ? "Remove your own access?" : "Give up Can manage?"}
             </AlertTitle>
             <AlertDescription>
               <p>
-                {selfChange.level === 0
+                {selfChange.remove
                   ? "You won’t be able to open this gadget again unless someone shares it with you."
                   : "You won’t be able to share or delete this gadget, or see who has access, unless someone gives you Can manage again."}
               </p>
@@ -662,11 +675,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
                   componentId="diagnostics.permissions.confirm_self_change"
                   onClick={() => {
                     if (viewerId === undefined) return;
-                    if (selfChange.level === 0) handleRevoke(viewerId, true);
+                    if (selfChange.remove) handleRevoke(viewerId, true);
                     else void handleChangeLevel(viewerId, selfChange.level, true);
                   }}
                 >
-                  {selfChange.level === 0 ? "Remove my access" : "Give up Can manage"}
+                  {selfChange.remove ? "Remove my access" : "Give up Can manage"}
                 </Button>
                 <Button size="sm" variant="outline" onClick={() => setSelfChange(null)}>
                   Cancel
@@ -713,13 +726,13 @@ export function PermissionsModal(props: PermissionsModalProps) {
                   <SelectContent position="popper" align="start">
                     {gadget ? (
                       // Read-only sharing caps new grants at view.
-                      GADGET_LEVELS.filter((level) => !sharingReadOnly || level.value === 1).map(
-                        (level) => (
+                      gadgetLevels
+                        .filter((level) => !sharingReadOnly || level.value === 1)
+                        .map((level) => (
                           <SelectItem key={level.value} value={String(level.value)}>
                             {level.label}
                           </SelectItem>
-                        ),
-                      )
+                        ))
                     ) : (
                       <>
                         <SelectItem value="1">Read</SelectItem>

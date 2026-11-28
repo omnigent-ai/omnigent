@@ -141,6 +141,8 @@ real data unless the person gives it to you.
   and the SDK use them like any collection. A scope can't change once published.
   Rules apply within one viewer's records, and a `reference` must stay within
   one scope. Your own `sys_gadget_records` calls reach only your viewer records.
+- `starter_collections` (optional): shared collections whose records a gadget
+  made from this one as a template starts with; the rest start empty.
 - `constraints`: rules across records, each with a `name`, a `kind` and an
   optional `message` shown when a write breaks it:
   - `max_records`: `collection`, `max`, optional `where` (`{field: value}`).

@@ -7,6 +7,14 @@ and everyone else what their grants in the server's
 :class:`~omnigent.stores.permission_store.PermissionStore` give them, the way
 sessions and workflows are shared. A deployment with its own access model passes
 another implementation to ``create_app(gadget_access=...)``.
+
+"Can use as template" (:data:`TEMPLATE_ONLY`) lets a viewer make their own gadget from
+the gadget's published code without opening it: the server reads the published revision,
+and the starter collections the publisher marked, on their behalf, and nothing else. A
+store backed by folder permissions maps it to read on the code alone (the gadget's
+revisions and publication, never its records, comments, sessions or action ledger); a
+viewer with only that grant gets :data:`TEMPLATE_ONLY` from :meth:`GadgetAccess.permissions`
+and is listed by :meth:`GadgetAccess.shared_with` like any other grantee.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from typing import Literal
 
 from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, current_workspace_id
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ, RESERVED_USER_LOCAL
+from omnigent.server.session_sharing import LEVEL_GADGET_TEMPLATE
 from omnigent.stores.gadget_store import Gadget, GadgetStore
 from omnigent.stores.permission_store import MAX_SHARED_GADGETS_PAGE_SIZE, PermissionStore
 
@@ -36,12 +45,16 @@ class GadgetPermissions:
         register a gadget session.
     :param manage: Delete it, change who it is shared with, and approve new
         capabilities on publish.
+    :param use_template: Create a gadget of one's own from its published code (and its
+        starter data), without opening it. Everyone who can read it can, and so can a
+        "Can use as template" grantee, who can do nothing else with it.
     """
 
     read: bool = False
     write_data: bool = False
     publish: bool = False
     manage: bool = False
+    use_template: bool = False
 
     def to_dict(self) -> dict[str, bool]:
         return {
@@ -49,22 +62,28 @@ class GadgetPermissions:
             "write_data": self.write_data,
             "publish": self.publish,
             "manage": self.manage,
+            "use_template": self.use_template,
         }
 
 
 NO_ACCESS = GadgetPermissions()
-FULL_ACCESS = GadgetPermissions(read=True, write_data=True, publish=True, manage=True)
+FULL_ACCESS = GadgetPermissions(
+    read=True, write_data=True, publish=True, manage=True, use_template=True
+)
+TEMPLATE_ONLY = GadgetPermissions(use_template=True)
 
 
 def permissions_for_level(level: int | None) -> GadgetPermissions:
     """The permissions a grant level gives; owners get :data:`FULL_ACCESS`."""
-    if level is None or level < LEVEL_READ:
+    if level is None or level < LEVEL_GADGET_TEMPLATE:
         return NO_ACCESS
     if level >= LEVEL_MANAGE:
         return FULL_ACCESS
     if level >= LEVEL_EDIT:
-        return GadgetPermissions(read=True, write_data=True, publish=True)
-    return GadgetPermissions(read=True)
+        return GadgetPermissions(read=True, write_data=True, publish=True, use_template=True)
+    if level >= LEVEL_READ:
+        return GadgetPermissions(read=True, use_template=True)
+    return TEMPLATE_ONLY
 
 
 def workspace_registration(registration: str | None) -> str | None:
@@ -140,7 +159,7 @@ class GadgetAccess(ABC):
     def shared_with(
         self, viewer_id: str, *, limit: int = MAX_SHARED_GADGETS, cursor: str | None = None
     ) -> SharedPage:
-        """One page of other people's gadgets *viewer_id* can read.
+        """One page of other people's gadgets *viewer_id* can read or use as a template.
 
         Leaves out the viewer's own gadgets and those they reach only through a
         role that reads everything, such as an administrator's.

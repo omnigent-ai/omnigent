@@ -51,7 +51,7 @@ from omnigent.stores.gadget_store import (
     InvalidInput,
     NotFound,
 )
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import PermissionStore, gadget_sharing_unsupported
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
@@ -270,6 +270,12 @@ def create_gadgets_router(
     """
     router = APIRouter(route_class=_GadgetRoute)
 
+    def _require_template_sharing(request: Request) -> None:
+        """Refuse template routes where gadgets can't be shared, as the share routes do."""
+        del request
+        if permission_store is None or not permission_store.supports_gadget_grants:
+            raise gadget_sharing_unsupported()
+
     def _viewer(user_id: str) -> GadgetViewer:
         # Gadgets belong to the account's registration, which a password change keeps. A
         # database read, so it runs in the request's worker thread.
@@ -391,6 +397,15 @@ def create_gadgets_router(
         limit, cursor = _page(request, 100)
         return _json(await run(request, lambda service: service.shared(limit, cursor)))
 
+    @router.get("/gadgets/templates", openapi_extra={"parameters": _PAGE_PARAMETERS})
+    async def gadget_templates(request: Request) -> Response:
+        """A page of gadgets shared with the caller as templates only, ``{"items",
+        "next_cursor"}``, each ``{"id", "name", "owner_email", "shared_via"}``. A page can be
+        short and continue."""
+        _require_template_sharing(request)
+        limit, cursor = _page(request, 100)
+        return _json(await run(request, lambda service: service.templates(limit, cursor)))
+
     _SHELF_PARAMETERS = [
         {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
         {"name": "cursor", "in": "query", "schema": _STRING},
@@ -474,6 +489,19 @@ def create_gadgets_router(
         records. Answers the copy with 201."""
         body = await _body(request)
         result = await run(request, lambda service: service.copy(app_id, body))
+        return _json(result, 201)
+
+    @router.post(
+        "/gadgets/{app_id}/from-template",
+        status_code=201,
+        openapi_extra=_json_body({"name": _STRING}, []),
+    )
+    async def create_from_template(app_id: str, request: Request) -> Response:
+        """Make a gadget the caller owns from one they can use as a template, from
+        ``{"name"?}``: its published code and starter data. Answers the new gadget with 201."""
+        _require_template_sharing(request)
+        body = await _body(request)
+        result = await run(request, lambda service: service.create_from_template(app_id, body))
         return _json(result, 201)
 
     @router.get("/gadgets/{app_id}/session/status")

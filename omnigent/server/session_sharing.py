@@ -34,7 +34,12 @@ SCHEDULED_TASK_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 WORKFLOW_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 
 # Levels a gadget may grant: Can view, Can edit (records and versions) and Can manage.
-GADGET_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE})
+# "Can use as template": create one's own gadget from its published code, without opening it.
+# Below Can view, so a grant at any other level (or a group's) gives more.
+LEVEL_GADGET_TEMPLATE = 0
+GADGET_GRANT_LEVELS: frozenset[int] = frozenset(
+    {LEVEL_GADGET_TEMPLATE, LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE}
+)
 
 
 def is_reserved_grantee(user_id: str) -> bool:
