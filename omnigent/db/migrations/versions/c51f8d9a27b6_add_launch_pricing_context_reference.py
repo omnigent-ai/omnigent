@@ -33,6 +33,9 @@ def upgrade() -> None:
         )
         if existing is not None:
             expected_type = Uuid16().compile(dialect=connection.dialect)
+            if connection.dialect.name == "cockroachdb" and isinstance(existing["type"], sa.BLOB):
+                # CockroachDB reflects its BYTEA/BYTES aliases as BLOB.
+                expected_type = sa.BLOB().compile(dialect=connection.dialect)
             if (
                 existing["type"].compile(dialect=connection.dialect) != expected_type
                 or existing["nullable"] is not True

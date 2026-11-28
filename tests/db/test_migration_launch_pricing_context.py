@@ -5,13 +5,16 @@ from __future__ import annotations
 import io
 import json
 from collections.abc import Callable
+from importlib import import_module
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from sqlalchemy.dialects import sqlite
 from sqlalchemy.orm import Session
 
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
@@ -59,6 +62,38 @@ def test_launch_pricing_reference_ddl_is_additive(uri: str, column_type: str) ->
     assert "DROP " not in sql
     assert f"UPDATE {_TABLE}" not in sql
     assert "CREATE INDEX" not in sql
+
+
+def test_existing_pricing_reference_default_is_rejected_before_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = import_module(
+        "omnigent.db.migrations.versions.c51f8d9a27b6_add_launch_pricing_context_reference"
+    )
+    connection = SimpleNamespace(dialect=sqlite.dialect())
+    reflected = {
+        "name": _COLUMN,
+        "type": sa.LargeBinary(16),
+        "nullable": True,
+        "default": "'unexpected'",
+    }
+    original = dict(reflected)
+    mutations: list[str] = []
+
+    def inspect_existing(bind):
+        assert bind is connection
+        return SimpleNamespace(get_columns=lambda _table: [reflected])
+
+    monkeypatch.setattr(migration.context, "is_offline_mode", lambda: False)
+    monkeypatch.setattr(migration.op, "get_bind", lambda: connection)
+    monkeypatch.setattr(migration.sa, "inspect", inspect_existing)
+    monkeypatch.setattr(migration.op, "add_column", lambda *_args: mutations.append("add"))
+
+    with pytest.raises(RuntimeError, match="column has an incompatible schema"):
+        migration.upgrade()
+
+    assert not mutations
+    assert reflected == original
 
 
 def test_metadata_bootstrap_can_downgrade_the_reserved_reference(tmp_path: Path) -> None:
@@ -274,7 +309,7 @@ def test_startup_preserves_an_incompatible_existing_pricing_reference(
 ) -> None:
     engine = get_or_create_engine(db_uri)
     head = _get_head_db_revision(db_uri)
-    _migrate(db_uri, engine, "downgrade", _REVISION)
+    _migrate(db_uri, engine, "downgrade", _PREVIOUS)
     value = 17 if incompatible == "wrong-type" else _SESSION_ID
     statements: list[str] = []
 
@@ -282,19 +317,20 @@ def test_startup_preserves_an_incompatible_existing_pricing_reference(
         statements.append(statement)
 
     try:
+        assert _get_current_db_revision(engine) == _PREVIOUS
+        assert _COLUMN not in {column["name"] for column in sa.inspect(engine).get_columns(_TABLE)}
         with engine.connect() as connection:
             if engine.dialect.name == "cockroachdb":
                 _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
             operation = Operations(MigrationContext.configure(connection))
-            with operation.batch_alter_table(_TABLE) as batch:
-                batch.alter_column(
+            operation.add_column(
+                _TABLE,
+                sa.Column(
                     _COLUMN,
-                    existing_type=Uuid16(),
-                    existing_nullable=True,
-                    type_=sa.Integer() if incompatible == "wrong-type" else Uuid16(),
+                    sa.Integer() if incompatible == "wrong-type" else Uuid16(),
                     nullable=incompatible != "not-null",
-                    postgresql_using="NULL",
-                )
+                ),
+            )
             connection.commit()
         column = next(
             column
@@ -304,7 +340,6 @@ def test_startup_preserves_an_incompatible_existing_pricing_reference(
         assert column["nullable"] is (incompatible != "not-null")
         if incompatible == "wrong-type":
             assert isinstance(column["type"], sa.Integer)
-        _migrate(db_uri, engine, "stamp", _PREVIOUS)
         assert _get_current_db_revision(engine) == _PREVIOUS
         with engine.begin() as connection:
             connection.execute(
