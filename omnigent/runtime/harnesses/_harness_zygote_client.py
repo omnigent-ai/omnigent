@@ -34,6 +34,8 @@ import signal
 import socket
 from typing import Any
 
+import psutil
+
 from omnigent.inner import _proc
 from omnigent.runner._zygote import ZYGOTE_HARNESS_FD_ENV_VAR
 
@@ -71,6 +73,11 @@ class ZygoteHarnessProc:
         # close_subprocess_transport(proc) getattrs this; None is handled there.
         self._transport = None
         self._client = client
+        try:
+            self._process: psutil.Process | None = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            self._process = None
+        _proc.remember_process_group(self)
         # Keep returncode fresh for the manager's synchronous reads (e.g. the
         # _wait_for_bind loop, which never awaits wait()).
         self._poll_task: asyncio.Task[None] | None = asyncio.ensure_future(self._poll_loop())
@@ -86,6 +93,10 @@ class ZygoteHarnessProc:
                 # it is gone, record a non-zero sentinel so a crashed / never-
                 # bound harness reads as a failure rather than a clean exit; if
                 # it is somehow still alive, keep polling.
+                process = self._process
+                if process is None or not await asyncio.to_thread(process.is_running):
+                    self.returncode = _ZYGOTE_LOST_EXIT_CODE
+                    return
                 if not await asyncio.to_thread(_proc.process_alive, self.pid):
                     self.returncode = _ZYGOTE_LOST_EXIT_CODE
                     return
@@ -114,8 +125,12 @@ class ZygoteHarnessProc:
 
         :param sig: POSIX signal number.
         """
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(self.pid, sig)
+        process = self._process
+        if self.returncode is not None or process is None:
+            return
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            if process.is_running():
+                process.send_signal(sig)
 
     def terminate(self) -> None:
         """Send ``SIGTERM`` to the harness (best-effort)."""

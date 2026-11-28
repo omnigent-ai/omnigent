@@ -14,7 +14,9 @@ import asyncio
 import os
 import signal
 import socket
+from unittest.mock import AsyncMock, Mock
 
+import psutil
 import pytest
 
 from omnigent.host.runner_zygote import ZygoteManager
@@ -23,6 +25,7 @@ from omnigent.runner._zygote import (
     ZYGOTE_HARNESS_FD_ENV_VAR,
 )
 from omnigent.runtime.harnesses._harness_zygote_client import (
+    _ZYGOTE_LOST_EXIT_CODE,
     HarnessZygoteClient,
     ZygoteHarnessProc,
     ZygoteHarnessUnavailable,
@@ -86,6 +89,51 @@ async def test_from_env_absent_returns_none(monkeypatch) -> None:
     """
     monkeypatch.delenv(ZYGOTE_HARNESS_FD_ENV_VAR, raising=False)
     assert HarnessZygoteClient.from_env() is None
+
+
+@pytest.mark.parametrize("gone_before_capture", [False, True])
+async def test_lost_harness_identity_never_follows_a_reused_pid(
+    monkeypatch: pytest.MonkeyPatch, gone_before_capture: bool
+) -> None:
+    original = Mock()
+    original.is_running.return_value = False
+    factory = Mock(return_value=original)
+    if gone_before_capture:
+        factory.side_effect = psutil.NoSuchProcess(123456)
+    monkeypatch.setattr("psutil.Process", factory)
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._harness_zygote_client._proc.process_alive", lambda _pid: True
+    )
+    signals = Mock()
+    monkeypatch.setattr(os, "kill", signals)
+    client = Mock(spec=HarnessZygoteClient)
+    client.poll = AsyncMock(side_effect=ZygoteHarnessUnavailable("lost channel"))
+    proc = ZygoteHarnessProc(123456, client)
+    factory.side_effect = AssertionError("must not capture the replacement PID")
+    try:
+        proc.terminate()
+        proc.kill()
+        signals.assert_not_called()
+        assert await asyncio.wait_for(proc.wait(), timeout=0.5) == _ZYGOTE_LOST_EXIT_CODE
+        original.send_signal.assert_not_called()
+    finally:
+        assert proc._poll_task is not None
+        proc._poll_task.cancel()
+        await asyncio.gather(proc._poll_task, return_exceptions=True)
+
+
+async def test_cached_harness_exit_never_signals_its_old_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Mock(spec=HarnessZygoteClient)
+    client.poll = AsyncMock(return_value=7)
+    proc = ZygoteHarnessProc(os.getpid(), client)
+    signals = Mock()
+    monkeypatch.setattr(os, "kill", signals)
+    assert await proc.wait() == 7
+    proc.terminate()
+    proc.kill()
+    signals.assert_not_called()
 
 
 async def test_fork_harness_runs_and_reports_exit(zygote: ZygoteManager, tmp_path) -> None:
