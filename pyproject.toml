@@ -184,9 +184,9 @@ modal = ["modal>=1.0,<2"]
 # server-managed `sandbox.provider: daytona`).
 # Same lazy-import posture as the modal extra. Pre-1.0 SDK: pin minor.
 daytona = ["daytona>=0.180,<1"]
-# Blaxel sandbox launcher (`omnigent sandbox --provider blaxel` and
-# server-managed `sandbox.provider: blaxel`).
-blaxel = ["blaxel>=0.4.1,<0.5"]
+# Baseten Sandboxes launcher (`omnigent sandbox --provider baseten` and
+# server-managed `sandbox.provider: baseten`). Pre-1.0 SDK: pin minor.
+baseten = ["baseten>=0.14.0,<0.15"]
 # Boxlite sandbox launcher: server-managed `sandbox.provider: boxlite`, either
 # local embedded micro-VMs (KVM/HVF, no daemon) or a remote `boxlite serve`
 # pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
@@ -368,6 +368,7 @@ test = [
     # and execute the real packages against mocks.
     "hindsight-client>=0.4.0",
     "nimble-python>=1.2.0,<2",
+    "baseten>=0.14.0,<0.15",
     "connectrpc>=0.13,<0.14",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",

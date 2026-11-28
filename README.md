@@ -44,7 +44,7 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
-  [Blaxel](https://blaxel.ai),
+  [Baseten](https://www.baseten.co/),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [Gensee](https://gensee.ai),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
@@ -90,7 +90,7 @@ with `--no-databricks --extra antigravity`.
 Available user-facing extras include:
 
 - **Model providers:** `databricks` (included by default), `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `microsandbox`,
+- **Sandbox providers:** `modal`, `daytona`, `baseten`, `boxlite`, `microsandbox`,
   `cwsandbox`, `e2b`, `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`

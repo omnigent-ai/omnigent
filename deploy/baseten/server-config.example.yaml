@@ -1,13 +1,14 @@
 sandbox:
-  provider: blaxel
+  provider: baseten
   server_url: https://omnigent.example.com
-  blaxel:
-    # Optional override for a fixed published tag.
-    # Defaults to the public blaxel/omnigent-host:latest image.
-    # image: blaxel/omnigent-host:TAG
+  baseten:
+    # Optional Baseten image to boot instead of the default, which builds
+    # ghcr.io/omnigent-ai/omnigent-host into the team on first use.
+    # image: my-omnigent-host:latest
     env:
       - OPENAI_API_KEY
-    # region: us-was-1
+    # region: us-pdx-1
+    # Memory also sets the CPU allocation.
     # memory_mb: 4096
     # Maximum sandbox age, and the bound the launch-token lifetime is
     # derived from (ttl + 1h). Raise it for managed sessions that must

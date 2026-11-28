@@ -660,27 +660,27 @@ async def test_pending_id_equal_to_active_id_is_not_terminated() -> None:
         {
             7: [
                 _host(
-                    "host_blaxel",
-                    provider="blaxel",
-                    sandbox_id="managed-host_blaxel",
-                    terminating_sandbox_id="managed-host_blaxel",
+                    "host_baseten",
+                    provider="baseten",
+                    sandbox_id="managed-host_baseten",
+                    terminating_sandbox_id="managed-host_baseten",
                     updated_at=now,
                     status="online",
                 )
             ]
         }
     )
-    blaxel = _RecordingLauncher("blaxel")
+    baseten = _RecordingLauncher("baseten")
     reaper = ManagedSandboxReaper(
         host_store=hosts,  # type: ignore[arg-type]
-        sandbox_config=_deployment([blaxel]),
+        sandbox_config=_deployment([baseten]),
     )
 
     assert await reaper.sweep_once(now=now) == 0
-    assert blaxel.terminated == []
-    current = hosts.hosts[7]["host_blaxel"]
-    assert current.sandbox_id == "managed-host_blaxel"
-    assert current.terminating_sandbox_id == "managed-host_blaxel"
+    assert baseten.terminated == []
+    current = hosts.hosts[7]["host_baseten"]
+    assert current.sandbox_id == "managed-host_baseten"
+    assert current.terminating_sandbox_id == "managed-host_baseten"
 
 
 async def test_identity_and_termination_run_off_event_loop_thread() -> None:

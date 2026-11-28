@@ -2136,7 +2136,7 @@ def test_pending_cleanup_rejects_reused_active_sandbox_id(db_uri: str) -> None:
         name="managed-reused-id",
         user_id="alice@example.com",
         token="old-generation-token",
-        provider="blaxel",
+        provider="baseten",
         sandbox_id="managed-reused-id",
         token_expires_at=now_epoch() + 3600,
     )
@@ -2151,7 +2151,7 @@ def test_pending_cleanup_rejects_reused_active_sandbox_id(db_uri: str) -> None:
             host_id=host_id,
             user_id="alice@example.com",
             token="new-generation-token",
-            provider="blaxel",
+            provider="baseten",
             sandbox_id="managed-reused-id",
             token_expires_at=now_epoch() + 3600,
         )
