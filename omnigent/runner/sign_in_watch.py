@@ -95,23 +95,39 @@ def build_sign_in_watch(
                 registry = resource_registry.terminal_registry
                 entries = registry.list_for_conversation(conv_id) if registry is not None else []
                 screens: list[str] = []
+                observed_panes = []
+                unreadable = False
                 for entry in entries:
                     if entry.terminal_name not in pane_names or not entry.instance.running:
                         continue
+                    observed_panes.append(entry)
                     try:
                         result = await entry.instance.read(join_wrapped=True)
-                    except Exception:  # A failed read must still release the hold.
+                    except Exception:
                         _logger.debug(
                             "Failed to read the sign-in pane for %s", conv_id, exc_info=True
                         )
                         result = None
                     screen = result.get("screen") if isinstance(result, dict) else None
-                    screens.append(screen if isinstance(screen, str) else "")
+                    if isinstance(screen, str) and screen.strip():
+                        screens.append(screen)
+                    else:
+                        unreadable = True
+                if unreadable:
+                    continue
                 if not screens:
                     return
                 if any(detect_sign_in_prompt(screen) is not None for screen in screens):
                     continue
                 if _sign_in_agent_ready(conv_id, harness, screens):
+                    # A read of a replaced pane cannot establish its successor's readiness.
+                    if registry is None or any(
+                        registry.get(conv_id, entry.terminal_name, entry.session_key)
+                        is not entry.instance
+                        or not entry.instance.running
+                        for entry in observed_panes
+                    ):
+                        continue
                     # Post before the release on exit, so the notice lands before the resend
                     # and a resend refused again can rewatch.
                     await _post_sign_in_completed_notice(
