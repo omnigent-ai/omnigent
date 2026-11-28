@@ -717,9 +717,13 @@ class _AdvertisementProbeHarnessClient(_ScriptedHarnessClient):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "advertisement_state", ["missing", "undecodable", "undecodable-with-prompt"]
+)
 async def test_turn_readvertises_live_pane_before_forwarding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    advertisement_state: str,
 ) -> None:
     """Restore a live pane's missing advertisement before forwarding, without recreating it."""
     conv_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
@@ -734,8 +738,16 @@ async def test_turn_readvertises_live_pane_before_forwarding(
     )
     auto_create_calls.clear()
     live = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
-    # The fault: the pane is alive but nothing advertises its tmux target.
-    (bridge_dir / _TMUX_FILE).unlink()
+    if advertisement_state == "missing":
+        (bridge_dir / _TMUX_FILE).unlink()
+    else:
+        (bridge_dir / _TMUX_FILE).write_bytes(b"\xff")
+    prompt = {"open": advertisement_state == "undecodable-with-prompt"}
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_args: "Do you want to proceed?\n❯ 1. Yes\n  2. No" if prompt["open"] else "",
+    )
 
     async with _runner_client(app) as client:
         resp = await client.post(
@@ -749,6 +761,11 @@ async def test_turn_readvertises_live_pane_before_forwarding(
             },
         )
         assert resp.status_code == 202, resp.text
+        if prompt["open"]:
+            assert resp.json()["status"] == "buffered"
+            assert not harness_client.forwarded.is_set()
+            assert len(app.state.session_message_buffers[conv_id]) == 1
+            prompt["open"] = False
         await asyncio.wait_for(harness_client.forwarded.wait(), timeout=10.0)
 
     assert auto_create_calls == [], "a live pane must be re-advertised in place, not recreated"
