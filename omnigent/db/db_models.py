@@ -711,7 +711,7 @@ class SqlMemory(OmnigentBase):
 
     :param workspace_id: Tenant scope; stamped from :func:`current_workspace_id`.
     :param actor_type: Kind of owner, as a ``MEMORY_ACTOR_TYPE`` code (``1`` for
-        a user).
+        a user, ``2`` for a project).
     :param actor_id: The owner's id within its type, e.g. ``"alice"``.
     :param path: Absolute entry path, e.g. ``"/projects/api/gotchas"``, compared
         byte for byte.
@@ -740,8 +740,8 @@ class SqlMemory(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     __table_args__ = (
-        # MEMORY_ACTOR_TYPE codes: user.
-        CheckConstraint("actor_type IN (1)", name="ck_memories_actor_type"),
+        # MEMORY_ACTOR_TYPE codes: user, project.
+        CheckConstraint("actor_type IN (1, 2)", name="ck_memories_owner_type"),
         # SQLite ignores declared lengths and types, so bound every column there:
         # strings at up to four bytes per character, envelopes at their stored size.
         CheckConstraint(

@@ -132,7 +132,7 @@ def test_shipped_codes_are_stable() -> None:
     }
     assert ec.SCHEDULED_TASK_SESSION_MODE == {"new": 1, "continue": 2}
     assert ec.INBOX_ITEM_STATUS == {"unread": 1, "read": 2, "done": 3, "dismissed": 4}
-    assert ec.MEMORY_ACTOR_TYPE == {"user": 1}
+    assert ec.MEMORY_ACTOR_TYPE == {"user": 1, "project": 2}
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,
         "running": 2,

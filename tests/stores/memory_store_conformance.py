@@ -85,6 +85,17 @@ class MemoryStoreConformance:
         assert loaded is not None
         assert loaded.content == "alice secret"
 
+    def test_a_project_and_a_user_with_the_same_id_are_isolated(self, store: MemoryStore) -> None:
+        project = MemoryActor("project", "alice")
+        store.write(project, "/project/stack", "project fact")
+
+        assert store.get(ALICE, "/project/stack") is None
+        assert store.list(ALICE).entries == []
+        loaded = store.get(project, "/project/stack")
+        assert loaded is not None
+        assert (loaded.actor, loaded.content) == (project, "project fact")
+        assert [entry.path for entry in store.list(project).entries] == ["/project/stack"]
+
     def test_workspaces_are_isolated(self, store: MemoryStore) -> None:
         with workspace_scope(1):
             store.write(ALICE, "/p", "workspace one")

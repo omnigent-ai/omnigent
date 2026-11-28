@@ -24,6 +24,8 @@ from omnigent.db.utils import _build_alembic_config, get_or_create_engine
 
 _REVISION = "ffeec66eadb5"
 _PREVIOUS = "f7c2d8a4b901"
+# The latest revision that changes the table, which the model must match.
+_LATEST = "c5e2a8f4d1b7"
 _MEMORIES = SqlMemory.__table__
 _USER = MEMORY_ACTOR_TYPE["user"]
 
@@ -47,6 +49,12 @@ def _migrate(engine: sa.Engine, revision: str, *, down: bool = False) -> None:
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         (command.downgrade if down else command.upgrade)(config, revision)
+
+
+def _migrate_past_autocommit(engine: sa.Engine, revision: str, *, down: bool = False) -> None:
+    """Migrate through revisions that open their own autocommit blocks."""
+    config = _build_alembic_config(str(engine.url))
+    (command.downgrade if down else command.upgrade)(config, revision)
 
 
 def _shape(engine: sa.Engine) -> tuple[object, ...]:
@@ -137,7 +145,7 @@ def test_a_metadata_bootstrapped_table_matches_the_migration(tmp_path: Path) -> 
     migrated = sa.create_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     bootstrapped = sa.create_engine(f"sqlite:///{tmp_path / 'bootstrapped.db'}")
     try:
-        _migrate(migrated, _REVISION)
+        _migrate_past_autocommit(migrated, _LATEST)
         _MEMORIES.create(bootstrapped)
 
         assert _shape(bootstrapped) == _shape(migrated)
@@ -165,7 +173,7 @@ def test_columns_declare_their_bounds_and_byte_order_per_engine() -> None:
     # SQLite-only bounds stay off the others.
     actor_types = ", ".join(str(code) for code in sorted(MEMORY_ACTOR_TYPE.values()))
     for ddl in (mysql_ddl, postgresql_ddl):
-        assert f"CONSTRAINT ck_memories_actor_type CHECK (actor_type IN ({actor_types}))" in ddl
+        assert f"CONSTRAINT ck_memories_owner_type CHECK (actor_type IN ({actor_types}))" in ddl
         assert ddl.count("CHECK") == 1
 
 
@@ -254,9 +262,34 @@ def test_an_unknown_actor_type_is_rejected_on_this_engine(db_uri: str) -> None:
     unknown = max(MEMORY_ACTOR_TYPE.values()) + 1
     # Drivers differ in the error class for a CHECK violation. CockroachDB names the
     # expression instead of the constraint.
-    violation = r"ck_memories_actor_type|CHECK constraint \(actor_type IN"
+    violation = r"ck_memories_owner_type|CHECK constraint \(actor_type IN"
     with pytest.raises((IntegrityError, OperationalError), match=violation):
         with engine.begin() as connection:
             connection.execute(_MEMORIES.insert().values(**_row("/a", actor_type=unknown)))
     with engine.begin() as connection:
         connection.execute(_MEMORIES.insert().values(**_row("/a")))
+
+
+def test_project_owners_upgrade_and_downgrade(tmp_path: Path) -> None:
+    """c5e2a8f4d1b7 admits project owners; downgrade refuses while one owns memory."""
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'owners.db'}")
+    project = {**_row("/project/stack"), "actor_type": MEMORY_ACTOR_TYPE["project"]}
+    try:
+        _migrate(engine, _REVISION)
+        with pytest.raises(IntegrityError), engine.begin() as connection:
+            connection.execute(_MEMORIES.insert().values(**project))
+
+        _migrate_past_autocommit(engine, _LATEST)
+        with engine.begin() as connection:
+            connection.execute(_MEMORIES.insert().values(**project))
+        _assert_sqlite_rejects_out_of_bound_values(engine)
+        with pytest.raises(RuntimeError, match="Delete project memory"):
+            _migrate_past_autocommit(engine, "e3b7d1f5a9c2", down=True)
+
+        with engine.begin() as connection:
+            connection.execute(_MEMORIES.delete())
+        _migrate_past_autocommit(engine, "e3b7d1f5a9c2", down=True)
+        with pytest.raises(IntegrityError), engine.begin() as connection:
+            connection.execute(_MEMORIES.insert().values(**project))
+    finally:
+        engine.dispose()

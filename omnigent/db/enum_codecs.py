@@ -161,6 +161,7 @@ INBOX_ITEM_STATUS: dict[str, int] = {
 # new type also needs a migration.
 MEMORY_ACTOR_TYPE: dict[str, int] = {
     "user": 1,
+    "project": 2,
 }
 
 

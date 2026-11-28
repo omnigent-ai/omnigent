@@ -15,8 +15,9 @@ The contract is deliberately the common subset of what backends can do:
   ranked, without pagination;
 * there are no versions or etags; a write replaces the entry at its path.
 
-The :class:`MemoryActor` is whose memory it is. Callers derive it from the
-authenticated user. It is never accepted from an agent or a request body.
+The :class:`MemoryActor` is whose memory it is: a user, or a project. Callers
+derive it from the authenticated user or the calling session's project. It is
+never accepted from an agent or a request body.
 """
 
 from __future__ import annotations
@@ -28,11 +29,12 @@ from dataclasses import dataclass
 from omnigent.errors import ErrorCode, OmnigentError
 
 # An owner's id within its type: for a user, up to the 128 characters other
-# tables store for a user id.
+# tables store for a user id; for a project, its 32-character id.
 MAX_ACTOR_ID_LENGTH = 128
 ACTOR_TYPE_USER = "user"
+ACTOR_TYPE_PROJECT = "project"
 # Kinds of memory owner. A backend must keep owners of different types apart.
-ACTOR_TYPES: frozenset[str] = frozenset({ACTOR_TYPE_USER})
+ACTOR_TYPES: frozenset[str] = frozenset({ACTOR_TYPE_USER, ACTOR_TYPE_PROJECT})
 MAX_PATH_LENGTH = 512
 MAX_DESCRIPTION_LENGTH = 512
 # UTF-8 bytes before compression. Leaves headroom for zstd framing under the
@@ -51,8 +53,9 @@ class MemoryActor:
     """
     Whose memory it is.
 
-    :param type: Kind of owner, one of :data:`ACTOR_TYPES`, e.g. ``"user"``.
-    :param id: The owner's id within its type, e.g. ``"alice"``.
+    :param type: Kind of owner, one of :data:`ACTOR_TYPES`, e.g. ``"user"`` or
+        ``"project"``.
+    :param id: The owner's id within its type, e.g. ``"alice"`` or a project id.
     """
 
     type: str
