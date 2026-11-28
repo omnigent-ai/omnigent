@@ -5,9 +5,10 @@ event schema (turn.prompt + content.part + usage.record + llm.request,
 including the sanitized real-session fixtures under
 ``tests/fixtures/kimi_wire``), the byte-offset state round-trip, strict
 launch-epoch session discovery, the usage/model mirroring sync, and the
-forward loop's lifecycle edges (``turn.ended`` records, pane death,
-quiescence with in-flight tool suppression, transient-vs-poison POST
-rejections, edge dedupe across restarts) with the POST helpers stubbed out.
+forward loop's lifecycle edges (explicit ``turn.ended`` outcomes, pane death,
+the hung-tool ceiling, transient-vs-poison POST rejections, edge dedupe across
+restarts) with the POST helpers stubbed out, and the real POST bodies of
+mirrored tool calls and turn outcomes.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -41,6 +43,7 @@ from omnigent.harnesses.kimi_native.forwarder import (
     read_kimi_wire_items,
     read_new_kimi_wire_items,
 )
+from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES, cap_tool_output
 from tests.budgets import budget
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "kimi_wire"
@@ -49,6 +52,39 @@ _FIXTURES = Path(__file__).parent / "fixtures" / "kimi_wire"
 _ABSENT = object()
 
 _SEG_TOKEN_KEYS = ("input_other", "output", "cache_read", "cache_creation")
+
+_TOOL_HUNG_DETAIL = (
+    "Kimi wrote nothing to its session log for 30 minutes while a tool was running."
+)
+
+
+def _loop_event(**event: object) -> dict[str, object]:
+    """A ``context.append_loop_event`` row; ``_ABSENT`` values are left out."""
+    return {
+        "type": "context.append_loop_event",
+        "event": {key: value for key, value in event.items() if value is not _ABSENT},
+    }
+
+
+def _tool_call_row(
+    uuid: object = "t1",
+    *,
+    call_id: object = _ABSENT,
+    name: object = "Bash",
+    args: object = _ABSENT,
+) -> dict[str, object]:
+    """A ``tool.call`` row; without *call_id* it is counted but never posted."""
+    return _loop_event(
+        type="tool.call", uuid=uuid, turnId="0", toolCallId=call_id, name=name, args=args
+    )
+
+
+def _tool_result_row(
+    parent_uuid: object = "t1", *, call_id: object = _ABSENT, result: object = _ABSENT
+) -> dict[str, object]:
+    return _loop_event(
+        type="tool.result", parentUuid=parent_uuid, toolCallId=call_id, result=result
+    )
 
 
 def _segment(
@@ -140,20 +176,58 @@ class TestRowToItem:
         ):
             assert _row_to_item(0, row) is None
 
-    def test_tool_call_and_result_are_bookkeeping_items(self) -> None:
-        """Tool events are never posted but tracked for the quiescence gate."""
-        call = {
-            "type": "context.append_loop_event",
-            "event": {"type": "tool.call", "uuid": "t1", "name": "Read"},
-        }
-        result = {
-            "type": "context.append_loop_event",
-            "event": {"type": "tool.result", "parentUuid": "t1"},
-        }
+    def test_tool_call_and_result_share_response_and_call_ids(self) -> None:
+        call = _tool_call_row("t1", call_id="c1", args={"path": "a.txt", "note": "é"})
+        result = _tool_result_row("t1", call_id="c1", result={"output": "contents"})
         call_item = _row_to_item(7, call)
         result_item = _row_to_item(8, result)
-        assert call_item is not None and call_item.kind == "tool_call"
-        assert result_item is not None and result_item.kind == "tool_result"
+        assert call_item is not None and result_item is not None
+        assert (call_item.kind, call_item.response_id, call_item.call_id) == (
+            "tool_call",
+            "kimi:t1",
+            "c1",
+        )
+        assert call_item.tool_name == "Bash"
+        assert call_item.text == '{"path": "a.txt", "note": "é"}'
+        assert (result_item.kind, result_item.response_id, result_item.call_id) == (
+            "tool_result",
+            "kimi:t1",
+            "c1",
+        )
+        assert result_item.text == "contents"
+
+    @pytest.mark.parametrize(
+        ("result", "output"),
+        [
+            ({"output": "boom", "isError": True}, "Error: boom"),
+            ({"output": "fine", "isError": False}, "fine"),
+            ({"output": {"lines": [1, 2]}}, '{"lines": [1, 2]}'),
+            ({"output": ["ü"], "isError": True}, 'Error: ["ü"]'),
+            ({"note": "model-facing only"}, ""),
+            (_ABSENT, ""),
+        ],
+    )
+    def test_tool_result_output_encoding(self, result: object, output: str) -> None:
+        item = _row_to_item(8, _tool_result_row("t1", call_id="c1", result=result))
+        assert item is not None
+        # Still a postable result even when it carries no output.
+        assert (item.call_id, item.text) == ("c1", output)
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            _tool_call_row(_ABSENT, call_id="c1"),
+            _tool_call_row("t1", call_id=_ABSENT),
+            _tool_call_row("t1", call_id="c1", name=_ABSENT),
+            _tool_result_row(_ABSENT, call_id="c1", result={"output": "x"}),
+            _tool_result_row("t1", call_id="", result={"output": "x"}),
+        ],
+    )
+    def test_tool_rows_without_identity_are_bookkeeping_only(self, row: dict) -> None:
+        item = _row_to_item(7, row)
+        assert item is not None
+        assert item.kind in ("tool_call", "tool_result")
+        assert item.call_id is None
 
     def test_step_end_never_drives_a_turn_edge(self) -> None:
         """Edges come from turn.ended: failed/cancelled turns write no step.end."""
@@ -169,6 +243,7 @@ class TestRowToItem:
         item = _row_to_item(31, row)
         assert item is not None
         assert item.kind == "turn_end"
+        assert item.outcome == "completed"
         assert item.response_id == "kimi:turn_end:31"
 
     def test_turn_ended_cancelled_is_turn_end(self) -> None:
@@ -176,24 +251,52 @@ class TestRowToItem:
         item = _row_to_item(10, row)
         assert item is not None
         assert item.kind == "turn_end"
+        assert item.outcome == "cancelled"
 
-    def test_turn_ended_failed_is_turn_failed_with_error_message(self) -> None:
-        row = {
-            "type": "turn.ended",
-            "turnId": 0,
-            "reason": "failed",
-            "error": {"code": "provider.auth_error", "message": "401 Invalid Token"},
-        }
+    @pytest.mark.parametrize(
+        ("error", "detail"),
+        [
+            (
+                {"code": "provider.auth_error", "message": "401 Invalid Token"},
+                "provider.auth_error: 401 Invalid Token",
+            ),
+            ({"message": "401 Invalid Token"}, "401 Invalid Token"),
+            ({"code": "provider.auth_error"}, "provider.auth_error"),
+            (_ABSENT, None),
+        ],
+    )
+    def test_turn_ended_failed_is_turn_failed_with_error_detail(
+        self, error: object, detail: str | None
+    ) -> None:
+        row: dict[str, object] = {"type": "turn.ended", "turnId": 0, "reason": "failed"}
+        if error is not _ABSENT:
+            row["error"] = error
         item = _row_to_item(9, row)
         assert item is not None
-        assert item.kind == "turn_failed"
-        assert item.text == "401 Invalid Token"
+        assert (item.kind, item.outcome, item.failure_detail) == ("turn_failed", "failed", detail)
+        message = error.get("message", "") if isinstance(error, dict) else ""
+        assert item.text == message
         assert item.response_id == "kimi:turn_failed:9"
 
-    def test_turn_ended_unknown_reason_keeps_turn_open(self) -> None:
-        """Unknown vocabulary never fails open to 'failed'; the fallbacks close it."""
-        row = {"type": "turn.ended", "turnId": 0, "reason": "paused"}
-        assert _row_to_item(9, row) is None
+    @pytest.mark.parametrize(
+        ("error", "detail"),
+        [
+            (_ABSENT, "Kimi turn ended with reason 'blocked'"),
+            (
+                {"code": "policy.blocked", "message": "not allowed"},
+                "Kimi turn ended with reason 'blocked': policy.blocked: not allowed",
+            ),
+        ],
+    )
+    def test_turn_ended_unknown_reason_is_failed_with_reason(
+        self, error: object, detail: str
+    ) -> None:
+        row: dict[str, object] = {"type": "turn.ended", "turnId": 0, "reason": "blocked"}
+        if error is not _ABSENT:
+            row["error"] = error
+        item = _row_to_item(9, row)
+        assert item is not None
+        assert (item.kind, item.outcome, item.failure_detail) == ("turn_failed", "failed", detail)
 
     def test_non_user_turn_prompt_skipped(self) -> None:
         row = {
@@ -317,9 +420,28 @@ class TestRealWireFixtures:
         items = read_kimi_wire_items(_FIXTURES / "completed.jsonl", 0)
         kinds = [i.kind for i in items]
         assert kinds[-1] == "turn_end"
+        assert items[-1].outcome == "completed"
         assert kinds.count("turn_end") == 1
         assert "turn_failed" not in kinds
         assert kinds.count("tool_call") == kinds.count("tool_result") == 3
+
+    def test_completed_turn_tool_pairs(self) -> None:
+        """Results pair to their calls; the error result is marked, note dropped."""
+        items = read_kimi_wire_items(_FIXTURES / "completed.jsonl", 0)
+        calls = {i.call_id: i for i in items if i.kind == "tool_call"}
+        results = [i for i in items if i.kind == "tool_result"]
+        assert [(c.tool_name, c.text) for c in calls.values()] == [
+            ("Grep", '{"pattern": "example", "path": "src"}'),
+            ("Grep", '{"pattern": "sample"}'),
+            ("Read", '{"path": "src/example.py"}'),
+        ]
+        assert [(r.call_id, r.text) for r in results] == [
+            ("call_grep_1", "src/example.py:1: example"),
+            ("call_grep_2", "Error: No matches found."),
+            ("call_read_1", "1\tprint('example')"),
+        ]
+        for result in results:
+            assert result.response_id == calls[result.call_id].response_id
 
     def test_failed_turn_emits_failed_edge_without_any_step_end(self) -> None:
         items = read_kimi_wire_items(_FIXTURES / "failed.jsonl", 0)
@@ -329,12 +451,17 @@ class TestRealWireFixtures:
         assert items[0].role == "user"
         assert items[-1].text == "401 Invalid Token"
 
-    def test_cancelled_turns_each_emit_an_idle_edge(self) -> None:
+    def test_cancelled_turns_each_emit_a_cancelled_edge(self) -> None:
         items = read_kimi_wire_items(_FIXTURES / "cancelled.jsonl", 0)
-        kinds = [i.kind for i in items]
-        assert kinds.count("turn_end") == 2
-        assert "turn_failed" not in kinds
+        assert [i.outcome for i in items if i.kind == "turn_end"] == ["cancelled", "cancelled"]
+        assert "turn_failed" not in [i.kind for i in items]
         assert sum(1 for i in items if i.kind == "message" and i.role == "user") == 2
+
+    def test_cancelled_mid_tool_leaves_an_orphan_call_and_a_cancelled_edge(self) -> None:
+        items = read_kimi_wire_items(_FIXTURES / "cancelled_mid_tool.jsonl", 0)
+        assert [i.kind for i in items] == ["message", "model", "message", "tool_call", "turn_end"]
+        assert items[3].call_id == "call_shell_1"
+        assert items[-1].outcome == "cancelled"
 
 
 class TestReadNewItems:
@@ -417,9 +544,20 @@ class TestState:
         )
         assert _read_state(tmp_path) is None
 
-    def test_lifecycle_fields_default_when_absent(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            {},
+            {"dropped_edge_status": ["failed"]},
+            {"dropped_edge_status": {"x": 1}},
+            {"dropped_edge_failure_detail": ["boom"]},
+        ],
+    )
+    def test_lifecycle_fields_default_when_absent_or_malformed(
+        self, tmp_path: Path, malformed: dict[str, object]
+    ) -> None:
         (tmp_path / "kimi_forwarder.json").write_text(
-            json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 3, "offset": 10}),
+            json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 3, "offset": 10, **malformed}),
             encoding="utf-8",
         )
         loaded = _read_state(tmp_path)
@@ -427,6 +565,8 @@ class TestState:
         assert loaded.turn_open is False
         assert loaded.tools_in_flight == 0
         assert loaded.last_edge_id is None
+        assert loaded.dropped_edge_status is None
+        assert loaded.dropped_edge_failure_detail is None
         assert loaded.last_assistant_text == ""
 
     def test_last_assistant_text_round_trips(self, tmp_path: Path) -> None:
@@ -1876,13 +2016,6 @@ def _assistant_row(uuid: str, text: str) -> dict[str, object]:
     }
 
 
-def _tool_call_row(uuid: str = "t1") -> dict[str, object]:
-    return {
-        "type": "context.append_loop_event",
-        "event": {"type": "tool.call", "uuid": uuid, "turnId": "0", "name": "Bash"},
-    }
-
-
 def _turn_ended_row(
     reason: str, *, error_message: str | None = None, time_ms: int | None = None
 ) -> dict[str, object]:
@@ -1900,7 +2033,6 @@ async def _drive_loop_until(
     done: Callable[[], bool],
     *,
     pane_alive: Callable[[], bool] | None = None,
-    quiescence_s: float = 60.0,
     tool_quiescence_s: float = 60.0,
     prepare: Callable[[Path, Path], None] | None = None,
     launch_epoch_ms: int = 0,
@@ -1925,7 +2057,6 @@ async def _drive_loop_until(
             workspace="/ws",
             launch_epoch_ms=launch_epoch_ms,
             pane_alive=pane_alive,
-            quiescence_s=quiescence_s,
             tool_quiescence_s=tool_quiescence_s,
             poll_interval_s=0.01,
             post_backoff_initial_s=0.01,
@@ -1950,6 +2081,8 @@ class TestForwardLoopEdges:
     def _stub_posts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.items: list[str] = []
         self.statuses: list[tuple[str, str]] = []
+        # (turn_outcome, failure_detail) of each posted edge.
+        self.edges: list[tuple[object, object]] = []
         forwarder_health.clear()
 
         async def _fake_item(_client: object, **kwargs: object) -> None:
@@ -1957,6 +2090,7 @@ class TestForwardLoopEdges:
 
         async def _fake_status(_client: object, **kwargs: object) -> None:
             self.statuses.append((str(kwargs["status"]), str(kwargs["output"])))
+            self.edges.append((kwargs.get("turn_outcome"), kwargs.get("failure_detail")))
 
         monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
         monkeypatch.setattr(fwd, "_post_reasoning_item", _fake_item)
@@ -2111,10 +2245,19 @@ class TestForwardLoopEdges:
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
         assert self.statuses == [("idle", "done!")]
 
-    async def test_turn_ended_cancelled_posts_idle_edge(self, tmp_path: Path) -> None:
-        rows = [_prompt_row(), _turn_ended_row("cancelled")]
+    async def test_new_prompt_after_missing_edge_drops_previous_reply(
+        self, tmp_path: Path
+    ) -> None:
+        """Turn A never wrote its edge; turn B's outcome must not carry A's reply."""
+        rows = [
+            _prompt_row("A"),
+            _assistant_row("u1", "reply A"),
+            _prompt_row("B"),
+            _turn_ended_row("cancelled"),
+        ]
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
         assert self.statuses == [("idle", "")]
+        assert self.edges == [("cancelled", None)]
 
     async def test_pane_death_mid_turn_posts_failed_edge(self, tmp_path: Path) -> None:
         # A prompt with no terminal edge and a dead pane: fail instead of strand.
@@ -2123,6 +2266,7 @@ class TestForwardLoopEdges:
             tmp_path, rows, lambda: bool(self.statuses), pane_alive=lambda: False
         )
         assert self.statuses == [("failed", "so far")]
+        assert self.edges == [("failed", "Kimi exited before reporting how the turn ended.")]
 
     async def test_dead_pane_waits_for_unterminated_terminal_row(self, tmp_path: Path) -> None:
         rows = [_prompt_row(), _turn_ended_row("completed")]
@@ -2140,37 +2284,84 @@ class TestForwardLoopEdges:
 
         assert self.statuses == [("idle", "")]
 
-    async def test_quiescence_closes_turn_without_edge_as_idle(self, tmp_path: Path) -> None:
-        # A wedged turn writes no wire edge; the quiet-wire fallback closes it.
+    async def test_quiet_turn_stays_open_until_its_explicit_edge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A turn quiet past the former five-minute window, with no tool in
+        flight, is never closed by silence; only its explicit edge closes it."""
         rows = [_prompt_row(), _assistant_row("u1", "so far")]
-        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), quiescence_s=0.05)
-        assert self.statuses == [("idle", "so far")]
+        wire_ref: list[Path] = []
+        skew = 0.0
+        quiet_polls = 0
+        # The forwarder's clock jumps; the event loop's own clock does not.
+        monkeypatch.setattr(
+            fwd,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: time.monotonic() + skew, time=lambda: time.time() + skew
+            ),
+        )
 
-    async def test_quiescence_suppressed_while_tool_in_flight(self, tmp_path: Path) -> None:
-        """A silent wire mid-tool is a long tool call; only pane death closes it."""
-        pane_up = True
-        rows = [_prompt_row(), _tool_call_row()]
-        checks = 0
+        def _capture(_bridge: Path, wire: Path) -> None:
+            wire_ref.append(wire)
 
         def _done() -> bool:
-            nonlocal pane_up, checks
-            if self.statuses:
-                return True
+            nonlocal skew, quiet_polls
+            if "kimi:u1" in self.items and quiet_polls < 20:
+                skew = 301.0
+                quiet_polls += 1
+                if quiet_polls == 20:
+                    assert self.statuses == []
+                    with wire_ref[0].open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(_turn_ended_row("completed")) + "\n")
+            return bool(self.statuses)
+
+        await _drive_loop_until(tmp_path, rows, _done, pane_alive=lambda: True, prepare=_capture)
+        assert quiet_polls == 20
+        assert self.statuses == [("idle", "so far")]
+        assert self.edges == [("completed", None)]
+
+    async def test_quiescence_suppressed_while_tool_in_flight(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wire silent past the former five-minute window mid-tool is a long
+        tool call; only pane death closes it, with the pane-death detail."""
+        pane_up = True
+        rows = [_prompt_row(), _tool_call_row()]
+        bridge = tmp_path / "bridge"
+        skew = 0.0
+        checks = 0
+        monkeypatch.setattr(
+            fwd,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: time.monotonic() + skew, time=lambda: time.time() + skew
+            ),
+        )
+
+        def _done() -> bool:
+            nonlocal pane_up, skew, checks
+            if not pane_up:
+                return bool(self.statuses)
+            state = _read_state(bridge)
+            if state is None or state.tools_in_flight != 1:
+                return False
+            skew = 301.0
             checks += 1
-            # 20 checks ≈ 200ms with a 20ms quiescence window: staying edge-free
-            # this long proves suppression; then a pane death must close it.
             if checks == 20:
+                assert self.statuses == []
                 pane_up = False
-            return False
+            return bool(self.statuses)
 
         await _drive_loop_until(
             tmp_path,
             rows,
             _done,
             pane_alive=lambda: pane_up,
-            quiescence_s=0.02,
+            tool_quiescence_s=1800.0,
         )
         assert self.statuses == [("failed", "")]
+        assert self.edges == [("failed", "Kimi exited before reporting how the turn ended.")]
 
     async def test_hung_tool_watchdog_fails_turn_after_ceiling(self, tmp_path: Path) -> None:
         """Crash-mid-tool replay: the real completed-turn wire cut right after its
@@ -2193,10 +2384,10 @@ class TestForwardLoopEdges:
             rows,
             lambda: bool(self.statuses),
             pane_alive=lambda: True,
-            quiescence_s=0.02,
             tool_quiescence_s=0.1,
         )
         assert self.statuses == [("failed", "sanitized text part")]
+        assert self.edges == [("failed", _TOOL_HUNG_DETAIL)]
 
     async def test_readopted_wire_ignores_stale_edge_dedupe(self, tmp_path: Path) -> None:
         """A newly discovered wire restarts line numbering; a stale edge id from
@@ -2242,53 +2433,6 @@ class TestForwardLoopEdges:
 
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), prepare=_seed)
         assert self.statuses == [("idle", "")]
-
-    async def test_stalled_cursor_quiescence_ids_do_not_collide_across_turns(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Turn B's fallback close must post even when failed POSTs stalled
-        the delivery cursor at turn A's line.
-
-        A line-only fallback id collided with turn A's persisted id, took
-        the dedupe branch, set turn_open=False WITHOUT posting, and disarmed
-        both watchdogs — the session stranded running. The per-turn
-        discriminator keeps the ids distinct."""
-
-        async def _failing_item(_client: object, **kwargs: object) -> None:
-            item = kwargs["item"]
-            if "B" in item.text:  # type: ignore[union-attr]
-                raise httpx.ConnectError("stalled")
-            self.items.append(item.response_id)  # type: ignore[union-attr]
-
-        monkeypatch.setattr(fwd, "_post_conversation_item", _failing_item)
-
-        wire_ref: list[Path] = []
-
-        def _capture(_bridge: Path, wire: Path) -> None:
-            wire_ref.append(wire)
-
-        phase = {"n": 0}
-
-        def _done() -> bool:
-            if phase["n"] == 0 and len(self.statuses) == 1:
-                # Turn A closed by quiescence; prompt B arrives but its POST
-                # fails forever, so the cursor stalls at A's line.
-                with wire_ref[0].open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(_prompt_row("prompt B")) + "\n")
-                phase["n"] = 1
-                return False
-            return len(self.statuses) == 2
-
-        await _drive_loop_until(
-            tmp_path,
-            [_prompt_row("prompt A")],
-            _done,
-            quiescence_s=0.2,
-            prepare=_capture,
-        )
-        # Both turns' quiescence closes posted — turn B was not swallowed by
-        # a colliding dedupe id.
-        assert self.statuses == [("idle", ""), ("idle", "")]
 
     async def test_shrunk_same_path_wire_ignores_stale_edge_dedupe(self, tmp_path: Path) -> None:
         """Same-path recreation detected by the high-water gate (delivery
@@ -2375,8 +2519,19 @@ class TestForwardLoopEdges:
         assert self.statuses == [("failed", "")]
         assert self.items == []
 
-    async def test_dropped_edge_status_persists_across_restart(self, tmp_path: Path) -> None:
-        """A restart must not soften a poison-dropped failure back to idle."""
+    @pytest.mark.parametrize(
+        ("persisted", "status", "outcome"),
+        [
+            ("failed", "failed", "failed"),
+            ("cancelled", "idle", "cancelled"),
+            # Older forwarders persisted "idle", which they delivered as completed.
+            ("idle", "idle", "completed"),
+        ],
+    )
+    async def test_dropped_edge_outcome_persists_across_restart(
+        self, tmp_path: Path, persisted: str, status: str, outcome: str
+    ) -> None:
+        """The fallback re-posts the poison-dropped edge's outcome, not its own."""
         rows = [_prompt_row()]
 
         def _seed(bridge: Path, wire: Path) -> None:
@@ -2387,14 +2542,15 @@ class TestForwardLoopEdges:
                     last_line=1,
                     offset=wire.stat().st_size,
                     turn_open=True,
-                    dropped_edge_status="failed",
+                    dropped_edge_status=persisted,
                 ),
             )
 
         await _drive_loop_until(
-            tmp_path, rows, lambda: bool(self.statuses), quiescence_s=0.05, prepare=_seed
+            tmp_path, rows, lambda: bool(self.statuses), pane_alive=lambda: False, prepare=_seed
         )
-        assert self.statuses == [("failed", "")]
+        assert self.statuses == [(status, "")]
+        assert self.edges == [(outcome, None)]
 
     async def test_tool_silence_clock_survives_restart(self, tmp_path: Path) -> None:
         """A restart resumes the tool-quiescence window instead of re-arming it,
@@ -2421,7 +2577,6 @@ class TestForwardLoopEdges:
             rows,
             lambda: bool(self.statuses),
             pane_alive=lambda: True,
-            quiescence_s=200.0,
             tool_quiescence_s=50.0,
             prepare=_seed,
         )
@@ -2441,6 +2596,7 @@ class TestForwardLoopEdges:
                     last_line=1,
                     offset=size,
                     turn_open=True,
+                    tools_in_flight=1,
                     last_activity_ts=time.time() - 10_000.0,
                     last_seen_offset=size,
                 ),
@@ -2448,9 +2604,15 @@ class TestForwardLoopEdges:
 
         started = time.monotonic()
         await _drive_loop_until(
-            tmp_path, rows, lambda: bool(self.statuses), quiescence_s=5.0, prepare=_seed
+            tmp_path,
+            rows,
+            lambda: bool(self.statuses),
+            pane_alive=lambda: True,
+            tool_quiescence_s=5.0,
+            prepare=_seed,
         )
-        assert self.statuses == [("idle", "")]
+        assert self.statuses == [("failed", "")]
+        assert self.edges == [("failed", _TOOL_HUNG_DETAIL)]
         assert time.monotonic() - started >= 0.8
 
     async def test_near_expired_window_still_fires_promptly(self, tmp_path: Path) -> None:
@@ -2466,6 +2628,7 @@ class TestForwardLoopEdges:
                     last_line=1,
                     offset=size,
                     turn_open=True,
+                    tools_in_flight=1,
                     last_activity_ts=time.time() - 4.5,
                     last_seen_offset=size,
                 ),
@@ -2473,15 +2636,21 @@ class TestForwardLoopEdges:
 
         started = time.monotonic()
         await _drive_loop_until(
-            tmp_path, rows, lambda: bool(self.statuses), quiescence_s=5.0, prepare=_seed
+            tmp_path,
+            rows,
+            lambda: bool(self.statuses),
+            pane_alive=lambda: True,
+            tool_quiescence_s=5.0,
+            prepare=_seed,
         )
-        assert self.statuses == [("idle", "")]
+        assert self.statuses == [("failed", "")]
+        assert self.edges == [("failed", _TOOL_HUNG_DETAIL)]
         assert time.monotonic() - started <= 2.5
 
     async def test_same_path_wire_shrink_reseeds_high_water(self, tmp_path: Path) -> None:
         """A wire recreated at the same path below the observed high-water must
         refresh the activity clock and reseed the gate — not leave the stale
-        high-water blinding it while quiescence falsely closes the live turn."""
+        high-water blinding it while a silence timer falsely closes the live turn."""
         rows = [_prompt_row()]
         bridge = tmp_path / "bridge"
 
@@ -2509,7 +2678,7 @@ class TestForwardLoopEdges:
                 and state.offset == state.last_seen_offset
             )
 
-        await _drive_loop_until(tmp_path, rows, _reseeded, quiescence_s=50.0, prepare=_seed)
+        await _drive_loop_until(tmp_path, rows, _reseeded, prepare=_seed)
         assert self.statuses == []
 
     async def test_replayed_turn_edge_is_deduped(self, tmp_path: Path) -> None:
@@ -2621,63 +2790,94 @@ class TestForwardLoopPostFailures:
         )
         forwarder_health.clear()
 
+    @pytest.mark.parametrize(
+        ("rows", "status"),
+        [
+            ([_prompt_row(), _turn_ended_row("failed", error_message="boom")], "failed"),
+            (
+                [_prompt_row(), _assistant_row("u1", "partial"), _turn_ended_row("cancelled")],
+                "idle",
+            ),
+        ],
+        ids=["failed-coded-error", "cancelled"],
+    )
     async def test_poison_dropped_failed_edge_routes_failed_via_fallback(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        rows: list[dict[str, object]],
+        status: str,
     ) -> None:
-        """A permanently rejected turn_failed edge must not be closed as idle later."""
-        posted: list[tuple[str, str]] = []
-        edge_attempts = 0
+        """A permanently rejected turn edge, recovered by pane death after a
+        restart, posts exactly the body the direct post carried."""
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        _loop_wire(home, rows)
+        rejecting = _FakeAsyncClient(reject={"external_session_status": [404] * 3})
 
-        async def _fake_item(_client: object, **kwargs: object) -> None:
-            return None
+        def _dropped() -> bool:
+            state = _read_state(bridge)
+            return state is not None and state.dropped_edge_status is not None
 
-        async def _fake_status(_client: object, **kwargs: object) -> None:
-            nonlocal edge_attempts
-            edge_attempts += 1
-            if edge_attempts <= 3:
-                request = httpx.Request("POST", "http://test")
-                raise httpx.HTTPStatusError(
-                    "404", request=request, response=httpx.Response(404, request=request)
-                )
-            posted.append((str(kwargs["status"]), str(kwargs["output"])))
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=rejecting,
+            launch_epoch_ms=0,
+            pane_alive=lambda: True,
+            post_backoff_initial_s=0.01,
+            until=_dropped,
+        )
+        direct = rejecting.rejected_posts
+        assert len(direct) == 3 and direct[0]["data"]["status"] == status
+        assert all(body == direct[0] for body in direct)
 
-        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
-        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
-
-        rows = [_prompt_row(), _turn_ended_row("failed", error_message="boom")]
-        await _drive_loop_until(tmp_path, rows, lambda: bool(posted), quiescence_s=0.2)
-        assert edge_attempts == 4
-        assert posted == [("failed", "boom")]
+        recovering = _FakeAsyncClient()
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=recovering,
+            launch_epoch_ms=0,
+            pane_alive=lambda: False,
+            until=lambda: bool(_status_bodies(recovering)),
+        )
+        assert _status_bodies(recovering) == [direct[0]]
 
     async def test_redelivered_prompt_keeps_one_fallback_sequence(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A dead pane's fallback waits until the retried prompt is delivered."""
         attempts = 0
         statuses: list[tuple[str, str]] = []
+        statuses_at_delivery: list[tuple[str, str]] | None = None
         bridge = tmp_path / "bridge"
 
-        async def _failing_item(_client: object, **kwargs: object) -> None:
-            nonlocal attempts
+        async def _flaky_item(_client: object, **kwargs: object) -> None:
+            nonlocal attempts, statuses_at_delivery
             attempts += 1
-            raise httpx.ConnectError("no route")
+            if attempts < 8:
+                raise httpx.ConnectError("no route")
+            statuses_at_delivery = list(statuses)
 
         async def _status(_client: object, **kwargs: object) -> None:
             statuses.append((str(kwargs["status"]), str(kwargs["output"])))
 
-        monkeypatch.setattr(fwd, "_post_conversation_item", _failing_item)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _flaky_item)
         monkeypatch.setattr(fwd, "_post_external_session_status", _status)
 
         await _drive_loop_until(
-            tmp_path,
-            [_prompt_row()],
-            lambda: attempts >= 8 and bool(statuses),
-            quiescence_s=0.05,
+            tmp_path, [_prompt_row()], lambda: bool(statuses), pane_alive=lambda: False
         )
 
         state = _read_state(bridge)
         assert state is not None
         assert state.turn_seq == 1
-        assert statuses == [("idle", "")]
+        assert statuses_at_delivery == []
+        assert statuses == [("failed", "")]
+        forwarder_health.clear()
 
     async def test_high_water_persisted_without_cursor_advance(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2702,16 +2902,16 @@ class TestForwardLoopPostFailures:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A restart re-reading rows already observed (persisted high-water)
-        must resume the silence clock, not restart the full window."""
-        statuses: list[tuple[str, str]] = []
+        must resume the hung-tool clock, not restart the full window."""
+        posted: list[tuple[object, object]] = []
 
-        async def _failing_item(_client: object, **kwargs: object) -> None:
-            raise httpx.ConnectError("no route to host")
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            return None
 
         async def _fake_status(_client: object, **kwargs: object) -> None:
-            statuses.append((str(kwargs["status"]), str(kwargs["output"])))
+            posted.append((kwargs.get("turn_outcome"), kwargs.get("failure_detail")))
 
-        monkeypatch.setattr(fwd, "_post_conversation_item", _failing_item)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
         monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
 
         def _seed(bridge: Path, wire: Path) -> None:
@@ -2729,31 +2929,42 @@ class TestForwardLoopPostFailures:
             )
 
         await _drive_loop_until(
-            tmp_path, [_prompt_row()], lambda: bool(statuses), quiescence_s=50.0, prepare=_seed
+            tmp_path,
+            [_prompt_row(), _tool_call_row()],
+            lambda: bool(posted),
+            pane_alive=lambda: True,
+            tool_quiescence_s=50.0,
+            prepare=_seed,
         )
-        assert statuses == [("idle", "")]
-        forwarder_health.clear()
+        assert posted == [("failed", _TOOL_HUNG_DETAIL)]
 
-    async def test_failed_redelivery_does_not_defer_quiescence(
+    async def test_pane_death_waits_for_retried_history_and_its_turn_end(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Retries re-reading the same unposted tail must not refresh the
-        silence timers — under a permanent outage the fallback still fires."""
+        """A dead pane must not overtake a retried history row or the real
+        turn.ended behind it with a pane-death failure."""
         statuses: list[tuple[str, str]] = []
+        outcomes: list[object] = []
+        failures = 0
 
-        async def _failing_item(_client: object, **kwargs: object) -> None:
-            raise httpx.ConnectError("no route to host")
+        async def _flaky_item(_client: object, **kwargs: object) -> None:
+            nonlocal failures
+            if kwargs["item"].text == "answer" and failures < 3:  # type: ignore[union-attr]
+                failures += 1
+                raise httpx.ConnectError("no route to host")
 
         async def _fake_status(_client: object, **kwargs: object) -> None:
             statuses.append((str(kwargs["status"]), str(kwargs["output"])))
+            outcomes.append(kwargs.get("turn_outcome"))
 
-        monkeypatch.setattr(fwd, "_post_conversation_item", _failing_item)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _flaky_item)
         monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
 
-        await _drive_loop_until(
-            tmp_path, [_prompt_row()], lambda: bool(statuses), quiescence_s=0.05
-        )
-        assert statuses == [("idle", "")]
+        rows = [_prompt_row(), _assistant_row("u1", "answer"), _turn_ended_row("completed")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(statuses), pane_alive=lambda: False)
+        assert failures == 3
+        assert statuses == [("idle", "answer")]
+        assert outcomes == ["completed"]
         forwarder_health.clear()
 
     async def test_persistent_edge_failure_alert_is_rate_limited(
@@ -2872,14 +3083,21 @@ class TestForwardLoopPostFailures:
 class _FakeAsyncClient:
     """Stands in for the loop's ``httpx.AsyncClient`` context manager.
 
-    Records POST bodies; ``fail_usage_posts`` makes that many
+    Records accepted POST bodies; ``fail_usage_posts`` makes that many
     ``external_session_usage`` posts raise before succeeding, to exercise the
-    per-poll retry path.
+    per-poll retry path. ``reject`` maps an item ``source_id`` (or, for events
+    without one, the event ``type``) to the HTTP statuses its next attempts get
+    back (one per attempt), all recorded in ``rejected`` / ``rejected_posts``.
     """
 
-    def __init__(self, *, fail_usage_posts: int = 0) -> None:
+    def __init__(
+        self, *, fail_usage_posts: int = 0, reject: dict[str, list[int]] | None = None
+    ) -> None:
         self.posts: list[dict] = []
+        self.rejected: list[tuple[str, int]] = []
+        self.rejected_posts: list[dict] = []
         self.fail_usage_posts = fail_usage_posts
+        self.reject = reject or {}
 
     async def __aenter__(self) -> _FakeAsyncClient:
         return self
@@ -2892,8 +3110,15 @@ class _FakeAsyncClient:
         if json.get("type") == "external_session_usage" and self.fail_usage_posts > 0:
             self.fail_usage_posts -= 1
             raise httpx.ConnectError("boom")
+        request = httpx.Request("POST", url)
+        source_id = json.get("data", {}).get("source_id") or json.get("type")
+        if self.reject.get(source_id):
+            status_code = self.reject[source_id].pop(0)
+            self.rejected.append((source_id, status_code))
+            self.rejected_posts.append(json)
+            return httpx.Response(status_code, request=request)
         self.posts.append(json)
-        return httpx.Response(200, request=httpx.Request("POST", url))
+        return httpx.Response(200, request=request)
 
 
 def _loop_wire(home: Path, rows: list[dict[str, object]]) -> Path:
@@ -2913,6 +3138,7 @@ async def _drive_loop(
     until: Callable[[], bool],
     timeout_s: float = 10.0,
     pane_alive: Callable[[], bool] | None = None,
+    post_backoff_initial_s: float = fwd._BACKOFF_INITIAL_S,
 ) -> None:
     """Run the real forwarder loop until *until* holds, then cancel it."""
     from omnigent.harnesses.kimi_native import forwarder as fwd
@@ -2929,6 +3155,7 @@ async def _drive_loop(
             workspace="/ws",
             launch_epoch_ms=launch_epoch_ms,
             pane_alive=pane_alive,
+            post_backoff_initial_s=post_backoff_initial_s,
         )
     )
     try:
@@ -2939,6 +3166,292 @@ async def _drive_loop(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+def _transcript(client: _FakeAsyncClient) -> list[dict]:
+    """The accepted history and status POST bodies, in order."""
+    types = ("external_conversation_item", "external_session_status")
+    return [body for body in client.posts if body["type"] in types]
+
+
+def _status_bodies(client: _FakeAsyncClient) -> list[dict]:
+    return [body for body in client.posts if body["type"] == "external_session_status"]
+
+
+class TestForwardLoopPostBodies:
+    """Real POST bodies the loop sends for history items and turn outcomes."""
+
+    async def test_turn_posts_ordered_history_tool_pair_and_outcome(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        _loop_wire(
+            home,
+            [
+                _prompt_row("list files"),
+                _assistant_row("a1", "Looking."),
+                _tool_call_row("t1", call_id="c1", args={"command": "ls"}),
+                _tool_result_row(
+                    "t1", call_id="c1", result={"output": "no such dir", "isError": True}
+                ),
+                _assistant_row("a2", "Nothing there."),
+                _turn_ended_row("completed"),
+            ],
+        )
+        client = _FakeAsyncClient()
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=0,
+            until=lambda: bool(_status_bodies(client)),
+        )
+
+        def _message(role: str, text: str, response_id: str) -> dict:
+            item_data: dict[str, object] = {
+                "role": role,
+                "content": [
+                    {"type": "input_text" if role == "user" else "output_text", "text": text}
+                ],
+            }
+            if role == "assistant":
+                item_data["agent"] = "kimi-native-ui"
+            return {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": item_data,
+                    "response_id": response_id,
+                },
+            }
+
+        assert _transcript(client) == [
+            _message("user", "list files", "kimi:turn:0"),
+            _message("assistant", "Looking.", "kimi:a1"),
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "function_call",
+                    "item_data": {
+                        "agent": "kimi-native-ui",
+                        "name": "Bash",
+                        "arguments": '{"command": "ls"}',
+                        "call_id": "c1",
+                    },
+                    "response_id": "kimi:t1",
+                    "source_id": "kimi:t1:call",
+                },
+            },
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "function_call_output",
+                    "item_data": {"call_id": "c1", "output": "Error: no such dir"},
+                    "response_id": "kimi:t1",
+                    "source_id": "kimi:t1:output",
+                },
+            },
+            _message("assistant", "Nothing there.", "kimi:a2"),
+            {
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "output": "Nothing there.",
+                    "turn_outcome": "completed",
+                    "turn_completed": True,
+                },
+            },
+        ]
+
+    @pytest.mark.parametrize(
+        ("reason", "error", "assistant", "data"),
+        [
+            (
+                "completed",
+                None,
+                "answer",
+                {
+                    "status": "idle",
+                    "output": "answer",
+                    "turn_outcome": "completed",
+                    "turn_completed": True,
+                },
+            ),
+            (
+                "cancelled",
+                None,
+                "answer",
+                {"status": "idle", "output": "answer", "turn_outcome": "cancelled"},
+            ),
+            (
+                "failed",
+                "401 Invalid Token",
+                "answer",
+                {
+                    "status": "failed",
+                    "output": "answer",
+                    "turn_outcome": "failed",
+                    "failure_detail": "provider.auth_error: 401 Invalid Token",
+                },
+            ),
+            (
+                "failed",
+                "401 Invalid Token",
+                None,
+                {
+                    "status": "failed",
+                    "output": "401 Invalid Token",
+                    "turn_outcome": "failed",
+                    "failure_detail": "provider.auth_error: 401 Invalid Token",
+                },
+            ),
+            (
+                "blocked",
+                None,
+                "answer",
+                {
+                    "status": "failed",
+                    "output": "answer",
+                    "turn_outcome": "failed",
+                    "failure_detail": "Kimi turn ended with reason 'blocked'",
+                },
+            ),
+        ],
+    )
+    async def test_turn_end_status_body(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        reason: str,
+        error: str | None,
+        assistant: str | None,
+        data: dict,
+    ) -> None:
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        rows = [_prompt_row()]
+        if assistant is not None:
+            rows.append(_assistant_row("a1", assistant))
+        rows.append(_turn_ended_row(reason, error_message=error))
+        _loop_wire(home, rows)
+        client = _FakeAsyncClient()
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=0,
+            until=lambda: bool(_status_bodies(client)),
+        )
+        assert _status_bodies(client) == [{"type": "external_session_status", "data": data}]
+
+    async def test_rejected_tool_call_is_dropped_and_its_capped_result_still_posts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A permanently rejected call cannot wedge the tail: its oversized
+        error result is capped only in its POST body (parsing, as the offline
+        importer does, leaves it whole) and the turn's outcome still posts."""
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        big = "y" * (MAX_TOOL_OUTPUT_BYTES + 100)
+        wire = _loop_wire(
+            home,
+            [
+                _prompt_row(),
+                _tool_call_row("t1", call_id="c1", args={}),
+                _tool_result_row("t1", call_id="c1", result={"output": big, "isError": True}),
+                _turn_ended_row("completed"),
+            ],
+        )
+        parsed = [i for i in read_kimi_wire_items(wire, 0) if i.kind == "tool_result"]
+        assert [i.text for i in parsed] == [f"Error: {big}"]
+        client = _FakeAsyncClient(reject={"kimi:t1:call": [400] * 5})
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=0,
+            post_backoff_initial_s=0.01,
+            until=lambda: bool(_status_bodies(client)),
+        )
+        assert client.rejected == [("kimi:t1:call", 400)] * 3
+        transcript = _transcript(client)
+        assert [body["data"].get("item_type") for body in transcript] == [
+            "message",
+            "function_call_output",
+            None,
+        ]
+        assert transcript[1]["data"]["item_data"]["output"] == cap_tool_output(f"Error: {big}")
+        assert transcript[2]["data"]["turn_outcome"] == "completed"
+
+    async def test_retail_reposts_identical_tool_source_ids(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A dropped cursor re-tails the wire with the same stable source ids,
+        so the server's idempotent append dedupes the replay."""
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        _loop_wire(
+            home,
+            [
+                _prompt_row(),
+                _tool_call_row("t1", call_id="c1", args={"path": "a"}),
+                _tool_result_row("t1", call_id="c1", result={"output": "ok"}),
+                _turn_ended_row("completed"),
+            ],
+        )
+
+        async def _tool_bodies() -> list[dict]:
+            client = _FakeAsyncClient()
+            await _drive_loop(
+                monkeypatch,
+                bridge_dir=bridge,
+                home=home,
+                client=client,
+                launch_epoch_ms=0,
+                until=lambda: bool(_status_bodies(client)),
+            )
+            return [body for body in _transcript(client) if "source_id" in body["data"]]
+
+        first = await _tool_bodies()
+        clear_kimi_bridge_state(bridge)
+        second = await _tool_bodies()
+        assert [body["data"]["source_id"] for body in first] == ["kimi:t1:call", "kimi:t1:output"]
+        assert second == first
+
+    async def test_transient_tool_call_failures_count_the_call_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        _loop_wire(home, [_prompt_row(), _tool_call_row("t1", call_id="c1", args={})])
+        client = _FakeAsyncClient(reject={"kimi:t1:call": [503, 503, 503]})
+
+        def _call_posted() -> bool:
+            return any(body["data"].get("source_id") == "kimi:t1:call" for body in client.posts)
+
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=0,
+            post_backoff_initial_s=0.01,
+            until=_call_posted,
+        )
+        assert len(client.rejected) == 3
+        state = _read_state(bridge)
+        assert state is not None
+        assert state.tools_in_flight == 1
+        forwarder_health.clear()
 
 
 class TestForwardLoopUsage:
