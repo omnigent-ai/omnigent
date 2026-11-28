@@ -240,6 +240,18 @@ async def _run(
         return await server.call("GET", f"{path}/revisions/{_segment(revision, 'revision_id')}")
     if tool_name == "sys_gadget_revision_create":
         body = {key: value for key, value in args.items() if key != "gadget_id"}
+        scopes = body.get("collection_scopes")
+        # Checked before anything is saved: an older server would store the revision and
+        # leave nothing to check its answer against.
+        if scopes is not None and (
+            not isinstance(scopes, dict)
+            or any(
+                not isinstance(name, str) or not isinstance(v, str) for name, v in scopes.items()
+            )
+        ):
+            raise _ToolError(
+                "invalid_input: collection_scopes must map collection names to shared or viewer"
+            )
         created = await server.call("POST", f"{path}/revisions", body=body)
         return _check_scopes_kept(body, created)
     if tool_name == "sys_gadget_publish":
