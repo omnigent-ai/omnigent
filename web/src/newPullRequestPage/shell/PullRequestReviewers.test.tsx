@@ -395,7 +395,8 @@ it("keeps a refused withdrawal's failure after its section remounts, until Retry
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Couldn’t withdraw the review request from Team core: Invalid request.",
   );
-  await waitFor(() => expect(announced()).toMatch(/^Couldn’t withdraw .*Invalid request\.$/));
+  // Said once, by the alert: the polite region doesn't repeat it.
+  expect(announced()).not.toMatch(/Couldn’t/);
 
   // The PR was closed and opened again: the failure is still said, read from the cache.
   cleanup();

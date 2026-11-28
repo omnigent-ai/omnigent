@@ -125,11 +125,7 @@ export function usePullRequestLabelChanges(
         if (!stillTheirs(sent ?? stamped)) return;
         announceChange(labelChangeText(change, "done"));
       },
-      onError: (error, sent) => {
-        // Answered after a switch of workspace user or GitHub account: not theirs.
-        if (!stillTheirs(sent)) return;
-        announceChange(`${labelFailurePrefix(change)}: ${error.message}`);
-      },
+      // A failure is said by its notice, an alert, so it isn't announced twice.
     });
   };
   return { changes, applied, waiting, send };

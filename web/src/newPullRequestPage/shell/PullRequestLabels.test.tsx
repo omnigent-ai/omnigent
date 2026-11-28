@@ -252,9 +252,8 @@ it("keeps a refused edit's failure after its section remounts, until Retry goes 
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Couldn’t remove the label bug: Refused by GitHub.",
   );
-  await waitFor(() =>
-    expect(announced()).toBe("Couldn’t remove the label bug: Refused by GitHub."),
-  );
+  // Said once, by the alert: the polite region doesn't repeat it.
+  expect(announced()).not.toMatch(/Couldn’t/);
 
   // The PR was closed and opened again: the failure is still said, read from the cache.
   cleanup();

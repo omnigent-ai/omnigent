@@ -364,7 +364,7 @@ export function PullRequestReviewers({
     announceChange(reviewerChangeText(change, "sending"));
     update.mutate(change, {
       onSuccess: () => announceChange(reviewerChangeText(change, "done")),
-      onError: (error) => announceChange(`${reviewerFailurePrefix(change)}: ${error.message}`),
+      // A failure is said by its notice, an alert, so it isn't announced twice.
     });
   };
   const toggle = (target: PullRequestReviewerTarget) => {
