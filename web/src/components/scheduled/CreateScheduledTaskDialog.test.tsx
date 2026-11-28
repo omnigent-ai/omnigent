@@ -8383,3 +8383,111 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     expect(screen.queryByTestId("task-mcp-services-menu")).not.toBeInTheDocument();
   });
 });
+
+describe("CreateScheduledTaskDialog retries", () => {
+  it.each([false, true])("offers retries only on a server that has them=%s", async (supported) => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ maxRetries: 2, retryDelaySeconds: 60 })}
+      />,
+      { info: { scheduled_task_retries: supported } },
+    );
+    expect(screen.queryByTestId("task-retries-trigger") !== null).toBe(supported);
+
+    // An unrelated edit leaves the saved retries alone, shown or not.
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input).toMatchObject({ name: "Renamed" });
+    expect(input).not.toHaveProperty("maxRetries");
+    expect(input).not.toHaveProperty("retryDelaySeconds");
+  });
+
+  it("offers no retries for a trigger, which polls again within minutes", () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialTrigger="github" />, {
+      info: {
+        scheduled_task_retries: true,
+        scheduled_task_overlap_modes: ["allow", "skip"],
+        scheduled_task_session_modes: true,
+        scheduled_task_subhour: true,
+      },
+    });
+    expect(screen.queryByTestId("task-retries-trigger")).toBeNull();
+    // A trigger has its own check of a busy polling session.
+    expect(screen.queryByTestId("task-overlap-trigger")).toBeNull();
+  });
+
+  it("saves the picked retry count and delay", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ maxRetries: 0, retryDelaySeconds: 300 })}
+      />,
+      { info: { scheduled_task_retries: true } },
+    );
+    closeTopLevelPopovers();
+    const trigger = screen.getByTestId("task-retries-trigger");
+    expect(trigger).toHaveTextContent("Off");
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("task-retries-count-2"));
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("task-retries-delay-60"));
+    expect(trigger).toHaveTextContent("2 retries · 1 minute apart");
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      maxRetries: 2,
+      retryDelaySeconds: 60,
+    });
+  });
+});
+
+describe("CreateScheduledTaskDialog overlap mode", () => {
+  // An older server lists none, and one with the release feature off only the default.
+  it.each([[[]], [["allow"]], [["allow", "skip"]]])(
+    "offers overlap modes the server accepts (%j)",
+    (modes) => {
+      render(
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />,
+        { info: { scheduled_task_overlap_modes: modes } },
+      );
+      expect(screen.queryByTestId("task-overlap-trigger") !== null).toBe(modes.length > 1);
+    },
+  );
+
+  it.each([
+    ["skip", "Skip it"],
+    ["queue", "Queue it"],
+  ] as const)("saves the picked overlap mode %s", async (mode, label) => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />,
+      { info: { scheduled_task_overlap_modes: ["allow", "skip", "queue"] } },
+    );
+    closeTopLevelPopovers();
+    const trigger = screen.getByTestId("task-overlap-trigger");
+    expect(trigger).toHaveTextContent("Start it anyway");
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(screen.getByTestId(`task-overlap-${mode}`));
+    expect(trigger).toHaveTextContent(label);
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ overlapMode: mode });
+  });
+
+  it("offers queuing only on a server that accepts it", () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />,
+      { info: { scheduled_task_overlap_modes: ["allow", "skip"] } },
+    );
+    closeTopLevelPopovers();
+    fireEvent.keyDown(screen.getByTestId("task-overlap-trigger"), { key: "Enter" });
+    expect(screen.getByTestId("task-overlap-skip")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-overlap-queue")).not.toBeInTheDocument();
+  });
+});

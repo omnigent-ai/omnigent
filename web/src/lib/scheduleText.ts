@@ -277,6 +277,20 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
   launch_failed: { stage: "Launch", reason: "The agent session failed to launch." },
   startup_expired: { stage: "Startup", reason: "The run stopped before the agent started." },
   incomplete: { stage: "Running", reason: "The agent stopped reporting before the run finished." },
+  retry_superseded: {
+    stage: "Retry",
+    reason: "The automation's next run came due before this retry started.",
+  },
+  task_paused: { stage: "Schedule", reason: "The automation was paused before this run started." },
+  retry_cancelled: {
+    stage: "Retry",
+    reason: "The automation's retries were turned off or reduced before this retry started.",
+  },
+  previous_run_active: { stage: "Schedule", reason: "The previous run was still going." },
+  queue_full: {
+    stage: "Schedule",
+    reason: "Another run was already queued behind the previous run.",
+  },
 };
 
 /**

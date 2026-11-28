@@ -2545,6 +2545,14 @@
             ],
             "title": "Max Cost Usd"
           },
+          "max_retries": {
+            "default": 0,
+            "format": "int64",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Max Retries",
+            "type": "integer"
+          },
           "mcp_services": {
             "items": {
               "type": "string"
@@ -2566,6 +2574,16 @@
           },
           "name": {
             "title": "Name",
+            "type": "string"
+          },
+          "overlap_mode": {
+            "default": "allow",
+            "enum": [
+              "allow",
+              "skip",
+              "queue"
+            ],
+            "title": "Overlap Mode",
             "type": "string"
           },
           "permission_mode": {
@@ -2611,6 +2629,14 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "retry_delay_seconds": {
+            "default": 300,
+            "format": "int64",
+            "maximum": 3600.0,
+            "minimum": 60.0,
+            "title": "Retry Delay Seconds",
+            "type": "integer"
           },
           "rrule": {
             "title": "Rrule",
@@ -8363,9 +8389,21 @@
             "title": "Scheduled Task One Time",
             "type": "boolean"
           },
+          "scheduled_task_overlap_modes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scheduled Task Overlap Modes",
+            "type": "array"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_retries": {
+            "default": false,
+            "title": "Scheduled Task Retries",
             "type": "boolean"
           },
           "scheduled_task_run_pull_requests": {
@@ -16096,6 +16134,20 @@
             ],
             "title": "Max Cost Usd"
           },
+          "max_retries": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 5.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Retries"
+          },
           "mcp_services": {
             "anyOf": [
               {
@@ -16132,6 +16184,22 @@
               }
             ],
             "title": "Name"
+          },
+          "overlap_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "allow",
+                  "skip",
+                  "queue"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overlap Mode"
           },
           "permission_mode": {
             "anyOf": [
@@ -16176,6 +16244,20 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "retry_delay_seconds": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 3600.0,
+                "minimum": 60.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Delay Seconds"
           },
           "rrule": {
             "anyOf": [

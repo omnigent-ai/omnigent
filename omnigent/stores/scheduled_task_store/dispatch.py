@@ -74,7 +74,9 @@ class ScheduledTaskDispatchStore(Protocol):
         A ``None`` next run marks the task completed.
 
         An already-recorded occurrence advances the cursor but returns None,
-        as does a changed task. Neither case starts another run.
+        as does a changed task. Neither case starts another run. A retry of an
+        earlier run that has not started is recorded as ``skipped``
+        (``retry_superseded``).
 
         A timer runs one firing at a time: while its previous run is unfinished, this
         returns None and changes nothing. Otherwise it first deletes the timer's
@@ -89,6 +91,66 @@ class ScheduledTaskDispatchStore(Protocol):
 
         Returns False, changing nothing, if the task changed since it was listed.
         """
+        ...
+
+    def has_unfinished_run(self, scheduled_task_id: str, *, running_since: int) -> bool:
+        """Whether a run of the task is ``starting``, ``running``, or a waiting Run now request.
+
+        Asked before a due or queued occurrence of a task whose ``overlap_mode``
+        isn't ``allow``. A ``running`` run that fired at or before *running_since*
+        (or, with no fire time, was scheduled then) is stale and doesn't count, and
+        neither does a retry waiting out its delay or a queued occurrence. The read
+        is bounded, so a full page of stale ``running`` runs could hide a newer one.
+        This fails that page, as the stale-run backstop would, and answers True
+        until a later call can tell.
+        """
+        ...
+
+    def skip_overlapping_occurrence(
+        self,
+        task: ScheduledTask,
+        *,
+        now: int,
+        next_run_at: int,
+        host_id: str | None,
+        running_since: int | None,
+    ) -> ScheduledTaskRun | None:
+        """Advance an unchanged task past its due occurrence, recording it as ``skipped``.
+
+        For a task whose ``overlap_mode`` is ``skip`` while its previous run is still
+        going: the run gets ``error_code`` ``previous_run_active``, and a retry still
+        waiting is superseded as a claim would. With *running_since*, the write first
+        checks again, under the task lock, that :meth:`has_unfinished_run` still
+        holds. It records nothing if that run ended meanwhile, or if only stale
+        runs it cannot read past are in the way, which it fails. Pass ``None`` when
+        the session the task continues is what is busy. Returns None then, and if
+        the task changed since it was listed; an occurrence that already has a run
+        only advances.
+        """
+        ...
+
+    def queue_overlapping_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run_at: int | None, host_id: str | None
+    ) -> ScheduledTaskRun | None:
+        """Advance an unchanged task past its due occurrence, queuing it behind the previous run.
+
+        For a task whose ``overlap_mode`` is ``queue`` while its previous run is still
+        going: the occurrence is recorded as a pending ``scheduled`` run under its
+        schedule key, which the scheduler claims once the previous run is no longer
+        going. If the task already has one queued, the occurrence is recorded as
+        ``skipped`` (``queue_full``) instead. ``next_run_at=None`` completes the
+        task: its last occurrence is queued or skipped the same way, and a queued
+        run still starts afterwards. Returns None if the task changed since it was
+        listed; an occurrence that already has a run only advances.
+        """
+        ...
+
+    def has_queued_run(self, task: ScheduledTask) -> bool:
+        """Whether an occurrence of *task* is queued behind its previous run."""
+        ...
+
+    def get_run_task(self, run: ScheduledTaskRun) -> ScheduledTask | None:
+        """The task *run* belongs to, or ``None`` once it is deleted."""
         ...
 
     def request_manual_run(
@@ -107,23 +169,48 @@ class ScheduledTaskDispatchStore(Protocol):
         ...
 
     def claim_pending_run(
-        self, run: ScheduledTaskRun, *, now: int, lease_seconds: int
+        self,
+        run: ScheduledTaskRun,
+        *,
+        now: int,
+        lease_seconds: int,
+        queued_task: ScheduledTask | None = None,
     ) -> tuple[ScheduledTask, ScheduledTaskRun] | None:
         """Start a pending run under a lease, returning the task snapshot to fire.
 
-        Returns None if another replica already claimed it. A run whose task was
+        Returns None if another replica already claimed it, or for a retry whose
+        ``scheduled_at`` has not come yet. A retry or queued occurrence is recorded
+        as ``skipped`` instead when its task is paused (``task_paused``), and a
+        retry when its task now allows fewer retries (``retry_cancelled``) or has
+        its next occurrence due (``retry_superseded``). A run whose task was
         deleted is recorded as ``skipped`` instead. A run whose host changed with
         the task's target gets the new host and stays pending. Both return None.
+
+        A queued occurrence needs *queued_task*, the task as the caller read it
+        (:meth:`get_run_task`) to decide that the occurrence no longer waits. It stays
+        pending, and this returns None, if the task has changed since, or if its
+        mode is still ``queue`` and :meth:`has_unfinished_run` holds under the task
+        lock. Starting it supersedes a retry still waiting.
         """
         ...
 
     def renew_starting_run(
-        self, run_id: str, *, now: Callable[[], float], lease_seconds: int
+        self,
+        run_id: str,
+        *,
+        now: Callable[[], float],
+        lease_seconds: int,
+        dispatching: bool = False,
     ) -> ScheduledTaskRun | None:
         """Renew only an unexpired startup, reading now after locking.
 
         Returns the current row even if no renewal occurred. Callers must check
         status and lease expiry; a non-None result alone does not confirm renewal.
+
+        With *dispatching*, a renewed run's ``prompt_dispatch`` becomes ``"started"``:
+        its prompt is about to leave the executor. Every claim records
+        ``"not_started"``, which is the only proof recovery accepts that a run
+        without a session never sent its prompt.
         """
         ...
 
@@ -141,8 +228,15 @@ class ScheduledTaskDispatchStore(Protocol):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        retryable: bool = False,
     ) -> ScheduledTaskRun | None:
         """Finish startup conditionally on its lease still matching this snapshot.
+
+        A ``failed`` startup marked *retryable* never got its prompt to the agent. The
+        same write records the occurrence's next retry, a pending run whose
+        ``scheduled_at`` is when it may start. None is recorded if the task has no
+        retry left or already has one waiting, or if a later occurrence is due
+        first or already has a run.
 
         Executors use an unexpired lease. Reconcilers use ``expired=True`` only
         after checking whether the prompt was sent: preserve a started run,

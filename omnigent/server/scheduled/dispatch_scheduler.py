@@ -19,8 +19,10 @@ from omnigent.debug_logging import current_session_id_scope, debug_event, log_at
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
+    is_queued_trigger_key,
     is_trigger_automation,
     manual_trigger_key,
     next_scheduled_time,
@@ -206,6 +208,18 @@ class StartupLease:
 
         await self._transition("starting", conversation_id=conversation_id, committed=log_session)
 
+    async def begin_dispatch(self) -> None:
+        """Record that the prompt is about to leave this executor; raise if the lease was lost.
+
+        Recovery takes an interrupted startup as unsent only while this was never recorded.
+        """
+        await self._write(
+            lambda: self._store.renew_starting_run(
+                self.run.id, now=self._now, lease_seconds=self._lease_seconds, dispatching=True
+            ),
+            renewing=True,
+        )
+
     async def finish(
         self,
         status: str,
@@ -214,11 +228,14 @@ class StartupLease:
         error: str | None = None,
         error_code: str | None = None,
         failure_stage: str | None = None,
+        retryable: bool = False,
     ) -> None:
         """Record prompt delivery or a known startup failure, with a live lease.
 
         ``succeeded`` is for a prompt delivered into a continued session, whose
-        run does not wait for the turn it joins.
+        run does not wait for the turn it joins. A ``failed`` startup is
+        *retryable* only when its prompt never reached the agent; the task's
+        retry settings then decide whether it runs again.
         """
         if status not in {"running", "succeeded", "failed", "skipped"}:
             raise ValueError(
@@ -234,6 +251,7 @@ class StartupLease:
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
+            retryable=retryable,
             committed=lambda _previous: self._log_startup_ended(
                 status, error_code=error_code, failure_stage=failure_stage, finished_at=finished_at
             ),
@@ -303,6 +321,7 @@ class StartupLease:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        retryable: bool = False,
         committed: Callable[[ScheduledTaskRun], None] | None = None,
     ) -> None:
         await self._write(
@@ -313,6 +332,7 @@ class StartupLease:
                 conversation_id=conversation_id,
                 error=error,
                 error_code=error_code,
+                retryable=retryable,
             ),
             committed=committed,
         )
@@ -379,9 +399,9 @@ class StartupLease:
 
 
 ClaimedFire = Callable[[ScheduledTask, StartupLease], Awaitable[None]]
-ReconcileStartup = Callable[
-    [ScheduledTaskRun], Awaitable[Literal["running", "succeeded", "failed"] | None]
-]
+# What recovery found; ``unsent`` is a failed startup whose prompt never reached the agent.
+RecoveryResult = Literal["running", "succeeded", "failed", "unsent"]
+ReconcileStartup = Callable[[ScheduledTaskRun], Awaitable[RecoveryResult | None]]
 # Receives host ownership keys and returns the subset this replica owns.
 OwnedHosts = Callable[[Sequence[str]], Awaitable[Collection[str]]]
 # Acts as the task's owner for the calls one startup or recovery makes.
@@ -393,6 +413,9 @@ PollInterval = Callable[[], float]
 # Given the current time, when a trigger automation's busy session should next be checked,
 # skipping this poll unrecorded; ``None`` polls now. Asked only for trigger automations.
 BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
+# Whether the session an automation continues is still busy with an earlier prompt. Asked
+# only for automations whose ``overlap_mode`` isn't ``allow`` and that have no unfinished run.
+SessionBusy = Callable[[ScheduledTask], Awaitable[bool]]
 
 # With a busy check, the server tries to poll a trigger automation this often instead of
 # following the trigger's saved schedule.
@@ -407,7 +430,7 @@ class FireIdentityRevoked(Exception):
     """
 
 
-_RECOVERY_RESULTS = ("running", "succeeded", "failed")
+_RECOVERY_RESULTS = ("running", "succeeded", "failed", "unsent")
 
 
 async def _owns_every_host(keys: Sequence[str]) -> Collection[str]:
@@ -459,6 +482,7 @@ class PersistentTaskScheduler:
         dispatch_enabled: DispatchEnabled = _always_enabled,
         poll_interval: PollInterval | None = None,
         busy_until: BusyUntil | None = None,
+        session_busy: SessionBusy | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -485,6 +509,7 @@ class PersistentTaskScheduler:
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
         self._busy_until = busy_until
+        self._session_busy = session_busy
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -612,10 +637,12 @@ class PersistentTaskScheduler:
             )
 
     async def _claim_pending(self) -> None:
-        """Start Run now requests whose host this replica owns, one page per poll.
+        """Start Run now requests, due retries and queued occurrences on this replica's hosts.
 
-        The cursor persists across polls and wraps at the end, so requests owned
-        by other replicas cost each poll at most one page.
+        One page per poll: the cursor persists across polls and wraps at the end, so
+        requests owned by other replicas cost each poll at most one page. A retry
+        stays pending until its ``scheduled_at``, and a queued occurrence while the
+        previous run is going.
         """
         if self._stopped or len(self._startups) >= self._max_startups:
             return
@@ -631,9 +658,16 @@ class PersistentTaskScheduler:
                 # Resume here next poll, so no request is skipped.
                 return
             self._pending_cursor = (run.workspace_id, run.id)
+            if run.scheduled_at > self._now():
+                continue
             try:
-                if host_ownership_key(run.workspace_id, run.host_id) in owned:
-                    await self._start_pending(run)
+                if host_ownership_key(run.workspace_id, run.host_id) not in owned:
+                    continue
+                waits, queued_task = False, None
+                if is_queued_trigger_key(run.trigger_key):
+                    waits, queued_task = await self._queued_run_waits(run)
+                if not waits:
+                    await self._start_pending(run, queued_task)
             except Exception:
                 _logger.exception(
                     "Could not start a requested run %s; will check it again on a later poll",
@@ -643,11 +677,17 @@ class PersistentTaskScheduler:
         if len(runs) < self._batch_size:
             self._pending_cursor = None
 
-    async def _start_pending(self, run: ScheduledTaskRun) -> None:
+    async def _start_pending(
+        self, run: ScheduledTaskRun, queued_task: ScheduledTask | None
+    ) -> None:
         now = int(self._now())
         with workspace_scope(run.workspace_id):
             claimed = await asyncio.to_thread(
-                self._store.claim_pending_run, run, now=now, lease_seconds=self._lease_seconds
+                self._store.claim_pending_run,
+                run,
+                now=now,
+                lease_seconds=self._lease_seconds,
+                queued_task=queued_task,
             )
         if claimed is None:
             return
@@ -748,6 +788,128 @@ class PersistentTaskScheduler:
         # A task that changed since it was listed is re-read on the next poll.
         return True
 
+    async def _defer_overlapping_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run: int | None, host_id: str | None
+    ) -> bool:
+        """Skip or queue a due occurrence while the automation's previous run is going.
+
+        Asked only for an automation whose ``overlap_mode`` is ``skip`` or ``queue``;
+        trigger automations have their own busy check. A ``queue`` task with an
+        occurrence already queued defers this one too, so the queued one starts first.
+        Returns True when this occurrence must not be claimed. A failed check returns
+        False, so the occurrence starts.
+        """
+        if (
+            task.overlap_mode not in ("skip", "queue")
+            or task.kind != "automation"
+            or is_trigger_automation(task)
+        ):
+            return False
+        queues = task.overlap_mode == "queue"
+        if next_run is None and not queues:
+            # Skipping the last occurrence would complete the task without running it.
+            return False
+        assert task.next_run_at is not None
+        try:
+            going: str | None = None
+            if queues:
+                with workspace_scope(task.workspace_id):
+                    if await asyncio.to_thread(self._store.has_queued_run, task):
+                        going = "queued"
+            going = going or await self._previous_run_going(task, now)
+        except Exception:
+            _logger.exception(
+                "Could not check whether task %s's previous run is still going; starting "
+                "this occurrence",
+                task.id,
+            )
+            return False
+        if going is None:
+            return False
+        with workspace_scope(task.workspace_id):
+            if queues:
+                run = await asyncio.to_thread(
+                    self._store.queue_overlapping_occurrence,
+                    task,
+                    now=now,
+                    next_run_at=next_run,
+                    host_id=host_id,
+                )
+            else:
+                assert next_run is not None
+                run = await asyncio.to_thread(
+                    self._store.skip_overlapping_occurrence,
+                    task,
+                    now=now,
+                    next_run_at=next_run,
+                    host_id=host_id,
+                    # A run can end before the skip is written, so the write checks it again.
+                    running_since=now - STALE_RUN_MAX_AGE_SECONDS if going == "run" else None,
+                )
+        if run is None:
+            # The task changed, its run just ended or only stale runs were in the way; the
+            # next poll decides again.
+            return True
+        queued = run.status == "scheduled"
+        _log_event(
+            _logger.info,
+            "%s occurrence %s of task %s: its previous run is still going",
+            "Queued" if queued else "Skipped",
+            task.next_run_at,
+            task.id,
+            extra=debug_event(
+                "scheduled_run_queued" if queued else "scheduled_run_skipped_overlap",
+                task_id=task.id,
+                task_workspace_id=task.workspace_id,
+                scheduled_at=task.next_run_at,
+                trigger_key=scheduled_trigger_key(task.next_run_at),
+                target=task.execution_target,
+                run_id=run.id,
+                error_code=run.error_code,
+            ),
+        )
+        return True
+
+    async def _previous_run_going(
+        self, task: ScheduledTask, now: int
+    ) -> Literal["run", "session"] | None:
+        """What keeps the task's previous run going: a run of it, or the session it continues."""
+        with workspace_scope(task.workspace_id):
+            if await asyncio.to_thread(
+                self._store.has_unfinished_run,
+                task.id,
+                running_since=now - STALE_RUN_MAX_AGE_SECONDS,
+            ):
+                return "run"
+            if self._session_busy is not None and await self._session_busy(task):
+                return "session"
+        return None
+
+    async def _queued_run_waits(self, run: ScheduledTaskRun) -> tuple[bool, ScheduledTask | None]:
+        """Whether a queued occurrence stays queued, and the task that decision was made on.
+
+        It waits while its task still queues and the previous run is going. A paused or
+        deleted task's queued run doesn't wait: the claim records it as skipped. One
+        whose task now allows overlap starts; a task moved to ``skip`` has none left,
+        since that edit skips it. A failed check starts it, as for an occurrence that
+        comes due.
+        """
+        with workspace_scope(run.workspace_id):
+            task = await asyncio.to_thread(self._store.get_run_task, run)
+        if (
+            task is None
+            or task.state not in ("active", "completed")
+            or task.overlap_mode != "queue"
+        ):
+            return False, task
+        try:
+            return await self._previous_run_going(task, int(self._now())) is not None, task
+        except Exception:
+            _logger.exception(
+                "Could not check whether queued run %s can start; starting it", run.id
+            )
+            return False, task
+
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
         try:
             if task.kind == "timer":
@@ -835,9 +997,11 @@ class PersistentTaskScheduler:
                                 if status not in _RECOVERY_RESULTS:
                                     raise ValueError(
                                         f"Invalid recovery result {status!r}. "
-                                        "Expected 'running', 'succeeded', 'failed', or None "
-                                        "to check again later."
+                                        "Expected 'running', 'succeeded', 'failed', 'unsent', "
+                                        "or None to check again later."
                                     )
+                                unsent = status == "unsent"
+                                status = "failed" if unsent else status
                                 transition = asyncio.ensure_future(
                                     asyncio.to_thread(
                                         self._store.transition_starting_run,
@@ -852,6 +1016,7 @@ class PersistentTaskScheduler:
                                         error_code="startup_expired"
                                         if status == "failed"
                                         else None,
+                                        retryable=unsent,
                                     )
                                 )
                                 # Logged on completion, even if this sweep times out first.
@@ -975,6 +1140,10 @@ class PersistentTaskScheduler:
                     # is always sent.
                     if next_run is not None and await self._skip_busy_occurrence(
                         task, now=now, next_run=next_run
+                    ):
+                        continue
+                    if await self._defer_overlapping_occurrence(
+                        task, now=now, next_run=next_run, host_id=host_id
                     ):
                         continue
                     with workspace_scope(task.workspace_id):

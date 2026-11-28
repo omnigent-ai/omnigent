@@ -26,6 +26,10 @@ reconciled the moment it would otherwise be shown:
   runs, so a future Tasks-list "last-run status" badge never shows a stale
   orphan as ``running``.
 
+The database scheduler's overlap check applies the same age check to a page of
+stale ``running`` runs it cannot read past (``_fail_stale_runs`` in the store),
+so a ``skip`` automation is not held up until someone reads its runs.
+
 This is a pure age check — NO conversation I/O on the read path. The idempotent,
 conditional :meth:`update_run` (``WHERE status = running``) means a run already
 terminal (via the event hook, a fire-time ``skipped``/``failed``, or a prior

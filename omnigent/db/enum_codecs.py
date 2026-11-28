@@ -131,6 +131,13 @@ SCHEDULED_TASK_SESSION_MODE: dict[str, int] = {
     "continue": 2,
 }
 
+# What a due occurrence does while the task's previous run is still going.
+SCHEDULED_TASK_OVERLAP_MODE: dict[str, int] = {
+    "allow": 1,
+    "skip": 2,
+    "queue": 3,
+}
+
 SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "scheduled": 1,
     "running": 2,
@@ -138,6 +145,19 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "failed": 4,
     "skipped": 5,
     "starting": 6,
+}
+
+# What started a run: the prefix of its trigger key, as a code an index can seek.
+SCHEDULED_TASK_RUN_TRIGGER_KIND: dict[str, int] = {
+    "schedule": 1,
+    "manual": 2,
+    "retry": 3,
+}
+
+# Whether a claimed run's prompt has left the executor that claimed it.
+SCHEDULED_TASK_RUN_PROMPT_DISPATCH: dict[str, int] = {
+    "not_started": 1,
+    "started": 2,
 }
 
 # Journal entry kinds. The column has no CHECK, so a new kind needs no migration.
@@ -387,6 +407,16 @@ def decode_scheduled_task_session_mode(code: int) -> str:
     return _decode(SCHEDULED_TASK_SESSION_MODE, code, field="scheduled_tasks.session_mode")
 
 
+def encode_scheduled_task_overlap_mode(name: str) -> int:
+    """Encode a ``scheduled_tasks.overlap_mode`` name to its int code."""
+    return _encode(SCHEDULED_TASK_OVERLAP_MODE, name, field="scheduled_tasks.overlap_mode")
+
+
+def decode_scheduled_task_overlap_mode(code: int) -> str:
+    """Decode a ``scheduled_tasks.overlap_mode`` int code to its name."""
+    return _decode(SCHEDULED_TASK_OVERLAP_MODE, code, field="scheduled_tasks.overlap_mode")
+
+
 def encode_scheduled_task_run_status(name: str) -> int:
     """Encode a ``scheduled_task_runs.status`` name to its int code."""
     return _encode(SCHEDULED_TASK_RUN_STATUS, name, field="scheduled_task_runs.status")
@@ -395,6 +425,30 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_scheduled_task_run_trigger_kind(name: str) -> int:
+    """Encode a ``scheduled_task_runs.trigger_kind`` name to its int code."""
+    return _encode(SCHEDULED_TASK_RUN_TRIGGER_KIND, name, field="scheduled_task_runs.trigger_kind")
+
+
+def decode_scheduled_task_run_trigger_kind(code: int) -> str:
+    """Decode a ``scheduled_task_runs.trigger_kind`` int code to its name."""
+    return _decode(SCHEDULED_TASK_RUN_TRIGGER_KIND, code, field="scheduled_task_runs.trigger_kind")
+
+
+def encode_scheduled_task_run_prompt_dispatch(name: str) -> int:
+    """Encode a ``scheduled_task_runs.prompt_dispatch`` name to its int code."""
+    return _encode(
+        SCHEDULED_TASK_RUN_PROMPT_DISPATCH, name, field="scheduled_task_runs.prompt_dispatch"
+    )
+
+
+def decode_scheduled_task_run_prompt_dispatch(code: int) -> str:
+    """Decode a ``scheduled_task_runs.prompt_dispatch`` int code to its name."""
+    return _decode(
+        SCHEDULED_TASK_RUN_PROMPT_DISPATCH, code, field="scheduled_task_runs.prompt_dispatch"
+    )
 
 
 def encode_journal_entry_kind(name: str) -> int:
