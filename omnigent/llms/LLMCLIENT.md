@@ -35,6 +35,16 @@ for event in client.responses.create(..., stream=True):
 
 Model strings use `"provider/model-name"` format. If no provider prefix is given, defaults to `"openai"`.
 
+Set `max_output_tokens` to pass an explicit output budget through the Responses
+interface. The client translates it to the selected adapter's Chat Completions
+parameter when necessary. Legacy `max_tokens` and `max_completion_tokens` are
+also accepted and translated for OpenAI's native Responses endpoint. Conflicting
+values are rejected before sending; equal aliases retain the requested limit.
+Every supplied non-`None` budget must be a positive integer, excluding booleans;
+zero, negative, fractional, and non-integer values are rejected locally. `None`
+continues to mean unspecified, including for legacy aliases.
+The client does not increase the limit or guarantee that a reply will fit in it.
+
 ---
 
 ## Architecture
