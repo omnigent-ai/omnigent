@@ -797,7 +797,7 @@ export function usePullRequestListEntries(
       }
       const info = infoByUrl.get(association.url);
       const editable = canEdit && info ? offeredEditCapabilities(info, editsServed) : null;
-      if (!readOnly && editsServed.reviewers && requestReviewOffered(entry.editCapabilities)) {
+      if (changesHere && editsServed.reviewers && requestReviewOffered(entry.editCapabilities)) {
         actions.splice(firstCopyAt(), 0, {
           id: "request-review",
           section: "review",
@@ -809,7 +809,7 @@ export function usePullRequestListEntries(
           run: openAt("reviewers"),
         });
       }
-      if (editable?.labels && !readOnly) {
+      if (editable?.labels && changesHere) {
         actions.splice(firstCopyAt(), 0, {
           id: EDIT_LABELS_ACTION_ID,
           section: "review",

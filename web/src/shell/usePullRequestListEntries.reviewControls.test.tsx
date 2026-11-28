@@ -70,6 +70,8 @@ interface RowTarget {
   /** The host's account for the PR, and who the PR asks for a review. */
   hostLogin?: string;
   requested?: string[];
+  /** A sub-agent that links the PR: the row reads through that session, not this list. */
+  linkedBy?: { id: string; name: string };
 }
 const SCOPE = "pull-requests-page";
 
@@ -81,7 +83,7 @@ function rowFor(
   PR = target.url;
   const onSelect = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, enabled: false } } });
-  client.setQueryData(["pr-page-github-info", SCOPE, PR], {
+  const info = {
     object: "session.github.info",
     ...(target.provider ? { provider: target.provider } : {}),
     available: true,
@@ -105,7 +107,10 @@ function rowFor(
       head_sha: "a".repeat(40),
       checks: { passing: 0, failing: 0, pending: 0, total: 0, runs: [] },
     },
-  });
+  };
+  client.setQueryData(["pr-page-github-info", SCOPE, PR], info);
+  // A sub-agent's row reads the PR through the sub-agent's session.
+  if (target.linkedBy) client.setQueryData(["pr-page-github-info", target.linkedBy.id, PR], info);
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
       <SidebarDataProvider>
@@ -123,6 +128,9 @@ function rowFor(
     number: 7,
     relationship: "created",
   } as unknown as PullRequestAssociation;
+  const sessionSources = target.linkedBy
+    ? new Map([[PR, { session: target.linkedBy, alsoIn: [] }]])
+    : undefined;
   const { result } = renderHook(
     () =>
       usePullRequestListEntries(
@@ -130,6 +138,7 @@ function rowFor(
           conversationId: SCOPE,
           active: false,
           associations: [association],
+          sessionSources,
           hostOffline: false,
           sandboxAsleep: false,
           onSelect,
@@ -215,6 +224,18 @@ describe("a row's Request Review… and Edit Labels…", () => {
     const readOnly = rowFor("OPEN");
     expect(readOnly.action("edit-labels")).toBeUndefined();
     expect(readOnly.action("request-review")).toBeUndefined();
+    // A sub-agent's row reads through its session, which this list can't change the PR through.
+    shell.canEdit = true;
+    const subAgent = rowFor("OPEN", undefined, {
+      url: GITHUB_PR,
+      linkedBy: { id: "conv_child", name: "auth-fix" },
+    });
+    expect(subAgent.action("edit-labels")).toBeUndefined();
+    expect(subAgent.action("request-review")).toBeUndefined();
+    expect(subAgent.commands.find((command) => command.id === `edit-labels:${PR}`)).toBeUndefined();
+    expect(
+      subAgent.commands.find((command) => command.id === `request-review:${PR}`),
+    ).toBeUndefined();
   });
 
   it.each([
