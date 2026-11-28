@@ -1,14 +1,35 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { MOBILE_BREAKPOINT_PX as MD_BREAKPOINT } from "@/hooks/useIsMobileViewport";
-import { keepsDesktopLayout } from "@/lib/desktopAppLayout";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 import {
-  readPanelSizePreference,
-  writePanelSizePreference,
-  type PanelSizePreferenceKey,
-} from "@/lib/panelSizePreferences";
+  arrowResizeDelta,
+  createPersistedWidthStore,
+  useResizableWidthSnapshot,
+} from "@/hooks/resizableWidthStore";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
+import type { PanelSizePreferenceKey } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
+const PAINTED_HANDLE_WIDTH_PX = 4;
+export const HANDLE_OUTWARD_SLIVER_PX = 6;
+export const HANDLE_INWARD_SLIVER_PX = 8;
+export const HANDLE_COARSE_GUTTER_PX = 12;
+export const HANDLE_FINE_GUTTER_PX = 10;
+
+function handleGutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? HANDLE_COARSE_GUTTER_PX : HANDLE_FINE_GUTTER_PX;
+  const inset = (gutter - PAINTED_HANDLE_WIDTH_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingInlineStart: HANDLE_OUTWARD_SLIVER_PX + inset,
+    paddingInlineEnd: HANDLE_INWARD_SLIVER_PX + inset,
+    marginInlineStart: -HANDLE_OUTWARD_SLIVER_PX,
+    marginInlineEnd: -HANDLE_INWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
+}
 
 /** Clamp a width value to the allowed range for the current viewport. */
 function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
@@ -29,82 +50,27 @@ function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
 // for no reason. A panel outside that group passes its own storage key.
 // `null` means "not yet set — fall back to the caller's default (vw-based)".
 // The first drag persists a px value.
-interface WidthStore {
-  /**
-   * The persisted user choice. It diverges from `current` after a viewport-shrink
-   * clamp, so the resize handler can restore the larger choice when space returns
-   * without reading localStorage on every resize event.
-   */
-  preferred: number | null;
-  /** The effective (viewport-clamped) width that drives layout. */
-  current: number | null;
-  listeners: Set<() => void>;
-  subscribe: (listener: () => void) => () => void;
-  getSnapshot: () => number | null;
-}
+type PersistedWidthStore = ReturnType<typeof createPersistedWidthStore>;
 
-const widthStores = new Map<PanelSizePreferenceKey, WidthStore>();
+const widthStores = new Map<PanelSizePreferenceKey, PersistedWidthStore>();
 
-function widthStore(key: PanelSizePreferenceKey): WidthStore {
+function widthStoreFor(key: PanelSizePreferenceKey): PersistedWidthStore {
   const existing = widthStores.get(key);
   if (existing) return existing;
-  const preferred = readPanelSizePreference(key);
-  const store: WidthStore = {
-    preferred,
-    current: preferred,
-    listeners: new Set(),
-    subscribe: (listener) => {
-      store.listeners.add(listener);
-      return () => {
-        store.listeners.delete(listener);
-      };
-    },
-    getSnapshot: () => store.current,
-  };
+  const store = createPersistedWidthStore(key);
   widthStores.set(key, store);
   return store;
-}
-
-function persistWidth(key: PanelSizePreferenceKey, value: number | null) {
-  widthStore(key).preferred = value;
-  writePanelSizePreference(key, value);
-}
-
-function setWidthRaw(key: PanelSizePreferenceKey, value: number | null, persist = false) {
-  const store = widthStore(key);
-  if (value === store.current) return;
-  store.current = value;
-  if (persist) persistWidth(key, value);
-  for (const listener of store.listeners) listener();
-}
-
-function setWidth(
-  key: PanelSizePreferenceKey,
-  next: number | null | ((prev: number | null) => number | null),
-  persist = false,
-) {
-  setWidthRaw(key, typeof next === "function" ? next(widthStore(key).current) : next, persist);
-}
-
-/** Snapshot the current width to storage (called once at drag end). */
-function persistCurrentWidth(key: PanelSizePreferenceKey) {
-  persistWidth(key, widthStore(key).current);
-}
-
-function getServerWidthSnapshot(): number | null {
-  return null;
 }
 
 /** Reset module-level width state from localStorage. Only for tests. */
 export function resetSharedWidthStoreForTesting(): void {
   for (const key of new Set<PanelSizePreferenceKey>(["pushPanelWidthPx", ...widthStores.keys()])) {
-    widthStore(key).preferred = readPanelSizePreference(key);
-    setWidthRaw(key, widthStore(key).preferred);
+    widthStoreFor(key).resetForTesting();
   }
 }
 
 /**
- * Hook for making a right-side panel resizable via mouse drag on its left edge.
+ * Hook for making a right-side panel resizable via pointer drag on its left edge.
  *
  * On desktop (`≥ md`) the panel width is controlled via an inline style
  * driven by drag state. On mobile (`< md`) the panel is a full-screen
@@ -124,28 +90,18 @@ export function useResizablePanel(
   minWidthPx = MIN_WIDTH_PX,
   storageKey: PanelSizePreferenceKey = "pushPanelWidthPx",
 ) {
-  const store = widthStore(storageKey);
-  const width = useSyncExternalStore(store.subscribe, store.getSnapshot, getServerWidthSnapshot);
-  const storageKeyRef = useRef(storageKey);
-  storageKeyRef.current = storageKey;
-  const dragging = useRef(false);
+  const { anyCoarse } = useInputCapabilities();
+  // Desktop layout (`md`+, or any width in the desktop app): only there does
+  // the panel take an inline width and a drag handle.
+  const mobileViewport = useIsMobileViewport();
+  const isDesktop = typeof window !== "undefined" && !mobileViewport;
+  const widthStore = widthStoreFor(storageKey);
+  const widthStoreRef = useRef(widthStore);
+  widthStoreRef.current = widthStore;
+  const width = useResizableWidthSnapshot(widthStore);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
-
-  // Track whether we're on desktop — only apply inline width there.
-  const [isDesktop, setIsDesktop] = useState(
-    () =>
-      typeof window !== "undefined" && (keepsDesktopLayout() || window.innerWidth >= MD_BREAKPOINT),
-  );
-
-  useEffect(() => {
-    // The desktop app keeps the desktop layout at every window width.
-    if (keepsDesktopLayout()) return;
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, []);
+  const [, bumpViewport] = useReducer((version: number) => version + 1, 0);
 
   // Re-clamp the stored width when the viewport resizes so a width
   // that was valid on a wider monitor doesn't push content off-screen
@@ -155,11 +111,12 @@ export function useResizablePanel(
       // Re-derive the effective width from the persisted preference (not the
       // possibly-already-clamped live value) so widening the viewport restores
       // the user's larger choice instead of sticking at the prior clamp.
-      const key = storageKeyRef.current;
-      setWidth(key, (prev) => {
-        const base = widthStore(key).preferred ?? prev;
+      const store = widthStoreRef.current;
+      store.set((prev) => {
+        const base = store.getPreferred() ?? prev;
         return base !== null ? clampWidth(base, minWidthRef.current) : prev;
       });
+      bumpViewport();
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -168,11 +125,11 @@ export function useResizablePanel(
   // When the minimum width increases (e.g. comments panel opens), ensure
   // the current shared width is at least the new minimum.
   useEffect(() => {
-    setWidth(storageKey, (prev) => {
+    widthStore.set((prev) => {
       if (prev !== null && prev < minWidthPx) return clampWidth(prev, minWidthPx);
       return prev;
     });
-  }, [minWidthPx, storageKey]);
+  }, [minWidthPx, widthStore]);
 
   // Initialise from viewport on first open (or if never set), respecting the minimum.
   const resolvedWidth = clampWidth(
@@ -180,74 +137,33 @@ export function useResizablePanel(
     minWidthPx,
   );
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      if (!open || !isDesktop) return;
-      e.preventDefault();
-      dragging.current = true;
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-    },
-    [open, isDesktop],
-  );
+  const resizeDrag = useResizeDrag({
+    enabled: open && isDesktop,
+    overlay: true,
+    onStart: widthStore.beginDrag,
+    onCancel: () => widthStore.rollbackDrag((w) => clampWidth(w, minWidthRef.current)),
+    onCommit: widthStore.persist,
+    onMove: useCallback(
+      (e: React.PointerEvent<HTMLElement>) => {
+        widthStore.set(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
+      },
+      [widthStore],
+    ),
+  });
 
   // Keyboard resize: left/right arrow keys adjust width by 20px.
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!open || !isDesktop) return;
-      const step = 20;
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        setWidth(
-          storageKey,
-          (prev) => clampWidth((prev ?? resolvedWidth) + step, minWidthRef.current),
-          true,
-        );
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        setWidth(
-          storageKey,
-          (prev) => clampWidth((prev ?? resolvedWidth) - step, minWidthRef.current),
-          true,
-        );
-      }
-    },
-    [open, isDesktop, resolvedWidth, storageKey],
-  );
-
-  useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current) return;
-      // Update the live width only; persisting on every move would fire a
-      // synchronous localStorage write per mousemove. We snapshot once on release.
-      setWidth(
-        storageKeyRef.current,
-        clampWidth(window.innerWidth - e.clientX, minWidthRef.current),
+      const delta = arrowResizeDelta(e, "ArrowLeft");
+      if (delta === null) return;
+      widthStore.set(
+        (prev) => clampWidth((prev ?? resolvedWidth) + delta, minWidthRef.current),
+        true,
       );
-    }
-
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      persistCurrentWidth(storageKeyRef.current);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      // Reset body styles if unmounted mid-drag (e.g. panel closed
-      // via Escape while dragging).
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-    };
-  }, []);
+    },
+    [open, isDesktop, resolvedWidth, widthStore],
+  );
 
   // On mobile the panel is a fixed full-screen overlay — no inline width.
   const panelWidth = isDesktop ? (open ? resolvedWidth : 0) : undefined;
@@ -257,11 +173,18 @@ export function useResizablePanel(
     panelWidth,
     /** Props to spread onto the resize handle element. */
     handleProps: {
-      onMouseDown,
+      ...resizeDrag.handleProps,
       onKeyDown,
+      style: handleGutterStyle(anyCoarse),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
+      "aria-valuenow": resolvedWidth,
+      "aria-valuemin": minWidthPx,
+      "aria-valuemax":
+        typeof window === "undefined"
+          ? resolvedWidth
+          : Math.max(minWidthPx, window.innerWidth * MAX_WIDTH_RATIO),
       tabIndex: 0,
     },
     /** Whether the resize handle should be visible (desktop only). */

@@ -432,6 +432,7 @@ import {
 } from "@/store/sessionTasksActions";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -4239,8 +4240,9 @@ describe("Right workspace card visibility", () => {
         expect(rightSidebarWindow.reset).toHaveBeenCalledOnce();
 
         fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
-        // The shell gets the remembered width, not the width clamped to this narrow window.
-        expect(rightSidebarWindow.opened).toHaveBeenCalledExactlyOnceWith(450);
+        // The shell gets the remembered width, not the width clamped to this narrow window,
+        // plus the 10px resize gutter that opens with the panel.
+        expect(rightSidebarWindow.opened).toHaveBeenCalledExactlyOnceWith(460);
         fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
         expect(rightSidebarWindow.closed).toHaveBeenCalledOnce();
         fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
@@ -4257,7 +4259,7 @@ describe("Right workspace card visibility", () => {
         if (!nextOpen) {
           fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
           expect(rightSidebarWindow.opened).toHaveBeenCalledTimes(3);
-          expect(rightSidebarWindow.opened).toHaveBeenLastCalledWith(520);
+          expect(rightSidebarWindow.opened).toHaveBeenLastCalledWith(530);
         }
         fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
         expect(rightSidebarWindow.closed).toHaveBeenCalledTimes(2);
@@ -4486,6 +4488,71 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+  });
+
+  it("aborts an active resize when the workspace panel closes", () => {
+    onTestFinished(stubMatchMedia({ width: 1440 }));
+    vi.stubGlobal("innerWidth", 1440);
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_drag_close", permission_level: null }]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_drag_close",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_drag_close");
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    Object.assign(separator, {
+      setPointerCapture: vi.fn(),
+      hasPointerCapture: () => true,
+      releasePointerCapture: vi.fn(),
+    });
+
+    fireEvent.pointerDown(separator, { pointerId: 9, pointerType: "touch", button: 0 });
+    fireEvent.pointerMove(separator, { pointerId: 9, pointerType: "touch", clientX: 1200 });
+
+    expect(document.body.style.cursor).toBe("col-resize");
+    expect(document.body.style.userSelect).toBe("none");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(false);
+    expect(readSessionWorkspaceState("conv_drag_close").widthPx).toBeUndefined();
   });
 
   it("keeps the pane mounted and transitions its width target to zero", () => {

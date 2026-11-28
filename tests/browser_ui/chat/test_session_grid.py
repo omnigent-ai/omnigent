@@ -365,13 +365,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert header.evaluate("node => !!node.closest('[inert]')")
         page.screenshot(path=str(artifacts / "workspace-maximized-in-grid.png"))
         first_workspace.get_by_role("button", name="Exit full screen", exact=True).click()
-        workspace.get_by_role("separator").focus()
+        # The resize gutter is the flex sibling just before the workspace <aside>.
+        separator = workspace.locator("xpath=preceding-sibling::*[@role='separator'][1]")
+        separator.focus()
         before_width = workspace.bounding_box()["width"]
         page.keyboard.press("ArrowLeft")
         saved_width = workspace.bounding_box()["width"]
         assert saved_width > before_width
         # Pointer resizing and a click in the composer also retain the grid's width.
-        handle_box = workspace.get_by_role("separator").bounding_box()
+        handle_box = separator.bounding_box()
         assert handle_box
         page.mouse.move(handle_box["x"] + 2, handle_box["y"] + 100)
         page.mouse.down()

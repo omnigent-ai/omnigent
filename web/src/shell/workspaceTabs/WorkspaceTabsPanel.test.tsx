@@ -398,14 +398,14 @@ describe("the gutter beside floating panes", () => {
 
   it("drags the docked rail from a band beside it, placed by the rail's width", () => {
     floatingPanes.on = true;
-    const onMouseDown = vi.fn();
+    const onPointerDown = vi.fn();
     renderPanels([
-      { conversationId: "conv_a", open: true, handleProps: { tabIndex: 0, onMouseDown } },
+      { conversationId: "conv_a", open: true, handleProps: { tabIndex: 0, onPointerDown } },
     ]);
     expect(rail().nextElementSibling).toBe(gutter());
     expect(gutter()!.style.right).toBe("355px");
-    fireEvent.mouseDown(gutter()!);
-    expect(onMouseDown).toHaveBeenCalledTimes(1);
+    fireEvent.pointerDown(gutter()!);
+    expect(onPointerDown).toHaveBeenCalledTimes(1);
   });
 
   it.each([

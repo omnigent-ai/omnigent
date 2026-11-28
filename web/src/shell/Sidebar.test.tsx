@@ -286,11 +286,14 @@ function renderSidebar(
   open = true,
   initialEntry = "/",
   onOpenSearch?: () => void,
-  info?: ServerInfo,
+  infoOrPeek?: ServerInfo | boolean,
   extensions: ExtensionCatalogItem[] = [],
   onClose = vi.fn(),
   config: SidebarConfig = sidebarConfig,
+  explicitPeek = false,
 ) {
+  const info = typeof infoOrPeek === "boolean" ? undefined : infoOrPeek;
+  const peek = typeof infoOrPeek === "boolean" ? infoOrPeek : explicitPeek;
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const tree = () => (
     <QueryClientProvider client={qc}>
@@ -299,7 +302,7 @@ function renderSidebar(
           <ExtensionCatalogProvider extensions={extensions}>
             <TooltipProvider>
               <MemoryRouter initialEntries={[initialEntry]}>
-                <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />
+                <Sidebar open={open} peek={peek} onClose={onClose} onOpenSearch={onOpenSearch} />
               </MemoryRouter>
             </TooltipProvider>
           </ExtensionCatalogProvider>
@@ -477,6 +480,89 @@ describe("Sidebar scroll divider", () => {
 
     fireEvent.click(screen.getByRole("link", { name: /back/i }));
     expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-0");
+  });
+});
+
+describe("Sidebar resize handle geometry", () => {
+  it("positions the seam handle outside flex layout and the clipped content", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const sidebar = screen.getByLabelText("Conversations");
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    const clippedContent = screen.getByTestId("sidebar-clipped-content");
+
+    expect(handle.parentElement).toBe(sidebar);
+    expect(clippedContent.parentElement).toBe(sidebar);
+    expect(sidebar).toHaveClass("flex-col");
+    expect(sidebar).not.toHaveClass("md:flex-row");
+    expect(sidebar).not.toHaveClass("md:overflow-hidden");
+    expect(clippedContent).toHaveClass("md:overflow-hidden");
+    expect(handle).toHaveClass("md:absolute", "md:inset-y-0");
+    expect(handle).not.toHaveClass("shrink-0", "md:order-2");
+    expect(clippedContent).not.toHaveClass("md:order-1");
+  });
+
+  it("anchors the hit box at the seam without reserving flex space", () => {
+    mockConversations([conv("edge-session", "Claude Code")]);
+    renderSidebar();
+
+    // Effective offsets, not class names: the border box's right edge sits at
+    // seam + |insetInlineEnd|, so the hit box spans
+    // [seam − inward reach, seam + outward reach] with the 4px painted strip
+    // flush at the seam (outward reach − end padding = 0). Margins must stay
+    // absent — on an absolutely positioned right-anchored box a negative
+    // marginInlineStart is absorbed by the auto left inset and shifts the
+    // whole box inward over the rows' hover kebab.
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle.style.paddingInlineStart).toBe("5px");
+    expect(handle.style.paddingInlineEnd).toBe("11px");
+    expect(handle.style.insetInlineEnd).toBe("-11px");
+    expect(handle.style.marginInlineStart).toBe("");
+    expect(handle.style.marginInlineEnd).toBe("");
+    const outwardReach = -Number.parseFloat(handle.style.insetInlineEnd);
+    const boxWidth =
+      Number.parseFloat(handle.style.paddingInlineStart) +
+      4 +
+      Number.parseFloat(handle.style.paddingInlineEnd);
+    expect(outwardReach).toBeLessThanOrEqual(11);
+    expect(boxWidth - outwardReach).toBeLessThanOrEqual(9); // inward reach clears the kebab
+    expect(outwardReach - Number.parseFloat(handle.style.paddingInlineEnd)).toBe(0);
+    expect(handle).toHaveClass("md:absolute");
+    expect(handle).not.toHaveClass("md:right-0");
+    expect(screen.getByText("edge-session")).not.toBe(handle);
+  });
+
+  it("keeps the painted separator strip unchanged", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle).toHaveClass(
+      "z-10",
+      "hidden",
+      "w-1",
+      "cursor-col-resize",
+      "transition-colors",
+      "hover:bg-primary/30",
+      "active:bg-primary/50",
+      "data-dragging:bg-primary/50",
+      "md:absolute",
+      "md:inset-y-0",
+      "md:block",
+    );
+    expect(handle).not.toHaveClass("absolute", "inset-y-0", "right-0");
+    expect(handle.style.width).toBe("");
+    expect(handle.style.backgroundClip).toBe("content-box");
+  });
+
+  it("restores desktop overflow clipping for the rounded peek card", () => {
+    mockConversations([]);
+    renderSidebar(false, "/", undefined, true);
+
+    const sidebar = screen.getByLabelText("Conversations");
+    expect(sidebar).toHaveClass("is-peek", "rounded-xl", "md:overflow-hidden");
+    expect(screen.queryByTestId("sidebar-resize-handle")).toBeNull();
   });
 });
 
@@ -4127,6 +4213,35 @@ describe("Sidebar collapsed project marker", () => {
     );
   });
 
+  it("keeps the marker hidden while an open project menu is outside the header", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    const trigger = screen.getByRole("button", { name: "Project actions for Customer X" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    await screen.findByTestId("rename-project");
+
+    fireEvent.pointerLeave(header.closest("section")!);
+    fireEvent.blur(trigger);
+    expect(trigger).toHaveAttribute("data-state", "open");
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    const markerGroup = slot.closest<HTMLElement>('[class~="group/header"]');
+    const triggerGroup = trigger.closest<HTMLElement>('[class~="group/header"]');
+    expect(markerGroup).not.toBeNull();
+    expect(triggerGroup).toBe(markerGroup);
+    expect(markerGroup).toHaveClass("group/header");
+    expect(markerGroup).toContainElement(trigger);
+    expect(markerGroup).toContainElement(slot);
+    expect(slot).toHaveClass("md:group-has-[[data-state=open]]/header:opacity-0");
+  });
+
   // The "awaiting" pill is wider than the dot markers; constraining it to the
   // size-6 box would clip its "Needs response" label, so it keeps its natural
   // width.
@@ -4449,10 +4564,10 @@ describe("Sidebar open/close motion", () => {
     expect(aside).toHaveAttribute("data-sidebar-motion");
     expect(aside).toHaveClass("md:transition-[width,opacity]");
 
-    fireEvent.mouseDown(screen.getByRole("separator", { name: "Resize sidebar" }));
+    fireEvent.pointerDown(screen.getByRole("separator", { name: "Resize sidebar" }));
     expect(aside).not.toHaveAttribute("data-sidebar-motion");
     expect(aside).not.toHaveClass("md:transition-[width,opacity]");
-    fireEvent.mouseUp(window);
+    fireEvent.pointerUp(document);
     expect(aside).toHaveAttribute("data-sidebar-motion");
   });
 });

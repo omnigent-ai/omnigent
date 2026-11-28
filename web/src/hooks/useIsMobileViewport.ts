@@ -19,7 +19,12 @@ const DESKTOP_VIEWPORT_QUERY = `(min-width: ${MOBILE_BREAKPOINT_PX}px)`;
 // with the `max-md:` / `md:` classes already used across the shell.
 const MOBILE_QUERY = `(max-width: ${MOBILE_BREAKPOINT_PX - 0.02}px)`;
 
-function subscribe(callback: () => void): () => void {
+/**
+ * Subscribe to `md` breakpoint crossings (the `useSyncExternalStore` subscribe
+ * shape). Event handlers that must react to a crossing, such as cancelling a
+ * resize drag whose handle just hid, re-read {@link isDesktopLayout} in the callback.
+ */
+export function subscribeMobileViewport(callback: () => void): () => void {
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
   const mql = window.matchMedia(MOBILE_QUERY);
   mql.addEventListener("change", callback);
@@ -55,6 +60,20 @@ export const DesktopWindowContext = createContext(false);
  */
 export function useIsMobileViewport(): boolean {
   const desktopWindow = useContext(DesktopWindowContext);
-  const narrow = useSyncExternalStore(subscribe, getSnapshot, () => false);
+  const narrow = useSyncExternalStore(subscribeMobileViewport, getSnapshot, () => false);
   return narrow && !desktopWindow;
+}
+
+declare global {
+  interface Window {
+    /** Layout signal consumed by native shells (see publication below). */
+    __omnigentIsMobileViewport?: () => boolean;
+  }
+}
+
+// Native shells (e.g. the Android back handler in NativeBridgeScript.kt)
+// consume the web layer's layout signal instead of re-deriving it from their
+// own copy of the breakpoint literal.
+if (typeof window !== "undefined") {
+  window["__omnigentIsMobileViewport"] = () => !isDesktopLayout();
 }

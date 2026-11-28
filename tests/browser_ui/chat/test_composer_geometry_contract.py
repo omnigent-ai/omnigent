@@ -829,7 +829,8 @@ def test_chat_width_scales_while_prose_remains_readable(
         workspace.evaluate(
             "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
         )
-        handle = box(workspace.get_by_label("Resize panel"))
+        # The gutter is a flex sibling of the workspace <aside>, not a child.
+        handle = box(page.get_by_role("separator", name="Resize panel"))
         pane = box(page.locator('[class~="@container/chat"]'))
         x, y = handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2
         page.mouse.move(x, y)
@@ -1502,7 +1503,8 @@ def test_panel_resize_does_not_summon_a_ghost_scrollbar(
         "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
     )
     before = _fully_visible_state(page)
-    handle = box(workspace.get_by_label("Resize panel"))
+    # The gutter is a flex sibling of the workspace <aside>, not a child.
+    handle = box(page.get_by_role("separator", name="Resize panel"))
     x, y = handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2
     violations = []
     page.mouse.move(x, y)

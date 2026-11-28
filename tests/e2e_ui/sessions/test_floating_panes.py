@@ -379,10 +379,11 @@ def test_the_desktop_app_floats_the_panes_from_48rem_too(
     expect(page.locator("html")).to_have_attribute("data-desktop-app", "true")
     assert (page.evaluate(_CHAT_RADIUS_JS) != "0px") is floats
     # The left sidebar's resize edge: its 4px bar edge to edge, a band across the gap where
-    # the panes float.
+    # the panes float. The hit box pads it with a 5px inward and an 11px outward sliver (fine
+    # pointer), so a touch or a loose click still lands on it.
     edge = page.get_by_role("separator", name="Resize sidebar").bounding_box()
     assert edge is not None
-    assert edge["width"] == (10 if floats else 4), edge
+    assert edge["width"] == (10 if floats else 4) + 16, edge
 
 
 _GRID_WORKSPACE_STYLE_JS = """() => {

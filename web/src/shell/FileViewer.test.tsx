@@ -497,6 +497,20 @@ function clearIOSViewport(): void {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+describe("FileViewer resize handle geometry", () => {
+  it("renders the handle as the panel's unclipped boundary sibling", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true });
+    const handle = screen.getByRole("separator", { name: "Resize panel" });
+    const panel = screen.getByTestId("file-viewer");
+
+    expect(handle.nextElementSibling).toBe(panel);
+    expect(panel.contains(handle)).toBe(false);
+    expect(handle.closest(".overflow-hidden, .overflow-auto, .overflow-y-auto")).toBeNull();
+    expect(handle.className).toMatch(/\bz-10\b/);
+  });
+});
+
 describe("FileViewer render failures", () => {
   it.each(["retry", "source", "another file"])(
     "contains a preview crash and recovers through %s",

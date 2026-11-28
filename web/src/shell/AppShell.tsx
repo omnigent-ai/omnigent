@@ -1296,19 +1296,6 @@ function AppShellImpl() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
-  const {
-    panelWidth: inlinePanelWidth,
-    widthInWiderWindow: inlinePanelWidthInWiderWindow,
-    preferredContentWidth: preferredConversationWidth,
-    handleProps: inlinePanelHandleProps,
-    isDragging: inlinePanelResizing,
-  } = useResizableInlinePanel(
-    rootSessionId,
-    inlinePanelMinWidth,
-    (sidebarOpen ? sidebarWidth : 0) + (canvasMode ? canvasReservedWidth : 0),
-    rootSessionResolved,
-    canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
-  );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -1358,10 +1345,6 @@ function AppShellImpl() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
-  rightSidebarWindowRef.current = {
-    canShow: Boolean(conversationId) && hasRailContent,
-    width: inlinePanelWidthInWiderWindow,
-  };
   const initialWorkspaceTab = readInitialWorkspaceTab();
   const fallbackWorkspaceTab =
     initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
@@ -3454,6 +3437,24 @@ function AppShellImpl() {
     focusWorkspaceTabsOnOpenRef.current = false;
     focusWorkspaceTabs();
   }, [workspacePanelVisible, focusWorkspaceTabs]);
+  const {
+    panelWidth: inlinePanelWidth,
+    widthInWiderWindow: inlinePanelWidthInWiderWindow,
+    preferredContentWidth: preferredConversationWidth,
+    handleProps: inlinePanelHandleProps,
+    isDragging: inlinePanelResizing,
+  } = useResizableInlinePanel(
+    rootSessionId,
+    inlinePanelMinWidth,
+    (sidebarOpen ? sidebarWidth : 0) + (canvasMode ? canvasReservedWidth : 0),
+    workspacePanelVisible && !mobileViewport,
+    rootSessionResolved,
+    canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
+  );
+  rightSidebarWindowRef.current = {
+    canShow: Boolean(conversationId) && hasRailContent,
+    width: inlinePanelWidthInWiderWindow,
+  };
 
   return (
     <AppShellRootProviders
