@@ -46,7 +46,10 @@ conv_*
 # from overlaying the container's.
 loadtest/
 demos/
+# scripts/ stays out of the image except the uninstall script, which
+# setup.py's _bundle_scripts requires (the build aborts without it).
 scripts/
+!scripts/uninstall_oss.sh
 dev/
 designs/
 skills/
