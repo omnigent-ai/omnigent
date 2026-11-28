@@ -15,6 +15,7 @@ from omnigent.runner import (
     github_images,
     github_lifecycle,
     github_merge_queue,
+    github_native_stack,
     github_reviews,
     github_stack,
     pr_resource,
@@ -384,6 +385,13 @@ def get_pull_request_stack(
 ) -> dict[str, Any]:
     """The stack around the pull request, found through its branches."""
     return github_stack.pull_request_stack(root, _target(session_id, pr_url))
+
+
+def get_pull_request_native_stack(
+    root: str, *, session_id: str | None, pr_url: str | None
+) -> dict[str, Any]:
+    """GitHub's own record of the stack the pull request is in, where its host has one."""
+    return github_native_stack.pull_request_native_stack(root, _target(session_id, pr_url))
 
 
 def set_pull_request_state(

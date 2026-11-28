@@ -329,6 +329,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
   alwaysSteer: false,
+  quickPick: false,
   contentSearch: true,
   grids: true,
   splitTerminal: true,

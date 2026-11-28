@@ -1,5 +1,5 @@
 // How wide a review's changed-files tree may be. It keeps its share of the review as the
-// panel widens, within pixel limits, and never takes more than about half of it.
+// panel widens, and never takes more than about half of it.
 
 import type { PaneWidthSpec } from "@/hooks/useRememberedPaneWidth";
 
@@ -26,6 +26,8 @@ const REVIEW_TREE_LIMITS = {
   label: "Resize changed files",
   keyboardStep: 12,
   largeKeyboardStep: 32,
+  // The tree docks at the review's right, so its handle is its left edge.
+  anchor: "right",
 } as const;
 
 /** The tree beside a session's Changes review. */
@@ -40,6 +42,8 @@ export const CHANGES_REVIEW_TREE_WIDTH: PaneWidthSpec = {
   defaultWidth: 228,
   minWidth: 180,
   maxWidth: 360,
+  // A review gone full screen widens the tree in proportion, as the Files tree does.
+  growsWithRoom: true,
 };
 
 /** The tree beside a pull request's Changes, and its commits' and stack's reviews. */

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import codecs
 import contextlib
 import errno
 import os
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
+from ._bounded_output import DEFAULT_OUTPUT_CHARS, BoundedPipeCapture, CapturedOutput
 from ._bwrap_request_init import _ADMIT, _EXIT, _READY, _validate_control_socket
 
 _POLL_S = 0.05
@@ -24,12 +26,13 @@ _CREDENTIALS = struct.Struct("iII")
 
 @dataclass(frozen=True)
 class BwrapRequestResult:
-    """Command result, with empty bytes for output streams that were not captured."""
+    """Bounded text output, or legacy bytes when readiness has no encoding metadata."""
 
-    stdout: bytes
-    stderr: bytes
+    stdout: bytes | CapturedOutput
+    stderr: bytes | CapturedOutput
     exit_code: int | None
     timed_out: bool
+    encoding: str | None = None
 
 
 class RequestCancelled(RuntimeError):
@@ -80,6 +83,8 @@ class BwrapRequestControl:
         token: bytes,
         init_pidfd: int,
         launcher_pidfd: int,
+        *,
+        encoding: str | None = None,
     ) -> None:
         _validate_control_socket(control)
         self._control = control
@@ -87,6 +92,8 @@ class BwrapRequestControl:
         self._token = token
         self._init_pidfd = init_pidfd
         self._launcher_pidfd = launcher_pidfd
+        self._encoding = encoding
+        self._output_capture: BoundedPipeCapture | None = None
         self._owned_pidfds: tuple[int, int] | None = (init_pidfd, launcher_pidfd)
         self._lock = threading.Lock()
         self._stop_reason: str | None = None
@@ -103,6 +110,7 @@ class BwrapRequestControl:
         *,
         expected_init_pid: int,
         launcher_pidfd: int,
+        encoding_required: bool = False,
     ) -> BwrapRequestControl:
         """Take ownership only after validating the init's actual transferred pidfd."""
         _validate_control_socket(control)
@@ -112,7 +120,7 @@ class BwrapRequestControl:
             raise OSError("Request launcher identity is invalid")
         integer_size = array.array("i").itemsize
         payload, ancillary, flags, _ = control.recvmsg(
-            len(_READY) + len(token) + 1,
+            len(_READY) + len(token) + (130 if encoding_required else 1),
             socket.CMSG_SPACE(integer_size) + socket.CMSG_SPACE(_CREDENTIALS.size),
             socket.MSG_CMSG_CLOEXEC,
         )
@@ -136,7 +144,21 @@ class BwrapRequestControl:
                     unexpected_metadata = True
             if unexpected_metadata:
                 raise OSError("Unexpected request readiness metadata")
-            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or payload != _READY + token:
+            ready = _READY + token
+            encoding = None
+            if encoding_required and payload.startswith(ready + b":"):
+                try:
+                    encoding = payload[len(ready) + 1 :].decode("ascii")
+                    if not encoding or len(encoding) > 128:
+                        raise ValueError("Missing or oversized encoding")
+                    codecs.lookup(encoding)
+                except (LookupError, UnicodeError, ValueError) as exc:
+                    raise OSError("Request output encoding is invalid") from exc
+            if (
+                flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+                or (encoding_required and encoding is None)
+                or (not encoding_required and payload != ready)
+            ):
                 raise OSError("Request readiness was incomplete or belongs to another request")
             if len(descriptors) != 1 or len(credentials) != 1:
                 raise OSError("Request readiness needs one init handle and kernel credentials")
@@ -151,7 +173,9 @@ class BwrapRequestControl:
             ):
                 raise OSError("Request readiness is not from the pinned namespace init")
             os.set_inheritable(descriptors[0], False)
-            instance = cls(control, process, token, descriptors[0], launcher_pidfd)
+            instance = cls(
+                control, process, token, descriptors[0], launcher_pidfd, encoding=encoding
+            )
             descriptors.clear()
             return instance
         finally:
@@ -223,7 +247,7 @@ class BwrapRequestControl:
                     raise
             return None
 
-    def run(self, *, deadline: float) -> BwrapRequestResult:
+    def run(self, *, deadline: float, max_output: int | None = None) -> BwrapRequestResult:
         """Admit once, then require namespace exit and launcher/output cleanup.
 
         The deadline is observed between 50 ms polls; completion during the
@@ -233,9 +257,18 @@ class BwrapRequestControl:
             if self._started:
                 raise RuntimeError("A shell request can only run once")
             self._started = True
-        outputs: tuple[bytes, bytes] | None = None
+        outputs: tuple[bytes | CapturedOutput, bytes | CapturedOutput] | None = None
         exit_code: int | None = None
         try:
+            if self._encoding is not None:
+                self._output_capture = BoundedPipeCapture(
+                    self._process.stdout,
+                    self._process.stderr,
+                    encoding=self._encoding,
+                    max_chars=DEFAULT_OUTPUT_CHARS if max_output is None else max_output,
+                )
+            elif max_output is not None:
+                raise ValueError("Bounded output requires the command's encoding metadata")
             self._admit(deadline)
             while True:
                 if monotonic() >= deadline:
@@ -243,9 +276,13 @@ class BwrapRequestControl:
                 if exit_code is None and self._stop_reason is None:
                     exit_code = self._read_pending_result()
                 if outputs is None:
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        stdout, stderr = self._process.communicate(timeout=_POLL_S)
-                        outputs = (stdout or b"", stderr or b"")
+                    if self._output_capture is not None:
+                        if self._output_capture.poll(_POLL_S):
+                            outputs = self._output_capture.result()
+                    else:
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            stdout, stderr = self._process.communicate(timeout=_POLL_S)
+                            outputs = (stdout or b"", stderr or b"")
                 init_exited = _pidfd_exited(self._init_pidfd)
                 launcher_exited = _pidfd_exited(self._launcher_pidfd)
                 if init_exited and launcher_exited and outputs is not None:
@@ -262,7 +299,9 @@ class BwrapRequestControl:
                     exit_code = self._read_result()
                     if exit_code is None:
                         raise OSError("Request result was lost; the command must not be replayed")
-                return BwrapRequestResult(*outputs, None if timed_out else exit_code, timed_out)
+                return BwrapRequestResult(
+                    *outputs, None if timed_out else exit_code, timed_out, self._encoding
+                )
         finally:
             self._finish()
 
@@ -274,13 +313,21 @@ class BwrapRequestControl:
         while not _pidfd_exited(self._launcher_pidfd, round(_POLL_S * 1000)):
             pass
         try:
-            self._process.communicate()
+            if self._output_capture is not None:
+                try:
+                    self._output_capture.drain()
+                finally:
+                    self._process.wait()
+            else:
+                self._process.communicate()
         finally:
             # Serialize descriptor retirement with cancellation to prevent fd reuse races.
             with self._lock:
                 self._owned_pidfds = None
                 try:
                     with contextlib.ExitStack() as cleanup:
+                        if self._output_capture is not None:
+                            cleanup.callback(self._output_capture.close)
                         cleanup.callback(self._control.close)
                         cleanup.callback(os.close, self._launcher_pidfd)
                         cleanup.callback(os.close, self._init_pidfd)

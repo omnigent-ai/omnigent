@@ -24,6 +24,7 @@ const CONTEXT: ShortcutPageContext = {
   siblingSessions: true,
   desktopCommands: false,
   alwaysSteer: false,
+  quickPick: false,
 };
 const OTHER: ShortcutEnvironment = { ...MAC, mac: false };
 const page = shortcutPageGroups(CONTEXT, true);

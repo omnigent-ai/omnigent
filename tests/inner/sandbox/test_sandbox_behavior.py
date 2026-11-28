@@ -602,11 +602,12 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
     sandbox_pythonpath_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A completed shell request closes its Linux tool-helper namespace before return."""
+    """Unsupported request launchers retire the disposable helper and its descendants."""
     import asyncio
 
     import psutil
 
+    import omnigent.inner._bwrap_shell_request as shell_request_module
     import omnigent.inner.os_env as os_env_module
     from omnigent.inner.os_env import CallerProcessOSEnvironment
     from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -619,6 +620,7 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
     sandbox_spec = active_sandbox_spec_factory(
         env_passthrough=[passthrough_name], write_paths=[str(tmp_path)]
     )
+    monkeypatch.setattr(shell_request_module, "request_launcher", lambda *_args: None)
     if sandbox_spec.type != "linux_bwrap":
         pytest.skip("Complete descendant retirement here depends on a Linux PID namespace")
     spec = OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=sandbox_spec)
@@ -676,14 +678,22 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
         helper = processes[0]
         assert helper.pid != file_helper.pid
         assert file_helper.poll() is None
-        descendants = psutil.Process(helper.pid).children(recursive=True)
-        sleepers = []
-        for process in descendants:
-            try:
-                if process.cmdline() == ["sleep", "30"]:
-                    sleepers.append(process)
-            except psutil.NoSuchProcess:
-                pass
+        descendants: list[psutil.Process] = []
+        sleepers: list[psutil.Process] = []
+
+        def background_sleep_started() -> bool:
+            nonlocal descendants, sleepers
+            descendants = psutil.Process(helper.pid).children(recursive=True)
+            sleepers = []
+            for process in descendants:
+                try:
+                    if process.cmdline() == ["sleep", "30"]:
+                        sleepers.append(process)
+                except psutil.NoSuchProcess:
+                    pass
+            return bool(sleepers)
+
+        await poll_until_async(background_sleep_started, timeout_s=5)
         assert sleepers
         (tmp_path / "release").touch()
         result = json.loads(await task)
