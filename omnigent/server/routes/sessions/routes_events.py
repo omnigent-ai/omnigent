@@ -3014,6 +3014,7 @@ def register_events_routes(
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            outcome: str | None = None
             if (
                 conv.parent_conversation_id is not None
                 and status in {"idle", "failed"}
@@ -3096,8 +3097,9 @@ def register_events_routes(
                     )
                     if recovered is not None:
                         runner_result = recovered
-                elif _subagent_delivery_not_confirmed(runner_result):
+                elif outcome is not None and _subagent_delivery_not_confirmed(runner_result):
                     # The child's live runner has no inbox for a parent bound elsewhere.
+                    # Only a confirmed outcome may go there: that runner cannot judge a bare idle.
                     via_parent = await _sf._forward_subagent_status_to_parent_runner(
                         conv, runner_router, conversation_store, forward_body
                     )

@@ -2435,6 +2435,14 @@ class _ChildApartFromParent:
             and body.get("type") == "external_session_status"
         ]
 
+    def child_events_at_parent_runner(self) -> list[dict[str, Any]]:
+        return [
+            body["data"]
+            for path, body in self.parent_runner_requests
+            if path == f"/v1/sessions/{self.child_id}/events"
+            and body.get("type") == "external_session_status"
+        ]
+
 
 def _runner_without_parent_inbox(request: httpx.Request) -> httpx.Response:
     if request.method == "POST" and request.url.path == "/v1/sessions":
@@ -2537,12 +2545,49 @@ async def test_subagent_idle_refused_by_its_own_runner_reaches_parent_runner(
             f"/v1/sessions/{family.child_id}/events",
             json={
                 "type": "external_session_status",
-                "data": {"status": "idle", "turn_completed": True},
+                "data": {"status": "idle", "turn_completed": True, "output": "Found 3 issues."},
             },
         )
 
-    assert family.child_statuses_at_parent_runner() == ["idle"], resp.text
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_completed": True, "output": "Found 3 issues."}
+    ], resp.text
     assert resp.status_code == 202, resp.text
+    assert family.store.get_conversation(family.child_id).runner_id == _CHILD_RUNNER
+
+
+async def test_unconfirmed_subagent_idle_refused_by_its_own_runner_stays_off_parent_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client,
+        app,
+        db_uri,
+        monkeypatch,
+        name="apart-bare-idle",
+        child_runner_handler=_runner_without_parent_inbox,
+    ) as family:
+        bare = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert bare.status_code == 503, bare.text
+        assert family.child_events_at_parent_runner() == []
+        confirmed = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "turn_completed": True, "output": "Found 3 issues."},
+            },
+        )
+
+    assert confirmed.status_code == 202, confirmed.text
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_completed": True, "output": "Found 3 issues."}
+    ]
 
 
 async def test_native_subagent_boot_failure_reaches_parent_on_another_runner(
@@ -2568,7 +2613,9 @@ async def test_native_subagent_boot_failure_reaches_parent_on_another_runner(
             },
         )
 
-    assert family.child_statuses_at_parent_runner() == ["failed"], resp.text
+    assert family.child_events_at_parent_runner() == [
+        {"status": "failed", "output": "Native Claude requires the 'claude' CLI on PATH."}
+    ], resp.text
     assert resp.status_code == 202, resp.text
 
 
@@ -2589,7 +2636,9 @@ async def test_subagent_whose_runner_departs_mid_turn_reaches_parent_runner(
         )
         assert sessions_module._session_status_cache[family.child_id] == "failed"
 
-    assert family.child_statuses_at_parent_runner() == ["failed"]
+    assert family.child_events_at_parent_runner() == [
+        {"status": "failed", "output": _RUNNER_DISCONNECTED.message}
+    ]
 
 
 async def test_subagent_stopped_mid_turn_reaches_parent_runner(
@@ -2618,7 +2667,9 @@ async def test_subagent_stopped_mid_turn_reaches_parent_runner(
             sessions_module._intentional_stop_sessions.pop(family.child_id, None)
         assert sessions_module._session_status_cache[family.child_id] == "idle"
 
-    assert family.child_statuses_at_parent_runner() in (["idle"], ["failed"])
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_outcome": "cancelled"}
+    ]
 
 
 # ── message-send stale-runner heal (issue #3067) ─────────────────────────────

@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from omnigent.host.frames import HostHelloFrame, HostStopRunnerFrame, decode_host_frame
+from omnigent.runner.subagent_work import SUBAGENT_DISPATCH_ID_LABEL_KEY
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state
 from omnigent.server.host_registry import HostRegistry, WebSocketLike
@@ -332,6 +333,84 @@ async def test_sweep_reports_stopped_child_to_parent_on_another_runner(
             },
         )
     ]
+
+
+_LOST_CHILD_STATUS = {"status": "failed", "output": "Runner disconnected unexpectedly."}
+
+
+@pytest.mark.parametrize("first_attempt", ["parent_runner_offline", "transport_error"])
+async def test_lost_child_report_is_retried_until_parent_runner_takes_it(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    first_attempt: str,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    store.set_labels(child_id, {SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_first"})
+    monkeypatch.setattr(orchestration, "_PARENT_REPORT_RETRY_DELAYS_S", (0.0,))
+    parent_runner_posts: list[object] = []
+
+    def parent_runner_reconnecting(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append(json.loads(request.content))
+        if first_attempt == "transport_error" and len(parent_runner_posts) == 1:
+            raise httpx.ConnectError("tunnel reconnecting", request=request)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(parent_runner_reconnecting), base_url="http://parent-runner"
+    ) as parent_runner:
+        lookups: list[str] = []
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            lookups.append(session_id)
+            if first_attempt == "parent_runner_offline" and len(lookups) == 1:
+                return None
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await orchestration._report_lost_subagent_to_parent_runner(
+            child_id, store, _LOST_CHILD_STATUS
+        )
+        await orchestration._parent_report_retries[child_id]
+
+    assert parent_runner_posts[-1:] == [
+        {"type": "external_session_status", "data": _LOST_CHILD_STATUS}
+    ]
+    assert len(parent_runner_posts) == (2 if first_attempt == "transport_error" else 1)
+    assert child_id not in orchestration._parent_report_retries
+
+
+async def test_lost_child_report_retry_stops_when_child_gets_a_new_turn(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    store.set_labels(child_id, {SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_first"})
+    monkeypatch.setattr(orchestration, "_PARENT_REPORT_RETRY_DELAYS_S", (0.0,))
+    parent_runner_posts: list[object] = []
+
+    def parent_runner_unreachable(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append(json.loads(request.content))
+        raise httpx.ConnectError("tunnel reconnecting", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(parent_runner_unreachable), base_url="http://parent-runner"
+    ) as parent_runner:
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await orchestration._report_lost_subagent_to_parent_runner(
+            child_id, store, _LOST_CHILD_STATUS
+        )
+        retry = orchestration._parent_report_retries[child_id]
+        store.set_labels(child_id, {SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_second"})
+        await retry
+
+    assert parent_runner_posts == [{"type": "external_session_status", "data": _LOST_CHILD_STATUS}]
+    assert child_id not in orchestration._parent_report_retries
 
 
 @pytest.mark.parametrize("delivered", [True, False])
