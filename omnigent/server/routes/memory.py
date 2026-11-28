@@ -43,6 +43,9 @@ from omnigent.stores.memory_store import (
 )
 from omnigent.stores.permission_store import PermissionStore
 
+# Backend cursors can encode filters and exceed the length of an individual path.
+_MAX_PAGE_TOKEN_LENGTH = 8192
+
 
 class MemoryWriteRequest(BaseModel):
     """Body of ``PUT /v1/memory/entry``."""
@@ -204,7 +207,7 @@ def create_memory_router(
     async def list_entries(
         request: Request,
         prefix: Annotated[str | None, Query(max_length=MAX_PATH_LENGTH)] = None,
-        page_token: Annotated[str | None, Query(max_length=MAX_PATH_LENGTH)] = None,
+        page_token: Annotated[str | None, Query(max_length=_MAX_PAGE_TOKEN_LENGTH)] = None,
         page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
     ) -> MemoryEntryList:
         actor = await asyncio.to_thread(resolve_actor, request)

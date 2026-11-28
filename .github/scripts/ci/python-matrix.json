@@ -93,7 +93,7 @@
   },
   {
     "group": "databricks",
-    "paths": "tests/db tests/deploy tests/server/test_smart_routing.py",
+    "paths": "tests/db tests/deploy tests/server/test_smart_routing.py tests/stores tests/cli/test_databricks_memory_backend_selection.py tests/server/integration/test_databricks_memory_routes.py",
     "extra": "databricks",
     "markexpr": "databricks"
   },
