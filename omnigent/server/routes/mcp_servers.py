@@ -36,7 +36,8 @@ class McpServerSummary(BaseModel):
     """An MCP server a harness loads on the host, without secrets.
 
     :param name: Server name as configured, e.g. ``"github"``.
-    :param harness: Harness family that loads it: ``claude``, ``codex``, ``cursor``, or ``pi``.
+    :param harness: Harness family that loads it: ``claude``, ``codex``, ``cursor``, ``pi``,
+        or ``antigravity``.
     :param transport: ``stdio`` for a local process, ``http`` for a remote server.
     :param scope: Config scope; always ``user`` today.
     :param managed: Whether an organization pins this server for every user on the

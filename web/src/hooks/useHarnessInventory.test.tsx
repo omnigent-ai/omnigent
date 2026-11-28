@@ -66,10 +66,19 @@ describe("installedHarnesses", () => {
   it("checks only the requested families", () => {
     const host = {
       ...HOST,
-      configured_harnesses: { ...HOST.configured_harnesses, "pi-native": true },
+      configured_harnesses: {
+        ...HOST.configured_harnesses,
+        "pi-native": true,
+        "antigravity-native": true,
+      },
     };
     expect(installedHarnesses(host)).toEqual(["claude", "codex"]);
-    expect(installedHarnesses(host, INVENTORY_HARNESSES)).toEqual(["claude", "codex", "pi"]);
+    expect(installedHarnesses(host, INVENTORY_HARNESSES)).toEqual([
+      "claude",
+      "codex",
+      "pi",
+      "antigravity",
+    ]);
     expect(installedHarnesses({ ...HOST, configured_harnesses: null }, ["pi"])).toEqual(["pi"]);
   });
 
