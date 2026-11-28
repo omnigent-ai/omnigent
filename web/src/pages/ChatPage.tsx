@@ -4736,6 +4736,7 @@ function ComposerImpl(
           },
           onPaste,
           onScroll: highlight.input.onScroll,
+          "data-testid": "composer-input",
           "aria-label": "Message the agent",
           "aria-describedby": highlight.input["aria-describedby"],
           "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
@@ -5118,6 +5119,7 @@ function ComposerImpl(
                       }
                       title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
                       label={showInterruptButton ? "Interrupt" : "Send"}
+                      data-testid="composer-send-button"
                     />
                   </TooltipTrigger>
                   {showInterruptButton ? (
