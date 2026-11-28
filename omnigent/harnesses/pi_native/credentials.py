@@ -393,6 +393,10 @@ class PiProviderConfig:
             # Preserve the native default for unlisted models; model-level flags win.
             provider["compat"] = {"forceAdaptiveThinking": True}
             provider["models"] = [pi_model_with_thinking_defaults(entry) for entry in models]
+        elif self.api == "openai-completions":
+            # Pi sends reasoning models a ``developer`` role on unrecognized hosts;
+            # Gemini and most non-OpenAI chat servers accept only ``system``.
+            provider["compat"] = {"supportsDeveloperRole": False}
         providers = {self.provider_id: provider}
         providers.update(additional)
         for provider_id, payload in providers.items():
