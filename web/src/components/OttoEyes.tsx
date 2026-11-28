@@ -52,78 +52,125 @@ function isTrackedTextField(node: EventTarget | null): node is HTMLElement {
   return node.isContentEditable;
 }
 
-// Screen-space point of the caret inside a <textarea>/<input>. There is no
-// native caret-rect API, so a hidden <div> mirrors the field's text layout and
-// a DOM Range measures the real character before the caret. Only the direction
-// to the caret matters (the pupil is normalized onto the eye rim), so sub-pixel
+// Holds the hidden mirror off the page: fixed, zero-size and fully contained,
+// so the mirror's layout never reaches the document or its scroll area.
+const MIRROR_HOST_STYLE =
+  "position:fixed;top:0;left:0;width:0;height:0;overflow:hidden;" +
+  "visibility:hidden;pointer-events:none;contain:strict";
+
+interface TextFieldCaretMeasurer {
+  caretPoint: (el: TextField) => ScreenPoint | null;
+  dispose: () => void;
+}
+
+// Measures the caret inside a <textarea>/<input>. There is no native caret-rect
+// API, so a hidden <div> mirrors the field's text layout and a DOM Range
+// measures the real character before the caret. Only the direction to the
+// caret matters (the pupil is normalized onto the eye rim), so sub-pixel
 // differences are invisible.
-function textFieldCaretPoint(el: TextField): ScreenPoint | null {
-  const doc = el.ownerDocument;
-  const win = doc.defaultView;
-  if (!win) return null;
+//
+// The mirror stays attached: inserting a node under <body> restyles the whole
+// document, which takes WebKit tens of ms, so a keystroke only rewrites its text.
+// The text is cleared again after every measurement.
+function createTextFieldCaretMeasurer(): TextFieldCaretMeasurer {
+  let host: HTMLDivElement | null = null;
+  let mirror: HTMLDivElement | null = null;
+  let text: Text | null = null;
 
-  const cs = win.getComputedStyle(el);
-  const padLeft = parseFloat(cs.paddingLeft) || 0;
-  const padTop = parseFloat(cs.paddingTop) || 0;
-  const borderLeft = parseFloat(cs.borderLeftWidth) || 0;
-  const borderTop = parseFloat(cs.borderTopWidth) || 0;
-
-  const mirror = createTextFieldMirror(el, cs);
-  mirror.textContent = el.value;
-
-  // Default to the content box's top-left (caret at the very start, empty
-  // field, or a layout-less environment like jsdom where Range rects are
-  // unavailable). A real character rect overrides it below.
-  let localLeft = 0;
-  let localTop = 0;
-  let caretHeight = parseFloat(cs.lineHeight) || 0;
-
-  // Always remove the mirror, even if a measurement throws (a browser Range
-  // quirk, or the field detaching mid-frame): this runs on every tracked
-  // event via rAF, so a leaked node would accumulate one hidden <div> per
-  // frame and the uncaught throw would kill all subsequent tracking.
-  doc.body.appendChild(mirror);
-  try {
-    const node = mirror.firstChild;
-    // Clamp against the mirrored text length: selectionStart can momentarily
-    // lead el.value (controlled inputs, IME composition), and an out-of-range
-    // index would make Range.setStart throw.
-    const textLength = node?.textContent?.length ?? 0;
-    const caretIndex = Math.min(el.selectionStart ?? el.value.length, textLength);
-    const mirrorRect = mirror.getBoundingClientRect();
-
-    if (node && caretIndex > 0) {
-      // The character before the caret; its trailing edge is where the caret
-      // rides, so the caret only drops to the next line once that glyph wraps.
-      // getClientRects() splits at a line wrap \u2014 the last rect is on the caret's
-      // line.
-      const range = doc.createRange();
-      range.setStart(node, caretIndex - 1);
-      range.setEnd(node, caretIndex);
-      const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
-      const r =
-        rects && rects.length > 0
-          ? rects[rects.length - 1]
-          : typeof range.getBoundingClientRect === "function"
-            ? range.getBoundingClientRect()
-            : null;
-      if (r && (r.width > 0 || r.height > 0 || r.right > 0 || r.top > 0)) {
-        localLeft = r.right - mirrorRect.left;
-        localTop = r.top - mirrorRect.top;
-        caretHeight = r.height;
-      }
+  const syncMirror = (el: TextField, cs: CSSStyleDeclaration) => {
+    const doc = el.ownerDocument;
+    if (!host || !host.isConnected || host.ownerDocument !== doc) {
+      host?.remove();
+      host = doc.createElement("div");
+      host.setAttribute("aria-hidden", "true");
+      host.style.cssText = MIRROR_HOST_STYLE;
+      doc.body.appendChild(host);
+      mirror = null;
     }
-  } finally {
-    doc.body.removeChild(mirror);
-  }
+    // A detached mirror costs no style work; swap it in only when the field's
+    // font or width changed.
+    const next = createTextFieldMirror(el, cs);
+    if (!mirror || !text || mirror.style.cssText !== next.style.cssText) {
+      text = doc.createTextNode("");
+      next.append(text);
+      host.replaceChildren(next);
+      mirror = next;
+    }
+    text.data = el.value;
+    return { mirror, text };
+  };
 
-  const rect = el.getBoundingClientRect();
-  // The mirror's zero-padding/zero-border content box starts at its own
-  // top-left, so a local offset maps to the field's content origin (border +
-  // padding inside the field's border box), adjusted for the field's scroll.
+  const caretPoint = (el: TextField): ScreenPoint | null => {
+    const doc = el.ownerDocument;
+    const win = doc.defaultView;
+    if (!win) return null;
+
+    const cs = win.getComputedStyle(el);
+    const padLeft = parseFloat(cs.paddingLeft) || 0;
+    const padTop = parseFloat(cs.paddingTop) || 0;
+    const borderLeft = parseFloat(cs.borderLeftWidth) || 0;
+    const borderTop = parseFloat(cs.borderTopWidth) || 0;
+
+    try {
+      const { mirror: mirrorDiv, text: node } = syncMirror(el, cs);
+
+      // Default to the content box's top-left (caret at the very start, empty
+      // field, or a layout-less environment like jsdom where Range rects are
+      // unavailable). A real character rect overrides it below.
+      let localLeft = 0;
+      let localTop = 0;
+      let caretHeight = parseFloat(cs.lineHeight) || 0;
+
+      // Clamp against the mirrored text length: selectionStart can momentarily
+      // lead el.value (controlled inputs, IME composition), and an out-of-range
+      // index would make Range.setStart throw.
+      const caretIndex = Math.min(el.selectionStart ?? el.value.length, node.length);
+      if (caretIndex > 0) {
+        const mirrorRect = mirrorDiv.getBoundingClientRect();
+        // The character before the caret; its trailing edge is where the caret
+        // rides, so the caret only drops to the next line once that glyph wraps.
+        // getClientRects() splits at a line wrap \u2014 the last rect is on the
+        // caret's line.
+        const range = doc.createRange();
+        range.setStart(node, caretIndex - 1);
+        range.setEnd(node, caretIndex);
+        const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
+        const r =
+          rects && rects.length > 0
+            ? rects[rects.length - 1]
+            : typeof range.getBoundingClientRect === "function"
+              ? range.getBoundingClientRect()
+              : null;
+        if (r && (r.width > 0 || r.height > 0 || r.right > 0 || r.top > 0)) {
+          localLeft = r.right - mirrorRect.left;
+          localTop = r.top - mirrorRect.top;
+          caretHeight = r.height;
+        }
+      }
+
+      const rect = el.getBoundingClientRect();
+      // The mirror's zero-padding/zero-border content box starts at its own
+      // top-left, so a local offset maps to the field's content origin (border +
+      // padding inside the field's border box), adjusted for the field's scroll.
+      return {
+        x: rect.left + borderLeft + padLeft + localLeft - el.scrollLeft,
+        y: rect.top + borderTop + padTop + localTop - el.scrollTop + caretHeight / 2,
+      };
+    } finally {
+      // The field may be a password input, and the host outlives the field, so
+      // its value must not stay in the document between measurements.
+      if (text) text.data = "";
+    }
+  };
+
   return {
-    x: rect.left + borderLeft + padLeft + localLeft - el.scrollLeft,
-    y: rect.top + borderTop + padTop + localTop - el.scrollTop + caretHeight / 2,
+    caretPoint,
+    dispose: () => {
+      host?.remove();
+      host = null;
+      mirror = null;
+      text = null;
+    },
   };
 }
 
@@ -144,9 +191,12 @@ function contentEditableCaretPoint(win: Window): ScreenPoint | null {
 
 // Where the focused text field's caret sits on screen, or null if it can't be
 // resolved (whereupon Otto falls back to the pointer).
-function caretPointFor(field: HTMLElement): ScreenPoint | null {
+function caretPointFor(
+  field: HTMLElement,
+  textFieldCaret: TextFieldCaretMeasurer,
+): ScreenPoint | null {
   if (field instanceof HTMLTextAreaElement || field instanceof HTMLInputElement) {
-    return textFieldCaretPoint(field);
+    return textFieldCaret.caretPoint(field);
   }
   const win = field.ownerDocument.defaultView;
   return win ? contentEditableCaretPoint(win) : null;
@@ -194,6 +244,7 @@ export function OttoEyes({ className }: { className?: string }) {
 
     let frame = 0;
     let pointer: ScreenPoint | null = null;
+    const textFieldCaret = createTextFieldCaretMeasurer();
     // The focused text field whose caret Otto can watch, or null when no
     // tracked field is focused.
     let activeField: HTMLElement | null = null;
@@ -221,7 +272,7 @@ export function OttoEyes({ className }: { className?: string }) {
       // back to the pointer. Neither source yet → leave the pupils centered.
       const target =
         source === "caret" && activeField
-          ? (caretPointFor(activeField) ?? pointer)
+          ? (caretPointFor(activeField, textFieldCaret) ?? pointer)
           : source === "pointer"
             ? pointer
             : null;
@@ -347,6 +398,7 @@ export function OttoEyes({ className }: { className?: string }) {
       window.removeEventListener("scroll", onCaretMaybeShifted, true);
       window.removeEventListener("resize", onCaretMaybeShifted);
       if (frame) cancelAnimationFrame(frame);
+      textFieldCaret.dispose();
     };
   }, []);
 

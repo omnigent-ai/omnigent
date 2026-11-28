@@ -20,6 +20,9 @@ function transformOf(pupil: SVGGElement): { tx: number; ty: number } | null {
   return { tx: Number(match[1]), ty: Number(match[2]) };
 }
 
+// The hidden host OttoEyes keeps under <body> for its caret mirror.
+const mirrorHost = () => document.querySelector<HTMLElement>('body > div[aria-hidden="true"]');
+
 describe("OttoEyes", () => {
   it("renders the mascot with image semantics", () => {
     const { container } = render(<OttoEyes className="h-18" />);
@@ -172,6 +175,121 @@ describe("OttoEyes", () => {
 
     textarea.remove();
     button.remove();
+  });
+
+  it("keeps one caret mirror attached across keystrokes and removes it on unmount", async () => {
+    // Inserting or removing a node under <body> invalidates style for the whole
+    // document (tens of ms per keystroke in WebKit), so typing must only touch
+    // a mirror that is already attached.
+    const textarea = document.createElement("textarea");
+    document.body.appendChild(textarea);
+    const { unmount } = render(<OttoEyes />);
+    textarea.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+
+    const records: MutationRecord[] = [];
+    const bodyChildren = new MutationObserver((batch) => records.push(...batch));
+    bodyChildren.observe(document.body, { childList: true });
+    const type = (value: string) => {
+      textarea.value = value;
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      return nextFrame();
+    };
+    await type("h");
+    await type("he");
+    await type("hel");
+    records.push(...bodyChildren.takeRecords());
+    bodyChildren.disconnect();
+
+    const added = records.flatMap((record) => Array.from(record.addedNodes));
+    const removed = records.flatMap((record) => Array.from(record.removedNodes));
+    expect(added).toHaveLength(1);
+    expect(removed).toHaveLength(0);
+    const host = added[0] as HTMLElement;
+    expect(host.style.position).toBe("fixed");
+    expect(host.style.contain).toBe("strict");
+    expect(host).toHaveAttribute("aria-hidden", "true");
+    expect(host.textContent).toBe("");
+
+    unmount();
+    expect(host.isConnected).toBe(false);
+    textarea.remove();
+  });
+
+  it("measures a password but leaves no trace of it once the field is gone", async () => {
+    // The API-key field in the credential dialog is a password input, and the
+    // dialog can be cancelled while Otto stays mounted.
+    const secret = "sk-synthetic-secret-1234";
+    const input = document.createElement("input");
+    input.type = "password";
+    document.body.appendChild(input);
+    let measuredText: string | null | undefined;
+    vi.spyOn(input, "getBoundingClientRect").mockImplementation(() => {
+      measuredText = mirrorHost()?.textContent;
+      return new DOMRect(10, 90, 200, 40);
+    });
+    render(<OttoEyes />);
+    input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+
+    input.value = secret;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextFrame();
+    expect(measuredText).toBe(secret);
+
+    input.remove();
+    const host = mirrorHost();
+    expect(host?.isConnected).toBe(true);
+    expect(host?.textContent).toBe("");
+    expect(document.body.innerHTML).not.toContain(secret);
+  });
+
+  it("clears the caret mirror when measuring the caret throws", async () => {
+    const secret = "sk-synthetic-secret-5678";
+    const input = document.createElement("input");
+    input.type = "password";
+    input.value = secret;
+    document.body.appendChild(input);
+    const failure = new Error("layout unavailable");
+    vi.spyOn(input, "getBoundingClientRect").mockImplementation(() => {
+      throw failure;
+    });
+    const errors: unknown[] = [];
+    const onError = (e: ErrorEvent) => {
+      errors.push(e.error);
+      e.preventDefault();
+    };
+    window.addEventListener("error", onError);
+    render(<OttoEyes />);
+    input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextFrame();
+    window.removeEventListener("error", onError);
+
+    expect(errors).toEqual([failure]);
+    expect(mirrorHost()?.textContent).toBe("");
+    expect(document.body.innerHTML).not.toContain(secret);
+    input.remove();
+  });
+
+  it("restyles the kept caret mirror when the field's width changes", async () => {
+    const textarea = document.createElement("textarea");
+    document.body.appendChild(textarea);
+    const width = vi.spyOn(textarea, "clientWidth", "get").mockReturnValue(300);
+    render(<OttoEyes />);
+    textarea.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    const mirrorWidth = () =>
+      document.querySelector<HTMLElement>('div[aria-hidden="true"] > div')?.style.width;
+
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextFrame();
+    expect(mirrorWidth()).toBe("300px");
+
+    width.mockReturnValue(180);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextFrame();
+    expect(mirrorWidth()).toBe("180px");
+
+    textarea.remove();
   });
 
   it("tracks the caret on first input when a field was already focused at mount", async () => {
