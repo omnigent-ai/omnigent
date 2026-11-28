@@ -179,6 +179,23 @@
         font-weight: 550;
       }
 
+      .desktop-version {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px 14px;
+      }
+
+      .release-notes {
+        color: var(--focus);
+        font-weight: 400;
+        text-underline-offset: 3px;
+      }
+
+      .release-notes svg {
+        vertical-align: -2px;
+      }
+
       code {
         display: block;
         overflow: hidden;
@@ -271,7 +288,8 @@
         background: var(--button-hover);
       }
 
-      button:focus-visible {
+      button:focus-visible,
+      a:focus-visible {
         outline: 2px solid var(--focus);
         outline-offset: 2px;
       }
@@ -350,7 +368,27 @@
           </div>
           <dl>
             <dt>Version</dt>
-            <dd id="desktop-version">Loading…</dd>
+            <dd class="desktop-version">
+              <span id="desktop-version">Loading…</span>
+              <a
+                class="release-notes"
+                href="https://omnigent.ai/releases"
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="Release notes (opens in browser)"
+                >Release notes
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  aria-hidden="true"
+                >
+                  <path d="M15 3h6v6M10 14 21 3M21 14v7H3V3h7" /></svg
+              ></a>
+            </dd>
           </dl>
           <div id="desktop-actions" class="actions">
             <button id="desktop-check" type="button">Check for updates</button>
