@@ -9,6 +9,7 @@ import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -22,6 +23,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runner.session_history import build_session_history
 from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests._helpers.polling import poll_until_async
@@ -1983,7 +1985,10 @@ async def test_session_creation_no_recovery_for_empty_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_history_load_paginates_beyond_100_items() -> None:
+@pytest.mark.parametrize("fault", [None, "timeout", 429, 502, 503, 504])
+async def test_history_load_paginates_beyond_100_items(
+    monkeypatch: pytest.MonkeyPatch, fault: str | int | None
+) -> None:
     """_load_history_as_input must paginate when history exceeds one page.
 
     Breakage this catches: if the history loader fetches only one page
@@ -2005,6 +2010,19 @@ async def test_history_load_paginates_beyond_100_items() -> None:
     # Last item is assistant (i=149, odd) so no recovery turn —
     # we're testing pagination, not recovery.
     server_client = _FakeServerClient(history)
+    get = server_client.get
+    fault_pending = fault is not None
+
+    async def get_with_fault(url: str, **kwargs: Any) -> Any:
+        nonlocal fault_pending
+        if fault_pending and kwargs.get("params", {}).get("after") == "item_99":
+            fault_pending = False
+            if fault == "timeout":
+                raise httpx.ReadTimeout("history read stalled")
+            return httpx.Response(int(fault), request=httpx.Request("GET", url))
+        return await get(url, **kwargs)
+
+    monkeypatch.setattr(server_client, "get", get_with_fault)
     spec = AgentSpec(spec_version=1, name="paginate-test")
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_p"}}),
@@ -2074,6 +2092,49 @@ async def test_history_load_paginates_beyond_100_items() -> None:
         f"Expected at least 151 items (150 server + 1 new), "
         f"got {len(body_content)}. Some server items were dropped."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["timeout", 401, 403, 404, 503, "empty_page", "repeated_page"])
+async def test_incomplete_history_keeps_its_previous_anchor(
+    fault: str | int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed or nonadvancing page cannot commit partial history or its cursor."""
+    history = [
+        {"id": f"item_{index}", "type": "message", "role": "assistant", "content": []}
+        for index in range(150)
+    ]
+    server_client = _FakeServerClient(history)
+    get = server_client.get
+    requests = 0
+
+    async def get_with_fault(url: str, **kwargs: Any) -> Any:
+        nonlocal requests
+        if kwargs.get("params", {}).get("after") == "item_99":
+            requests += 1
+            if fault == "timeout":
+                raise httpx.ReadTimeout("history read stalled")
+            request = httpx.Request("GET", url)
+            if isinstance(fault, int):
+                return httpx.Response(fault, request=request)
+            page = [] if fault == "empty_page" else history[:100]
+            return httpx.Response(200, json={"data": page, "has_more": True}, request=request)
+        return await get(url, **kwargs)
+
+    monkeypatch.setattr(server_client, "get", get_with_fault)
+    anchors = {"history-session": "previous-anchor"}
+    loader = build_session_history(
+        _background_tasks=set(),
+        _last_server_item_id=anchors,
+        _persist_cancellation_items=AsyncMock(),
+        _session_histories={},
+        _session_spec_cache={},
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    with pytest.raises((httpx.HTTPError, RuntimeError)):
+        await loader.load_history_as_input("history-session")
+    assert anchors == {"history-session": "previous-anchor"}
+    assert requests == (3 if fault in ("timeout", 503) else 1)
 
 
 @pytest.mark.asyncio
