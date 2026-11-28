@@ -1,3 +1,4 @@
+import { useWarmSwitchConversationId } from "@/lib/warmSessionSwitch";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { PaneLoading } from "@/components/PageLoading";
@@ -5,6 +6,7 @@ import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContex
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   LazyFileActionHost,
+  LazyGoToFileHost,
   LazyShowAllPullRequestsCommand,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
@@ -13,7 +15,6 @@ import {
   showWorkspaceTabOrChooser,
   useTabsSidebar,
 } from "@/shell/workspaceTabsRouting";
-import type { WorkspaceFileOpenOptions } from "@/shell/workspaceTabs/workspacePlaceNavigation";
 import {
   type ComponentProps,
   type CSSProperties,
@@ -58,6 +59,9 @@ import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useWorkspaceFullScreenCommand } from "@/shell/workspaceCommands/useWorkspaceFullScreenCommand";
+import { rightPanelCollapsesItself } from "./rightPanelCollapse";
+import { useRailControlsWidth } from "./workspaceTabs/railControlsWidth";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
@@ -145,6 +149,7 @@ import { useWorkspaceResources } from "./useWorkspaceResources";
 import { relativizeToWorkspace } from "@/hooks/useWorkspaceChangedFiles";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { citedFilePosition } from "./filePositionState";
+import { fileLinkOpenOptions, useArrivedFileLink } from "./arrivedFileLink";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -191,10 +196,14 @@ import {
 import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
+import { MarkAllReadPaletteCommand } from "./markAllReadPaletteCommand";
+import { ResumeSandboxPaletteCommand } from "./resumeSandboxCommand";
 import { AppShellRootProviders } from "./AppShellRootProviders";
 import { replaceThemePicker } from "@/store/themePicker";
+import { replaceFeatureFlagsPicker } from "@/store/featureFlagsPicker";
 import { commandViewForPath, useCommandSession } from "./commandContext";
 import { CloseShellDialog } from "./CloseShellDialog";
+import { joinShellTabsCloses, type ShellTabsClose, useShellCloseRequest } from "./shellCloseCheck";
 import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -210,6 +219,11 @@ import {
   useIsWideViewport,
 } from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
+import { requestGadgetRailTab, useGadgetRailRequest } from "@/lib/gadgetRailTabs";
+import { gadgetRailKey } from "@/gadgets/host/gadgetSession";
+import { GadgetNewSessionPanel } from "@/gadgets/ui/GadgetRailTabs";
+import { useSessionGadgets } from "@/gadgets/ui/gadgetQueries";
+import { useAdoptStartedGadgetSession } from "@/gadgets/ui/useAdoptStartedGadgetSession";
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -328,6 +342,193 @@ function offWindowArchiveState(
       reportedStatus === "waiting" ||
       boundStatus === "waiting" ||
       boundBackgroundTaskCount > 0,
+  };
+}
+
+function isKnownTopLevelConversation(
+  id: string | undefined,
+  row: Conversation | null,
+  session: Session | null,
+): boolean {
+  return row != null || (session != null && session.id === id && session.parentSessionId == null);
+}
+
+function sessionShareDisabledReason(
+  canShare: boolean,
+  info: ReturnType<typeof useServerInfo>,
+): string | undefined {
+  if (!canShare) return undefined;
+  if (isCurrentServerLocal()) return "Sharing is unavailable from a local server.";
+  return info !== "loading" && info.sharing_mode === "off" ? SHARING_OFF_REASON : undefined;
+}
+
+function sessionActionGates({
+  conversationId,
+  isKnownTopLevel,
+  isChildSession,
+  permissionLevel,
+  serverInfo,
+}: {
+  conversationId: string | undefined;
+  isKnownTopLevel: boolean;
+  isChildSession: boolean;
+  permissionLevel: number | null;
+  serverInfo: ReturnType<typeof useServerInfo>;
+}) {
+  const canShare =
+    !!conversationId &&
+    isKnownTopLevel &&
+    isOwnerLevel(permissionLevel) &&
+    !isSingleUserMode(serverInfo);
+  // Any viewer can fork, sub-agents included (that promotes a child to top level),
+  // once the session kind is known so the action doesn't flicker in.
+  const canFork =
+    !!conversationId &&
+    (isKnownTopLevel || isChildSession) &&
+    (permissionLevel === null || permissionLevel >= 1);
+  return {
+    canShare,
+    canFork,
+    shareDisabledReason: sessionShareDisabledReason(canShare, serverInfo),
+  };
+}
+
+function useHeaderConversation(
+  conversationId: string | undefined,
+  allConversations: Conversation[] | undefined,
+  conversationsLoading: boolean,
+) {
+  const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
+  const activeConv = useMemo(
+    () => allConversations?.find((row) => row.id === serverConversationId) ?? null,
+    [allConversations, serverConversationId],
+  );
+  const { session: activeSession, isLoading: sessionLoading } = useSession(serverConversationId);
+  const { data: boundAgent } = useSessionAgent(serverConversationId ?? null);
+  const permissionLevel = derivePermissionLevel(
+    activeSession,
+    sessionLoading,
+    activeConv,
+    conversationId,
+    allConversations !== undefined,
+  );
+  const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
+  // Temporary rows supply display text, not server-side actions.
+  const provisionalConv = useMemo(() => {
+    if (!conversationId || !isTempConvId(conversationId)) return null;
+    const row = allConversations?.find((c) => c.id === conversationId);
+    return row?.provisional === true ? row : null;
+  }, [conversationId, allConversations]);
+  const isChildSession = activeSession?.parentSessionId != null;
+  const parentConv =
+    allConversations?.find((row) => row.id === activeSession?.parentSessionId) ?? null;
+  const { session: parentSession } = useSession(activeSession?.parentSessionId);
+  const { data: projectSummaries } = useProjects();
+  const breadcrumbConv = isChildSession ? parentConv : (activeConv ?? provisionalConv);
+  const headerConversationTitle =
+    breadcrumbConv?.title ||
+    (isChildSession ? parentSession?.title : activeSession?.title) ||
+    (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
+    (isTempConvId(conversationId)
+      ? (optimisticConversationTitle ?? UNTITLED_CONVERSATION_LABEL)
+      : null) ||
+    (isChildSession || activeSession?.id === conversationId ? UNTITLED_CONVERSATION_LABEL : null);
+  const headerProjectSummary =
+    breadcrumbConv?.project_id != null
+      ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)
+      : undefined;
+  const headerProjectName =
+    headerProjectSummary?.name ?? breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ?? null;
+  const headerProjectIcon = headerProjectSummary?.icon ?? null;
+  const headerTitleLinkTo =
+    isChildSession && activeSession?.parentSessionId
+      ? `/c/${activeSession.parentSessionId}`
+      : undefined;
+  const isKnownTopLevel = isKnownTopLevelConversation(conversationId, activeConv, activeSession);
+  const activeSessionMatchesConversation = activeSession?.id === conversationId;
+  // The off-window archive confirmation's sources; see `offWindowArchiveState`.
+  const openSessionRow = useOpenSessionRow(
+    !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
+      ? (serverConversationId ?? null)
+      : null,
+  );
+  const boundSessionStatus = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.sessionStatus : null,
+  );
+  const boundBackgroundTaskCount = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.backgroundTaskCount : 0,
+  );
+  const actionConversation = useMemo<Conversation | null>(() => {
+    if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
+    if (activeConv) return activeConv;
+    if (!activeSessionMatchesConversation || !activeSession) return null;
+    return {
+      id: activeSession.id,
+      object: "conversation",
+      title: activeSession.title,
+      created_at: activeSession.createdAt,
+      updated_at: activeSession.createdAt,
+      labels: activeSession.labels ?? {},
+      // Only the snapshot carries the archive flag for off-window sessions.
+      archived: activeSession.archived ?? false,
+      permission_level: activeSession.permissionLevel,
+      runner_id: activeSession.runnerId ?? null,
+      host_id: activeSession.hostId ?? null,
+      workspace: activeSession.workspace ?? null,
+      agent_id: activeSession.agentId,
+      agent_name: activeSession.agentName,
+      family: activeSession.family,
+      git_branch: activeSession.gitBranch ?? null,
+      // `useArchivePrompt` applies `isSessionWorking` to these.
+      ...offWindowArchiveState(
+        openSessionRow,
+        activeSession,
+        boundSessionStatus,
+        boundBackgroundTaskCount,
+      ),
+    };
+  }, [
+    activeConv,
+    activeSession,
+    activeSessionMatchesConversation,
+    boundBackgroundTaskCount,
+    boundSessionStatus,
+    isKnownTopLevel,
+    openSessionRow,
+    permissionLevel,
+  ]);
+  const serverInfo = useServerInfo();
+  const { canShare, canFork, shareDisabledReason } = sessionActionGates({
+    conversationId,
+    isKnownTopLevel,
+    isChildSession,
+    permissionLevel,
+    serverInfo,
+  });
+  const hasAgentInfo =
+    serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
+  const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
+  return {
+    activeConv,
+    activeSession,
+    boundAgent,
+    permissionLevel,
+    isChildSession,
+    conversationTitle: headerConversationTitle,
+    projectName: headerProjectName,
+    projectIcon: headerProjectIcon,
+    titleLinkTo: headerTitleLinkTo,
+    actionConversation,
+    canShare,
+    canFork,
+    shareDisabled: shareDisabledReason !== undefined,
+    shareDisabledReason,
+    hasAgentInfo,
+    hasHeaderMenu: canShare || hasAgentInfo,
+    forkDisabledReason,
+    serverConversationId,
+    wrapperLabel:
+      activeSession?.labels?.[WRAPPER_LABEL_KEY] ?? activeConv?.labels?.[WRAPPER_LABEL_KEY] ?? null,
   };
 }
 
@@ -538,6 +739,7 @@ function AppShellImpl() {
   const mobileViewport = useIsMobileViewport();
   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
   const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
+  const railControlsWidth = useRailControlsWidth(conversationId);
   const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
@@ -662,6 +864,8 @@ function AppShellImpl() {
   // Sidebar open-state captured when entering full screen, so exiting can
   // restore whatever the user had (collapsed stays collapsed; open reopens).
   const sidebarOpenBeforeMaximizeRef = useRef(false);
+  // Set while a full screen left the sidebar as it was, so leaving it does too.
+  const maximizeKeptSidebarRef = useRef(false);
   // Scope of the mobile Files drawer: false = full folder tree, true =
   // changed-files-only flat list. On desktop the scope is the selected rail
   // tab (Files vs Changes); on a phone there's no tab strip, so the two FAB
@@ -764,6 +968,7 @@ function AppShellImpl() {
     [],
   );
   const [shareOpen, setShareOpen] = useState(false);
+  const [sharedConversationId, setSharedConversationId] = useState<string | null>(null);
   const [sharedFilePath, setSharedFilePath] = useState<string | undefined>();
   const [forkOpen, setForkOpen] = useState(false);
   const [forkSourceSessionId, setForkSourceSessionId] = useState<string | null>(null);
@@ -790,7 +995,6 @@ function AppShellImpl() {
   const debugMode = useDebugMode();
   // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
   const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
-  const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Mirror muted projects into the store that notifications and rows read.
   useSyncMutedProjects();
   // Surface sessions needing attention as OS notifications + a dock badge.
@@ -808,6 +1012,12 @@ function AppShellImpl() {
     [conversationsData],
   );
   useSeedReadState(allConversations);
+  const headerConversationId = useWarmSwitchConversationId(conversationId);
+  const header = useHeaderConversation(
+    headerConversationId,
+    allConversations,
+    conversationsLoading,
+  );
   const activeConv = useMemo(() => {
     if (!serverConversationId) return null;
     return allConversations?.find((c) => c.id === serverConversationId) ?? null;
@@ -815,18 +1025,12 @@ function AppShellImpl() {
   // What ⌘K commands act on. The level is only authoritative once this route's snapshot loads.
   const commandSession = useCommandSession(serverConversationId, activeConv);
   const commandView = commandViewForPath(location.pathname, rebasePath);
-  // A temporary row is display-only: it can supply optimistic breadcrumb
-  // text, but must not participate in permissions, actions, or server hooks.
-  const provisionalConv = useMemo(() => {
-    if (!conversationId || !isTempConvId(conversationId)) return null;
-    const row = allConversations?.find((c) => c.id === conversationId);
-    return row?.provisional === true ? row : null;
-  }, [conversationId, allConversations]);
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
   const { session: activeSession, isLoading: sessionLoading } = useSession(serverConversationId);
+  const { session: sharedSession } = useSession(sharedConversationId);
   const { session: scopedForkSourceSession, error: scopedForkSourceError } =
     useSession(forkSourceSessionId);
   const { session: forkHostSession } = useSession(forkHostSessionId);
@@ -862,8 +1066,7 @@ function AppShellImpl() {
     turnActive: chatStatus === "streaming",
     launchedAt: runnerLaunchedAt,
   });
-  // Full agent object (mcp_servers + policies) for the header info icon.
-  // react-query-cached, so this shares the fetch ChatPage's picker makes.
+  // Workspace relays and terminal inventory stay on the URL-scoped agent.
   const { data: boundAgent } = useSessionAgent(serverConversationId ?? null);
   const permissionLevel = derivePermissionLevel(
     activeSession,
@@ -906,10 +1109,6 @@ function AppShellImpl() {
   // (embedded Omnigent REPL terminal) have NO wrapper label and must
   // keep regular chat behavior. See TerminalFirstContext.tsx.
   const isNativeWrapper = isNativeWrapperLabel(sessionLabels["omnigent.wrapper"]);
-  // Used for the header "Back to parent" link, which is hidden on
-  // top-level sessions. The Subagents tab itself is always visible —
-  // it lists the root's children plus a "main" entry, so the user
-  // can move between siblings and back to the parent from one place.
   const isChildSession = activeSession?.parentSessionId != null;
   // A sub-agent runs in its parent's working directory but records no
   // host/workspace of its own (the parent owns the tmux pane), which would drop
@@ -924,156 +1123,27 @@ function AppShellImpl() {
     () => allConversations?.find((c) => c.id === forkHostSessionId) ?? null,
     [allConversations, forkHostSessionId],
   );
-  // ── Header breadcrumb ─────────────────────────────────────────────────
-  // The chat header shows the conversation's title, prefixed by a folder icon
-  // when the session is filed under a project, and with the sub-agent identity
-  // appended when viewing a child. Title + project come from the active
-  // conversation normally, or its immediate parent when inside a sub-agent
-  // (whose own row the sidebar omits, so its title falls back to the parent
-  // snapshot). The parent title also links back out, replacing the old "Back"
-  // button. A child always gets a title (fallback "New session") so that
-  // climb-out does not wait on the parent row or snapshot. Prefer a real
-  // list/snapshot title over conversationDisplayLabel — that helper's
-  // "New session" fallback would otherwise shadow a titled snapshot.
-  // Project membership lives only on the list row (`Conversation`), never
-  // the snapshot, so a parent outside the loaded window shows no folder.
-  const { session: parentSession } = useSession(activeSession?.parentSessionId);
-  const { data: projectSummaries } = useProjects();
-  const breadcrumbConv = isChildSession ? parentConv : (activeConv ?? provisionalConv);
-  const headerConversationTitle =
-    breadcrumbConv?.title ||
-    (isChildSession ? parentSession?.title : activeSession?.title) ||
-    (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
-    (isTempConvId(conversationId)
-      ? (optimisticConversationTitle ?? UNTITLED_CONVERSATION_LABEL)
-      : null) ||
-    (isChildSession || activeSession?.id === conversationId ? UNTITLED_CONVERSATION_LABEL : null);
-  const headerProjectSummary =
-    breadcrumbConv?.project_id != null
-      ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)
-      : undefined;
-  const headerProjectName =
-    headerProjectSummary?.name ?? breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ?? null;
-  const headerProjectIcon = headerProjectSummary?.icon ?? null;
-  const headerTitleLinkTo =
-    isChildSession && activeSession?.parentSessionId
-      ? `/c/${activeSession.parentSessionId}`
-      : undefined;
   const projectKanban = useProjectKanbanEnabled();
   const projectHomeName =
     extensionId === undefined && projectKanban ? projectNameFromHomePath(location.pathname) : null;
   // Beside a docked tablet sidebar the header is empty on plain pages, so they skip its clearance.
   const headerClearanceHidden =
     sideBySideSidebar && sidebarOpen && !conversationId && projectHomeName === null && !canvasMode;
-  // Positive "this is a top-level session" signal for the top-level-only
-  // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
-  // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
-  // is false and the buttons rendered, then vanished once the snapshot
-  // revealed ``parentSessionId``. A session present in the sidebar list is
-  // known top-level immediately (children are omitted from that query);
-  // otherwise we wait for the snapshot rather than optimistically showing.
-  const activeSessionMatchesRoute = activeSession?.id === conversationId;
-  const isKnownTopLevel =
-    activeConv != null ||
-    (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
-  // The off-window archive confirmation's sources; see `offWindowArchiveState`.
-  const openSessionRow = useOpenSessionRow(
-    !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
-      ? (serverConversationId ?? null)
-      : null,
-  );
-  const boundSessionStatus = useChatStore((s) =>
-    s.conversationId === serverConversationId ? s.sessionStatus : null,
-  );
-  const boundBackgroundTaskCount = useChatStore((s) =>
-    s.conversationId === serverConversationId ? s.backgroundTaskCount : 0,
-  );
-  const actionConversation = useMemo<Conversation | null>(() => {
-    if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
-    if (activeConv) return activeConv;
-    if (!activeSessionMatchesRoute || !activeSession) return null;
-    return {
-      id: activeSession.id,
-      object: "conversation",
-      title: activeSession.title,
-      created_at: activeSession.createdAt,
-      updated_at: activeSession.createdAt,
-      labels: activeSession.labels ?? {},
-      // The snapshot is the only archived-flag carrier here: an archived
-      // session is absent from the sidebar list, so without this the header
-      // menu would offer "Archive" on an already-archived session.
-      archived: activeSession.archived ?? false,
-      permission_level: activeSession.permissionLevel,
-      runner_id: activeSession.runnerId ?? null,
-      host_id: activeSession.hostId ?? null,
-      workspace: activeSession.workspace ?? null,
-      agent_id: activeSession.agentId,
-      agent_name: activeSession.agentName,
-      family: activeSession.family,
-      git_branch: activeSession.gitBranch ?? null,
-      // `useArchivePrompt` applies `isSessionWorking` to these.
-      ...offWindowArchiveState(
-        openSessionRow,
-        activeSession,
-        boundSessionStatus,
-        boundBackgroundTaskCount,
-      ),
-    };
-  }, [
-    activeConv,
-    activeSession,
-    activeSessionMatchesRoute,
-    boundBackgroundTaskCount,
-    boundSessionStatus,
-    isKnownTopLevel,
-    openSessionRow,
-    permissionLevel,
-  ]);
+  const isKnownTopLevel = isKnownTopLevelConversation(conversationId, activeConv, activeSession);
   useToggleUnreadHotkey(activeConv);
-  // Header action gating, hoisted so the desktop buttons and the mobile
-  // three-dot menu render the exact same set (they can't drift apart).
-  // Stop session is not a header action — it lives in the sidebar row's
-  // kebab menu (see Sidebar's ConversationRow).
-  // Only the owner can manage sharing; top-level only. Sharing a
-  // sub-agent is a no-op anyway — children inherit the parent's grants via
-  // the server's parent-delegation path — so we hide the affordance.
-  // Also hidden in single-user mode: with no other users to grant to, the
-  // affordance is meaningless (unlike the local-server / sharing-off cases
-  // below, which stay present-but-disabled with an explanatory tooltip).
-  // ``isOwnerLevel`` is permissive on a null level (single-user / still
-  // loading), matching the sidebar's owner-only Share gate and the terminal
-  // ``readOnly`` gate below; the authoritative snapshot level resolves it.
-  const canShare =
-    !!conversationId &&
-    isKnownTopLevel &&
-    isOwnerLevel(permissionLevel) &&
-    !isSingleUserMode(serverInfo);
-  // Two independent reasons the Share affordance is present-but-disabled: a
-  // local server can't produce openable links, and a deployed server whose
-  // admin set OMNIGENT_SHARING_MODE=off reports sharing_mode "off" via
-  // /v1/info. Fail open (share enabled) while the capability probe loads.
-  const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
-  const shareDisabled = canShare && (isCurrentServerLocal() || sharingOff);
-  const shareDisabledReason = !shareDisabled
-    ? undefined
-    : isCurrentServerLocal()
-      ? "Sharing is unavailable from a local server."
-      : SHARING_OFF_REASON;
-  // Any viewer can fork a shared session, sub-agents included — forking a
-  // child is how it gets promoted to a top-level session of its own. Gated on
-  // knowing which the session is (sidebar row or loaded snapshot) so the
-  // affordance doesn't flicker in before that resolves. Shared by the header
-  // menus and ForkDialogContext's per-message "Fork from here" action.
-  const canClone =
-    !!conversationId &&
-    (isKnownTopLevel || isChildSession) &&
-    (permissionLevel === null || permissionLevel >= 1);
+  // File sharing and descendant fork actions remain scoped to the URL session.
+  const {
+    canShare,
+    canFork: canClone,
+    shareDisabledReason,
+  } = sessionActionGates({
+    conversationId,
+    isKnownTopLevel,
+    isChildSession,
+    permissionLevel,
+    serverInfo,
+  });
   const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
-  // Agent tools/policies exist to show.
-  const hasAgentInfo =
-    serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
-  // Whether the mobile three-dot menu has any entry to offer.
-  const hasHeaderMenu = canShare || hasAgentInfo;
   // The live snapshot is authoritative; the sidebar row is only a fallback
   // (it is absent entirely for sub-agent children, which the list omits).
   const wrapperLabel =
@@ -1088,12 +1158,6 @@ function AppShellImpl() {
   // ``inventoryTerminals``).
   const hideTerminalsTab = isClaudeNativeSubagent;
   const deleteTerminalMutation = useDeleteTerminal(conversationId ?? "");
-  // Tab key awaiting a close confirmation, or null. Closing a tab kills the
-  // terminal, so a user-initiated close routes through a confirm modal first.
-  const [terminalPendingClose, setTerminalPendingClose] = useState<{
-    keys: string[];
-    callbacks?: ShellCloseCallbacks;
-  } | null>(null);
   // While a close is in flight, grey the tabs being killed so the delay between
   // confirming and a tab disappearing (the DELETE round-trip + its
   // ``resource.deleted``) reads as "closing", not frozen. A bulk close kills
@@ -1471,7 +1535,14 @@ function AppShellImpl() {
     restoredWorkspace.conversationId !== conversationId ||
     restoredWorkspace.canvasMode !== canvasMode
   ) {
-    setShareOpen(false);
+    // Keep a dialog already opened for the incoming session.
+    const sharingIncomingSession =
+      restoredWorkspace?.conversationId !== conversationId &&
+      sharedConversationId === conversationId;
+    if (!sharingIncomingSession) {
+      setShareOpen(false);
+      setSharedConversationId(conversationId ?? null);
+    }
     setSharedFilePath(undefined);
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
@@ -1482,9 +1553,6 @@ function AppShellImpl() {
     setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
-    // An open "Close shell?" dialog would target a terminal absent from the
-    // new session's list.
-    setTerminalPendingClose(null);
     setFileNavigation(undefined);
     setRightPanelVisibilityAnimating(false);
     if (!conversationId) {
@@ -1686,6 +1754,7 @@ function AppShellImpl() {
         if (!sessionJustRestored || !restoredWorkspace?.exitedMaximized) {
           sidebarOpenBeforeMaximizeRef.current = currentLayout.sidebarOpen;
         }
+        maximizeKeptSidebarRef.current = false;
         setSidebarOpen(false);
       } else if (!maximized && currentLayout.rightPanelMaximized) {
         restoreSidebarAfterMaximize();
@@ -1756,7 +1825,8 @@ function AppShellImpl() {
       // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
       // gated nav tab — always valid, and never a fallback target.
       if (tab === null) return fallbackTab;
-      if (tab === "sidechat") return tab;
+      // A gadget tab is a dynamic mode too; the rail falls back itself when it goes away.
+      if (tab === "sidechat" || tab === "gadget") return tab;
       if (tab === "content-search" && serverInfo === "loading") return tab;
       if (railTabsAvailable[tab]) return tab;
       return fallbackTab;
@@ -1959,15 +2029,13 @@ function AppShellImpl() {
   }, [setSearchParams]);
   // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, its diff in
   // Changes, or its comment's thread, and the request leaves the URL once it's handed over.
+  // It opens as it arrived: before the sidebar choice is known, the classic one can rewrite it.
+  const arrivedFileLink = useArrivedFileLink();
   useEffect(() => {
     const tabsSession = tabsSessionRef.current;
     if (tabsSession === null || !citationPath) return;
-    const commentId = searchParams.get("comment") || undefined;
-    const options: WorkspaceFileOpenOptions = {
-      ...urlNavigation?.position,
-      ...(searchParams.get("diff") === "1" ? { view: "diff" } : {}),
-      ...(commentId !== undefined ? { commentId } : {}),
-    };
+    const link = arrivedFileLink.peek(citationPath) ?? searchParams;
+    const options = fileLinkOpenOptions(link);
     void routeToWorkspaceTabs((tabs) =>
       tabs.openWorkspaceFileLink(tabsSession, citationPath, options, "link"),
     );
@@ -1976,7 +2044,7 @@ function AppShellImpl() {
       setRightPanelOpenImmediately(true);
       // ?fullscreen=1 fills the window with the sidebar, as its Full screen button does. Arriving
       // from another session's full screen, the left sidebar it closed is the one to restore.
-      if (urlFileFullscreen && !rightPanelMaximized) {
+      if (link.get("fullscreen") === "1" && !rightPanelMaximized) {
         const leftFullScreen =
           tabsLinkRestoreRef.current !== restoredWorkspace && !!restoredWorkspace?.exitedMaximized;
         if (!leftFullScreen) sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
@@ -2224,10 +2292,23 @@ function AppShellImpl() {
   // setter stays a plain boolean flip. ``restoreSidebarAfterMaximize`` is
   // shared with the session-switch reset, which also drops out of full screen.
   const restoreSidebarAfterMaximize = useCallback(() => {
+    if (maximizeKeptSidebarRef.current) {
+      maximizeKeptSidebarRef.current = false;
+      return;
+    }
     setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
   }, [setSidebarOpen]);
+  // A gadget opened from inside Omnigent fills the screen and leaves the sidebar as it was, open
+  // or closed, and leaving full screen leaves it as the viewer then has it. A gadget tab never
+  // has a file selected, so the file URL is left alone.
+  const maximizeRightPanelKeepingSidebar = useCallback(() => {
+    if (rightPanelMaximized) return;
+    maximizeKeptSidebarRef.current = true;
+    setRightPanelMaximized(true);
+  }, [rightPanelMaximized]);
   const toggleRightPanelMaximized = useCallback(() => {
     if (!rightPanelMaximized) {
+      maximizeKeptSidebarRef.current = false;
       sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
       setSidebarOpen(false);
     } else {
@@ -2258,9 +2339,12 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
-  // The palette replaces the theme picker rather than stacking on it, which ends its preview.
+  // The palette replaces the theme and feature-flag pickers rather than stacking on them.
   useEffect(() => {
-    if (commandPaletteOpen) replaceThemePicker();
+    if (commandPaletteOpen) {
+      replaceThemePicker();
+      replaceFeatureFlagsPicker();
+    }
   }, [commandPaletteOpen]);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
@@ -2521,6 +2605,31 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     revealTabsSidebar,
   ]);
+  // A gadget tab requested for this session shows the rail too.
+  const gadgetRailRequest = useGadgetRailRequest((state) => state.requested);
+  useEffect(() => {
+    if (gadgetRailRequest !== null && gadgetRailRequest.conversationId === conversationId)
+      setRightPanelOpenAnimated(true);
+  }, [gadgetRailRequest, conversationId, setRightPanelOpenAnimated]);
+  // A session started beside a gadget shows that gadget once it is created.
+  useAdoptStartedGadgetSession();
+  // Phones list the session's gadgets in its menu, which opens one over the session.
+  const sessionGadgets = useSessionGadgets(
+    serverConversationId ?? "",
+    serverConversationId !== undefined,
+  );
+  const mobileGadgetItems = useMemo(
+    () =>
+      conversationId
+        ? (sessionGadgets ?? []).map((gadget) => ({
+            key: gadgetRailKey(gadget.id),
+            label: gadget.name,
+            onSelect: () =>
+              requestGadgetRailTab(conversationId, gadgetRailKey(gadget.id), { maximize: true }),
+          }))
+        : [],
+    [conversationId, sessionGadgets],
+  );
   // A click on the task preview or a task's marker, the agent's first plan, or opening a
   // session with tasks asks for its Tasks tab; clear the one-shot request, then show it.
   const tasksTabToOpen = useSessionTasksActions((state) => state.tasksTabToOpen);
@@ -2752,47 +2861,65 @@ function AppShellImpl() {
     }
   }, [openTerminals, openTerminalTab]);
 
-  // User clicked a tab's "x". Closing a tab kills the underlying terminal, so
-  // confirm first rather than acting immediately.
-  const requestCloseTerminal = useCallback((key: string, callbacks?: ShellCloseCallbacks) => {
-    setTerminalPendingClose({ keys: [key], callbacks });
-  }, []);
-  // A bulk tab close asks once for all of its shells.
-  const requestCloseTerminals = useCallback((keys: string[], callbacks?: ShellCloseCallbacks) => {
-    if (keys.length > 0) setTerminalPendingClose({ keys, callbacks });
-  }, []);
-  // Confirmed close: kill the terminal (DELETE). The `session.resource.deleted`
-  // delta + the mutation's cache prune drop it from the list, so its tab
-  // disappears. If it was the active tab, move focus to a neighbor (prefer the
-  // previous, else the next) so the rail doesn't snap back to Files; when none
-  // remain the selection clears.
-  const confirmCloseTerminal = useCallback(() => {
-    if (terminalPendingClose === null) return;
-    const { keys, callbacks } = terminalPendingClose;
-    setTerminalPendingClose(null);
-    setSelectedTerminalKey((active) => {
-      if (active === null || !keys.includes(active)) return active;
-      const idx = openTerminals.indexOf(active);
-      const kept = (key: string) => !keys.includes(key);
-      return (
-        openTerminals.slice(0, Math.max(idx, 0)).findLast(kept) ??
-        openTerminals.slice(idx + 1).find(kept) ??
-        null
-      );
-    });
-    if (!conversationId) return;
-    callbacks?.onConfirmed?.();
-    for (const key of keys) {
-      const info = terminals.find((t) => terminalTabKey(t) === key);
-      if (!info) continue;
-      setKillingTerminalIds((ids) => [...ids, info.id]);
-      // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
-      deleteTerminalMutation
-        .mutateAsync(info.id)
-        .catch(() => callbacks?.onFailed?.(key))
-        .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== info.id)));
-    }
-  }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
+  // Kill the tabs' terminals; if the active one closes, focus the previous kept neighbor,
+  // else the next, so the rail doesn't snap back to Files.
+  const closeTerminalTabs = useCallback(
+    (keys: string[], callbacks?: ShellCloseCallbacks) => {
+      setSelectedTerminalKey((active) => {
+        if (active === null || !keys.includes(active)) return active;
+        const idx = openTerminals.indexOf(active);
+        const kept = (key: string) => !keys.includes(key);
+        return (
+          openTerminals.slice(0, Math.max(idx, 0)).findLast(kept) ??
+          openTerminals.slice(idx + 1).find(kept) ??
+          null
+        );
+      });
+      if (!conversationId) return;
+      callbacks?.onConfirmed?.();
+      for (const key of keys) {
+        const info = terminals.find((t) => terminalTabKey(t) === key);
+        if (!info) continue;
+        setKillingTerminalIds((ids) => [...ids, info.id]);
+        // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+        deleteTerminalMutation
+          .mutateAsync(info.id)
+          .catch(() => callbacks?.onFailed?.(key))
+          .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== info.id)));
+      }
+    },
+    [openTerminals, terminals, conversationId, deleteTerminalMutation],
+  );
+  // Closing a tab kills its terminal: the rail's shell tabs close through the "Close shell?" flow.
+  const closeShell = useShellCloseRequest<ShellTabsClose>(
+    conversationId,
+    "rail_tab_close",
+    (closes) => {
+      const { keys, callbacks } = joinShellTabsCloses(closes);
+      closeTerminalTabs(keys, callbacks);
+    },
+  );
+  const terminalPendingClose = closeShell.pending
+    ? joinShellTabsCloses(closeShell.pending.items)
+    : null;
+  // User closed shell tabs. Idle shells close at once and anything else asks first; a bulk close
+  // asks once for all of its shells.
+  const requestCloseShell = closeShell.request;
+  const requestCloseTerminals = useCallback(
+    (keys: string[], callbacks?: ShellCloseCallbacks) => {
+      if (keys.length === 0) return;
+      const ids = keys.flatMap((key) => {
+        const info = terminals.find((t) => terminalTabKey(t) === key);
+        return info ? [info.id] : [];
+      });
+      requestCloseShell({ keys, callbacks }, ids.length === keys.length ? ids : null);
+    },
+    [terminals, requestCloseShell],
+  );
+  const requestCloseTerminal = useCallback(
+    (key: string, callbacks?: ShellCloseCallbacks) => requestCloseTerminals([key], callbacks),
+    [requestCloseTerminals],
+  );
 
   // The active shell selection is sticky: it changes only on explicit user
   // action (opening a shell/file, switching a nav tab, closing the active
@@ -3042,10 +3169,11 @@ function AppShellImpl() {
       canShare && shareableFilePath
         ? () => {
             setSharedFilePath(shareableFilePath);
+            setSharedConversationId(serverConversationId ?? null);
             setShareOpen(true);
           }
         : undefined,
-    [canShare, shareableFilePath],
+    [canShare, shareableFilePath, serverConversationId],
   );
   const fileViewerContextValue = useMemo(
     () => ({
@@ -3276,6 +3404,24 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // ⇧⌘F and its ⌘K row: a hidden workspace opens straight into full screen.
+  const toggleWorkspaceFullScreen = useCallback(() => {
+    if (!workspacePanelVisible) {
+      revealRightPanel();
+      if (!rightPanelMaximized) toggleRightPanelMaximized();
+      return;
+    }
+    toggleRightPanelMaximized();
+  }, [workspacePanelVisible, revealRightPanel, rightPanelMaximized, toggleRightPanelMaximized]);
+  // Only the tabs sidebar fills the window; a phone shows the workspace as its own screen, and
+  // a grid route has its own rail.
+  const workspaceCanFillWindow =
+    tabsSidebar && !!conversationId && hasRailContent && !gridRoute && !mobileViewport;
+  useWorkspaceFullScreenCommand({
+    conversationId: conversationId ?? null,
+    fullScreen: workspaceCanFillWindow ? rightPanelMaximized && workspacePanelVisible : null,
+    toggle: toggleWorkspaceFullScreen,
+  });
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
   // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
@@ -3337,6 +3483,21 @@ function AppShellImpl() {
             sessionId={serverConversationId}
             pullRequestsAvailable={railTabsAvailable.github}
             showAll={() => openGithubTab()}
+          />
+        </Suspense>
+      )}
+      {/* The finder serves every window with the tabs sidebar, at any width: Go to File and Search
+        Text for its session, Sessions on any page. Its code, with the preview's editor, loads only
+        then. */}
+      {tabsSidebar && (
+        <Suspense fallback={null}>
+          <LazyGoToFileHost
+            key={serverConversationId ?? "no-session"}
+            // Files and Text only where the session's files can be browsed; Sessions always.
+            sessionId={showFilesPanel ? (serverConversationId ?? null) : null}
+            openFile={openFileViewer}
+            showTextSearch={() => showTabsPage("content-search")}
+            textSearch={railTabsAvailable["content-search"]}
           />
         </Suspense>
       )}
@@ -3493,16 +3654,19 @@ function AppShellImpl() {
                     sidebarOpen={sidebarOpen}
                     settingsMode={inSettings}
                     onOpenSidebar={handleSidebarOpen}
-                    isChildSession={isChildSession}
-                    subAgentName={activeSession?.subAgentName ?? null}
-                    conversationId={conversationId}
-                    workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
-                    permissionLevel={permissionLevel}
-                    actionConversation={actionConversation}
-                    conversationTitle={headerConversationTitle}
-                    projectName={headerProjectName}
-                    projectIcon={headerProjectIcon}
-                    titleLinkTo={headerTitleLinkTo}
+                    isChildSession={header.isChildSession}
+                    subAgentName={header.activeSession?.subAgentName ?? null}
+                    conversationId={headerConversationId}
+                    workspaceConversationId={conversationId ?? null}
+                    workingDirectory={
+                      header.activeSession?.workspace ?? header.activeConv?.workspace
+                    }
+                    permissionLevel={header.permissionLevel}
+                    actionConversation={header.actionConversation}
+                    conversationTitle={header.conversationTitle}
+                    projectName={header.projectName}
+                    projectIcon={header.projectIcon}
+                    titleLinkTo={header.titleLinkTo}
                     pageTitle={
                       projectHomeName !== null ? (
                         <ProjectHomeTitle projectName={projectHomeName} />
@@ -3513,26 +3677,41 @@ function AppShellImpl() {
                         <ProjectHomeHeaderActions projectName={projectHomeName} />
                       ) : undefined
                     }
-                    boundAgent={boundAgent}
-                    wrapperLabel={wrapperLabel}
-                    canShare={canShare}
-                    canFork={canClone}
-                    forkDisabledReason={forkDisabledReason}
-                    shareDisabled={shareDisabled}
-                    shareDisabledReason={shareDisabledReason}
+                    boundAgent={header.boundAgent}
+                    wrapperLabel={header.wrapperLabel}
+                    canShare={header.canShare}
+                    canFork={header.canFork}
+                    forkDisabledReason={header.forkDisabledReason}
+                    shareDisabled={header.shareDisabled}
+                    shareDisabledReason={header.shareDisabledReason}
                     onShare={() => {
                       setSharedFilePath(undefined);
+                      setSharedConversationId(header.serverConversationId ?? null);
                       setShareOpen(true);
                     }}
-                    onFork={() => forkDialogContextValue.openForkDialog()}
-                    hasAgentInfo={hasAgentInfo}
+                    onFork={() => {
+                      forkDialogContextValue.openForkDialog({
+                        sourceSessionId: header.serverConversationId,
+                      });
+                      setForkHostSessionId(header.activeSession?.parentSessionId ?? null);
+                    }}
+                    hasAgentInfo={header.hasAgentInfo}
                     onAgentInfo={() => setAgentInfoOpen(true)}
-                    hasHeaderMenu={hasHeaderMenu}
+                    hasHeaderMenu={header.hasHeaderMenu}
                     showFilesPanel={showFilesPanel}
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
-                    pending={pendingConversation}
+                    // The floating tabs sidebar collapses from its own corner button, where the toggle sits.
+                    rightPanelCollapsesItself={rightPanelCollapsesItself({
+                      floatingPanesShown,
+                      tabsSidebar,
+                      tabsInDrawer,
+                      rightPanelOpen,
+                      railWidth: inlinePanelWidth,
+                      controlsWidth: railControlsWidth,
+                    })}
+                    pending={isTempConvId(headerConversationId)}
                     mobileMenu={{
                       fileViewerOpen,
                       panelOpen,
@@ -3575,6 +3754,7 @@ function AppShellImpl() {
                       onOpenSideChats: tabsSidebar
                         ? () => showTabsTabOf("chat")
                         : openSideChatsPanel,
+                      gadgets: mobileGadgetItems,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -3746,6 +3926,9 @@ function AppShellImpl() {
                     onCloseTerminals={requestCloseTerminals}
                     maximized={rightPanelMaximized}
                     onToggleMaximized={toggleRightPanelMaximized}
+                    onMaximizeKeepingSidebar={maximizeRightPanelKeepingSidebar}
+                    sidebarOpen={sidebarOpen}
+                    onOpenSidebar={handleSidebarOpen}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}
@@ -3760,6 +3943,13 @@ function AppShellImpl() {
                     subagentPanelOpener={openSubagentInPanel}
                   />
                 )}
+                {/* The gadget a New session starts from, beside its composer. */}
+                <GadgetNewSessionPanel
+                  active={!conversationId}
+                  sidebarOpen={sidebarOpen}
+                  onOpenSidebar={handleSidebarOpen}
+                  onSidebarOpenChange={setSidebarOpen}
+                />
               </div>
 
               {conversationId && workspacePanelMounted && tabsSidebar && mobileViewport && (
@@ -3813,12 +4003,15 @@ function AppShellImpl() {
               />
             </GridWorkspace>
           </div>
-          {conversationId && (
+          {sharedConversationId && (
             <PermissionsModal
-              key={`${conversationId}:${sharedFilePath ?? ""}`}
-              sessionId={conversationId}
+              key={`${sharedConversationId}:${sharedFilePath ?? ""}`}
+              sessionId={sharedConversationId}
               filePath={sharedFilePath}
-              workspace={activeSession?.workspace ?? activeConv?.workspace}
+              workspace={
+                sharedSession?.workspace ??
+                allConversations?.find((row) => row.id === sharedConversationId)?.workspace
+              }
               open={shareOpen}
               onOpenChange={setShareOpen}
             />
@@ -3868,8 +4061,9 @@ function AppShellImpl() {
               if (!info) return null;
               return terminalDisplayLabel(info);
             })()}
-            onConfirm={confirmCloseTerminal}
-            onCancel={() => setTerminalPendingClose(null)}
+            busy={closeShell.pending?.busy}
+            onConfirm={closeShell.confirm}
+            onCancel={closeShell.cancel}
           />
           <CloseWindowDialog
             prompt={closeWindowPrompt}
@@ -3889,7 +4083,7 @@ function AppShellImpl() {
           />
           {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}
-          {hasAgentInfo && (
+          {header.hasAgentInfo && (
             <Dialog open={agentInfoOpen} onOpenChange={setAgentInfoOpen}>
               <DialogContent className="max-h-[85vh] overflow-y-auto">
                 <DialogHeader>
@@ -3899,9 +4093,9 @@ function AppShellImpl() {
                   </DialogDescription>
                 </DialogHeader>
                 <AgentInfoContent
-                  agent={boundAgent}
-                  sessionId={conversationId}
-                  permissionLevel={permissionLevel}
+                  agent={header.boundAgent}
+                  sessionId={headerConversationId}
+                  permissionLevel={header.permissionLevel}
                 />
               </DialogContent>
             </Dialog>
@@ -3920,6 +4114,14 @@ function AppShellImpl() {
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
           />
+          {/* ⌘K's Mark all as read and Resume sandbox, with the label and action their own
+              surfaces use. */}
+          {isFeatureEnabled(serverInfo, "quick_pick_palette") && (
+            <>
+              <MarkAllReadPaletteCommand />
+              <ResumeSandboxPaletteCommand />
+            </>
+          )}
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </AppShellRootProviders>

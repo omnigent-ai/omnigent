@@ -22,6 +22,7 @@ export {
 } from "./itemRanking";
 export {
   compareCandidateMatches,
+  foldText,
   matchCandidate,
   matchText,
   mergeRanges,

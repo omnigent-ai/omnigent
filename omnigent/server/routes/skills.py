@@ -194,12 +194,13 @@ def create_skills_router(
                 and CAP_MEMORY_IMPORT_SKILL in conn.hello.capabilities
                 else without_memory_tools(spec)
             )
-            # Framework skills come last, as in resolve_session_skills.
+            # Framework skills come last, as in resolve_session_skills; the menu lists
+            # only those people invoke.
             listed = reserved | {skill.name for skill in skills}
             skills += [
                 SkillSummary(name=skill.name, description=skill.description)
                 for skill in framework_skills(framework_spec, workflows_enabled=workflows_enabled)
-                if skill.name not in listed
+                if skill.user_invocable and skill.name not in listed
             ]
         return SkillsResponse(skills=skills, warnings=result.warnings)
 

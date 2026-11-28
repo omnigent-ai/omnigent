@@ -113,7 +113,7 @@ export function LanguageBreakdown({
         </Button>
       </PopoverTrigger>
       <PopoverContent
-        align="end"
+        align="start"
         className="w-80 gap-2 p-2"
         aria-label="Changes by language"
         onCloseAutoFocus={(event) => {

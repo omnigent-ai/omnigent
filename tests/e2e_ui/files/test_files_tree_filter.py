@@ -1,7 +1,8 @@
-"""E2E: the tabs sidebar's Files tree filters by name, narrowed by globs.
+"""E2E: the tabs sidebar's Files tree filters by name and by globs.
 
-With ``workspace_sidebar_v2`` on, the tree header's Filter Files Tree by Name opens a
-filter under it. Typing a name shows the workspace's matches as a tree, under a strip
+With ``workspace_sidebar_v2`` on, the tree header's ⋯ Filter by name opens a
+filter under it. Globs alone narrow the tree itself, an exclude hiding what it matches.
+Typing a name shows the workspace's matches as a tree, under a strip
 that says what the filter does. Include and exclude globs narrow the search, a match
 opens like a tree row, and Clear or Escape return to the whole tree. ⌘K's row opens the
 filter with focus in it, and closing it, in the narrow popover too, leaves focus on its
@@ -38,6 +39,14 @@ def _row(container: Locator, path: str) -> Locator:
     return container.locator(f'[role="treeitem"][data-item-path="{path}"]')
 
 
+def _open_filter(page: Page, scope: Locator) -> None:
+    """Choose Filter by name in the tree header's ⋯."""
+    scope.get_by_test_id("files-page-tree-header").get_by_role(
+        "button", name=re.compile(r"^Tree options")
+    ).click()
+    page.get_by_role("menuitem", name="Filter by name").click()
+
+
 def test_the_tree_filters_by_name_narrows_by_globs_and_clears(
     page: Page, filter_session: tuple[str, str]
 ) -> None:
@@ -48,7 +57,7 @@ def test_the_tree_filters_by_name_narrows_by_globs_and_clears(
         timeout=30_000
     )
 
-    sidebar.get_by_role("button", name="Filter Files Tree by Name").click()
+    _open_filter(page, sidebar)
     name = sidebar.get_by_role("textbox", name="Name contains")
     expect(name).to_be_focused()
     name.fill("button")
@@ -74,18 +83,25 @@ def test_the_tree_filters_by_name_narrows_by_globs_and_clears(
     place = sidebar.locator('[data-testid="workspace-files-place"]:visible')
     expect(place.get_by_text("button-sentinel")).to_be_visible(timeout=30_000)
 
-    # Back returns to the filtered tree, and Clear to the whole tree.
+    # Back returns to the filtered tree. With the name cleared, the globs alone narrow
+    # the tree itself; Clear brings back the whole tree.
     sidebar.get_by_role("group", name="Workspace history").get_by_role(
         "button", name="Back"
     ).click()
     strip = sidebar.get_by_test_id("tree-filter-strip")
     expect(strip).to_be_visible()
+    name.fill("")
+    expect(strip).to_have_text(re.compile(r"Hiding \*\.test\.ts, docs/\*\*"), timeout=15_000)
+    tree = sidebar.get_by_role("tree", name="Workspace files")
+    expect(_row(tree, "README.md")).to_be_visible(timeout=15_000)
+    expect(_row(tree, "docs/")).to_have_count(0)
     strip.get_by_role("button", name="Clear").click()
     expect(sidebar.get_by_role("treeitem", name="README.md", exact=True)).to_be_visible()
+    expect(_row(tree, "docs/")).to_be_visible(timeout=15_000)
     expect(strip).to_have_count(0)
 
     # ⌘K opens the filter with focus in it; Escape empties the name, then closes the filter.
-    sidebar.get_by_role("button", name="Filter Files Tree by Name").click()
+    sidebar.get_by_role("button", name="Close filter").click()
     expect(name).to_have_count(0)
     run_palette(page, "Filter Files Tree by Name")
     expect(name).to_be_focused(timeout=10_000)
@@ -97,8 +113,8 @@ def test_the_tree_filters_by_name_narrows_by_globs_and_clears(
     expect(name).to_have_value("")
     name.press("Escape")
     expect(name).to_have_count(0)
-    # Focus moves to the filter's button rather than dropping to the page.
-    expect(sidebar.get_by_role("button", name="Filter Files Tree by Name")).to_be_focused()
+    # Focus moves to the ⋯ that offers the filter rather than dropping to the page.
+    expect(sidebar.get_by_role("button", name="Tree options")).to_be_focused()
 
 
 def test_closing_the_filter_in_the_narrow_popover_keeps_focus_in_it(
@@ -113,16 +129,16 @@ def test_closing_the_filter_in_the_narrow_popover_keeps_focus_in_it(
     popover = page.get_by_role("dialog", name="Workspace files")
     expect(popover).to_be_visible()
 
-    toggle = popover.get_by_role("button", name="Filter Files Tree by Name")
-    toggle.click()
+    _open_filter(page, popover)
     name = popover.get_by_role("textbox", name="Name contains")
     expect(name).to_be_focused()
     name.press("Escape")
     expect(name).to_have_count(0)
     expect(popover).to_be_visible()
-    expect(toggle).to_be_focused()
+    expect(popover.get_by_role("button", name="Tree options")).to_be_focused()
 
-    toggle.click()
+    _open_filter(page, popover)
+    expect(name).to_be_focused()
     popover.get_by_role("button", name="Close filter").click()
     expect(popover).to_be_visible()
-    expect(toggle).to_be_focused()
+    expect(popover.get_by_role("button", name="Tree options")).to_be_focused()

@@ -16,13 +16,20 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
+from omnigent.automations_availability import (
+    ACCEPTED_TOOL_GROUPS_HEADER,
+    AUTOMATIONS_HEADER,
+    GADGETS_HEADER,
+    NEGOTIATED_TOOL_GROUPS,
+    USER_INBOX_HEADER,
+)
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
 from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER, POLICY_MODULES_HEADER
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -42,7 +49,12 @@ from omnigent.server.auth import (
     AuthProvider,
     local_single_user_enabled,
 )
-from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
+from omnigent.server.bundles import (
+    bundle_location,
+    bundle_without_tool_groups,
+    redacted_agent_bundle,
+    validate_agent_bundle,
+)
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
@@ -94,6 +106,9 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
+
+# User-Agent products of Omnigent clients that read bundles as written (see agent/contents).
+_SELF_NAMED_CLIENTS = ("omnigent-cli/", "omnigent-runner/", "omnigent-harness/")
 
 
 def register_agent_routes(
@@ -281,6 +296,23 @@ def register_agent_routes(
                 bundle_bytes,
                 operator_authored=agent.operator_authored,
             )
+        # Strip unknown tool groups only for legacy spec readers (a runner loading the spec, or
+        # a host reading its skills); preserve original bundles for exports.
+        runner_spec_fetch = request.headers.get(MCP_SELECTION_HEADER) == "1"
+        host_skill_read = (
+            request.headers.get("Origin") == OMNIGENT_INTERNAL_WS_ORIGIN
+            and RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
+            and not request.headers.get("User-Agent", "").startswith(_SELF_NAMED_CLIENTS)
+        )
+        accepted = {
+            group.strip()
+            for group in request.headers.get(ACCEPTED_TOOL_GROUPS_HEADER, "").split(",")
+        }
+        unknown_groups = NEGOTIATED_TOOL_GROUPS - accepted
+        if (runner_spec_fetch or host_skill_read) and unknown_groups:
+            bundle_bytes = await asyncio.to_thread(
+                bundle_without_tool_groups, bundle_bytes, frozenset(unknown_groups)
+            )
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":
             selection_headers[MCP_SELECTION_HEADER] = json.dumps(
@@ -316,6 +348,10 @@ def register_agent_routes(
                 )
                 inbox_on = False
             selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
+        gadgets_available = getattr(request.app.state, "gadgets_available", None)
+        selection_headers[GADGETS_HEADER] = (
+            "1" if gadgets_available is not None and gadgets_available() else "0"
+        )
         memory_available = getattr(request.app.state, "memory_available", None)
         selection_headers[MEMORY_HEADER] = (
             "1" if memory_available is not None and memory_available() else "0"
@@ -631,6 +667,7 @@ def register_agent_routes(
 
         if method == "tools/call":
             from omnigent.server.mcp_identity import mcp_policy_actor
+            from omnigent.tools.builtins.gadgets import GADGET_TOOL_NAMES
             from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 
             tool_name = params.get("name")
@@ -642,6 +679,12 @@ def register_agent_routes(
                 )
             ):
                 return _mcp_error_response(rpc_id, -32601, "Workflows are disabled on this server")
+            if isinstance(tool_name, str) and tool_name in GADGET_TOOL_NAMES:
+                gadgets_available = getattr(request.app.state, "gadgets_available", None)
+                if gadgets_available is None or not gadgets_available():
+                    return _mcp_error_response(
+                        rpc_id, -32601, "Gadgets are disabled on this server"
+                    )
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)

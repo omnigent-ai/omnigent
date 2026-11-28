@@ -10,6 +10,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type * as TabStoreModule from "@/components/BrowserPane/agentTools/tabStore";
 import type { WorkspaceTabsHostProps } from "./workspaceTabs/WorkspaceTabsHost";
+import type { GoToFileHostProps } from "./goToFile/GoToFileHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext } from "react";
@@ -24,6 +25,8 @@ import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { TabsRecord } from "@/components/BrowserPane/agentTools/tabStore";
 import { type BrowserActionOutcome, emitBrowserActionSettled } from "@/lib/browserActionBus";
 import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
@@ -73,10 +76,21 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", async (importOriginal) =
 
 // The file action host has its own suite; these tests check that it mounts only with the flag.
 const fileActionHost = vi.hoisted(() => ({ throws: false }));
+// Like the real viewer before a file's diff loads, the classic viewer can take `diff` off the URL.
+const classicViewer = vi.hoisted(() => ({ dropsDiff: false }));
 vi.mock("./fileCommands/FileActionHost", () => ({
   FileActionHost: () => {
     if (fileActionHost.throws) throw new Error("file action host broke");
     return <div data-testid="file-action-host" />;
+  },
+}));
+
+// Go to File has its own suites; these tests check where it mounts and what it's handed.
+const goToFile = vi.hoisted(() => ({ props: null as GoToFileHostProps | null }));
+vi.mock("./goToFile/GoToFileHost", () => ({
+  GoToFileHost: (props: GoToFileHostProps) => {
+    goToFile.props = props;
+    return <div data-testid="go-to-file-host" />;
   },
 }));
 
@@ -183,11 +197,35 @@ vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
   revealFolderInFilesPanel: vi.fn(),
 }));
-vi.mock("./FileViewer", () => ({ FileViewer: () => <div data-testid="file-viewer" /> }));
+vi.mock("./FileViewer", async () => {
+  const { useEffect } = await import("react");
+  const { useSearchParams } = await import("react-router-dom");
+  return {
+    FileViewer: ({ syncUrl }: { syncUrl?: boolean }) => {
+      const [params, setParams] = useSearchParams();
+      useEffect(() => {
+        if (!classicViewer.dropsDiff || !syncUrl || !params.has("diff")) return;
+        setParams(
+          (previous) => {
+            const next = new URLSearchParams(previous);
+            next.delete("diff");
+            return next;
+          },
+          { replace: true },
+        );
+      }, [syncUrl, params, setParams]);
+      return <div data-testid="file-viewer" />;
+    },
+  };
+});
 vi.mock("./InlineTerminalsSection", () => ({ InlineTerminalsSection: () => null }));
 vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useSession } from "@/hooks/useSession";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
+import { LEVEL_READ } from "@/lib/permissionsApi";
+import { readRecentWorkspaceFiles } from "@/lib/recentWorkspaceFiles";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
@@ -289,6 +327,12 @@ function ChatProbe() {
       <button type="button" onClick={() => navigate("/c/conv_ws?file=README.md&line=4")}>
         Follow README link
       </button>
+      <button
+        type="button"
+        onClick={() => navigate("/c/conv_ws?file=src/app.ts", { replace: true })}
+      >
+        Rewrite the link to another file
+      </button>
       <button type="button" onClick={() => navigate("/c/conv_other?file=README.md&fullscreen=1")}>
         Follow another session's full screen link
       </button>
@@ -301,8 +345,8 @@ function ChatProbe() {
 
 function renderShell(info: ServerInfo | "loading", entry = "/c/conv_ws") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <CapabilitiesProvider info={info}>
+  const tree = (current: ServerInfo | "loading") => (
+    <CapabilitiesProvider info={current}>
       <QueryClientProvider client={client}>
         <SidebarDataProvider>
           <TooltipProvider>
@@ -316,8 +360,12 @@ function renderShell(info: ServerInfo | "loading", entry = "/c/conv_ws") {
           </TooltipProvider>
         </SidebarDataProvider>
       </QueryClientProvider>
-    </CapabilitiesProvider>,
+    </CapabilitiesProvider>
   );
+  const view = render(tree(info));
+  /** The server's answer arriving, or changing, for the shell already on screen. */
+  const setInfo = (next: ServerInfo | "loading") => view.rerender(tree(next));
+  return { ...view, setInfo };
 }
 
 /** The session's browser tabs change, as the relay's write to main reports it. */
@@ -367,6 +415,7 @@ function agentTabs(request: AgentBrowserTabRequest) {
 
 beforeEach(() => {
   localStorage.clear();
+  goToFile.props = null;
   sessionStorage.clear();
   writeWorkspacePanelDefault("open");
   tabs.host = null;
@@ -398,6 +447,15 @@ describe("workspace_sidebar_v2", () => {
     expect(await screen.findAllByTestId("file-action-host")).toHaveLength(1);
   });
 
+  it("keeps the classic sidebar, which has gadget tabs, when the server has gadgets too", async () => {
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, gadgets: true } });
+
+    expect(await screen.findByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("tabs-host")).toBeNull();
+  });
+
   it("keeps the shell when the file action host throws", async () => {
     fileActionHost.throws = true;
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -427,6 +485,93 @@ describe("workspace_sidebar_v2", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
+  });
+
+  it("mounts Go to File for the session with the flag on", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws", textSearch: false });
+  });
+
+  it.each([
+    [
+      "a read-only viewer the session doesn't share its files with",
+      () => {
+        const session = vi.mocked(useSession);
+        const original = session.getMockImplementation()!;
+        session.mockImplementation(
+          () =>
+            ({
+              session: { id: "conv_ws", permissionLevel: LEVEL_READ, shareWorkspaceFiles: false },
+              isLoading: false,
+              error: null,
+            }) as never,
+        );
+        onTestFinished(() => {
+          session.mockImplementation(original);
+        });
+      },
+    ],
+    [
+      "a session whose environment has no filesystem",
+      () => {
+        const environment = vi.mocked(useWorkspaceEnvironment);
+        const original = environment.getMockImplementation()!;
+        environment.mockImplementation(
+          () => ({ data: { available: false, root: null }, isLoading: false }) as never,
+        );
+        onTestFinished(() => {
+          environment.mockImplementation(original);
+        });
+      },
+    ],
+  ])("keeps Go to File's Sessions but searches no files for %s", async (_, arrange) => {
+    arrange();
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: null, textSearch: false });
+  });
+
+  it("offers Go to File's text search when the session has content search", async () => {
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props?.textSearch).toBe(true);
+    act(() => goToFile.props?.showTextSearch());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith(
+        "conv_ws",
+        "content-search",
+      ),
+    );
+  });
+
+  it.each([
+    ["off", withFlag(false)],
+    ["omitted", WITHOUT_FLAG],
+  ])("leaves Go to File out, and lists no recent files, when the flag is %s", async (_, info) => {
+    setViewport(DESKTOP);
+    renderShell(info);
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+    expect(readRecentWorkspaceFiles("conv_ws")).toEqual([]);
+  });
+
+  it("leaves Go to File out on a phone", async () => {
+    setViewport(390, "coarse");
+    renderShell(withFlag(true));
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
   });
 
   it("offers ⌘K's Show all pull requests with the flag on, which opens the session's list", async () => {
@@ -581,6 +726,16 @@ describe("workspace_sidebar_v2", () => {
     expect(tabs.host!.onHide).toBeUndefined();
     fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
     expect(drawer).toHaveAttribute("data-state", "closed");
+
+    // Go to File serves the drawer's tabs too, and a resize keeps an open finder mounted.
+    const finder = screen.getByTestId("go-to-file-host");
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws" });
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
+    resizeTo(NARROW_DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "drawer" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
   });
 
   it("opens the Workspace drawer on a page from the session's menu in a narrow window", async () => {
@@ -699,7 +854,6 @@ describe("workspace_sidebar_v2", () => {
   );
 
   it("doesn't reopen a file the classic sidebar remembered when the tabs sidebar reopens", async () => {
-    const { writeSessionWorkspaceState } = await import("@/lib/sessionWorkspaceState");
     writeSessionWorkspaceState("conv_ws", { selectedFilePath: "old.ts", open: true });
     setViewport(DESKTOP);
     renderShell(withFlag(true));
@@ -834,6 +988,48 @@ describe("workspace_sidebar_v2", () => {
     expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(linkOpens);
   });
 
+  it("opens a ?diff= link as it arrived, though the classic sidebar rewrote it before the server answered", async () => {
+    setViewport(DESKTOP);
+    classicViewer.dropsDiff = true;
+    onTestFinished(() => {
+      classicViewer.dropsDiff = false;
+    });
+    const shell = renderShell("loading", "/c/conv_ws?file=README.md&line=4&diff=1");
+    // Until the server answers, the classic sidebar shows the file and its viewer drops `diff`.
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("diff="));
+    expect(screen.getByTestId("search")).toHaveTextContent("file=README.md");
+
+    shell.setInfo(withFlag(true));
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledWith(
+        "conv_ws",
+        "README.md",
+        { line: 4, view: "diff" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("file="));
+    expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the URL's own link when it was rewritten to another file before the server answered", async () => {
+    setViewport(DESKTOP);
+    const shell = renderShell("loading", "/c/conv_ws?file=README.md&diff=1");
+    fireEvent.click(screen.getByRole("button", { name: "Rewrite the link to another file" }));
+    await waitFor(() => expect(screen.getByTestId("search")).toHaveTextContent("file=src"));
+
+    shell.setInfo(withFlag(true));
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledWith(
+        "conv_ws",
+        "src/app.ts",
+        {},
+        "link",
+      ),
+    );
+    expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(1);
+  });
+
   it("fills the window with the sidebar for a ?fullscreen=1 link, and leaves the URL", async () => {
     setViewport(DESKTOP);
     renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
@@ -958,5 +1154,63 @@ describe("workspace_sidebar_v2", () => {
     } finally {
       delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
     }
+  });
+});
+
+describe("⇧⌘F and ⌘K's full screen row", () => {
+  const pressFullScreen = () => {
+    const mac = isMacPlatform();
+    const event = new KeyboardEvent("keydown", {
+      key: "F",
+      code: "KeyF",
+      metaKey: mac,
+      ctrlKey: !mac,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    return event;
+  };
+  const fullScreenRow = () =>
+    registeredPaletteCommands().find(
+      (command) => command.shortcut === "workspace.toggleFullScreen",
+    );
+
+  it("fills the window from the chord, and leaves it on a second press", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    await screen.findByTestId("tabs-host");
+    // The row and the chord load with the tabs sidebar's code.
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    expect(pressFullScreen().defaultPrevented).toBe(true);
+    expect(tabs.host).toMatchObject({ maximized: true });
+    expect(fullScreenRow()?.label).toBe("Exit workspace full screen");
+    pressFullScreen();
+    expect(tabs.host).toMatchObject({ maximized: false });
+    expect(fullScreenRow()?.label).toBe("Make the workspace full screen");
+  });
+
+  it("opens a closed sidebar straight into full screen from ⌘K", async () => {
+    setViewport(DESKTOP);
+    writeSessionWorkspaceState("conv_ws", { open: false });
+    renderShell(withFlag(true));
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    act(() => fullScreenRow()!.run());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+  });
+
+  it("leaves the chord alone and offers no row in the classic sidebar", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(false));
+    await screen.findByRole("complementary", { name: "Workspace" });
+    // A row registered late, once some lazy code loads, would still count.
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
+    expect(pressFullScreen().defaultPrevented).toBe(false);
+    expect(fullScreenRow()).toBeUndefined();
   });
 });

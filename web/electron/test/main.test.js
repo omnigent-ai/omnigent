@@ -7934,6 +7934,30 @@ describe("Close menu item", () => {
     assert.equal(closes, 1);
   });
 
+  it("rebuilds the menu for a change it shows, not for pick-list focus", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createWindow();
+    h.setUrl(server);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    const report = (state) =>
+      h.ipc.get("omnigent:set-desktop-command-state")(
+        { sender: h.webContents, senderFrame: { url: server } },
+        state,
+      );
+    report({ commands: ["close"] });
+    const built = h.calls.appMenu;
+    assert.ok(built);
+
+    report({ commands: ["close"], pickListFocused: true });
+    assert.equal(h.calls.appMenu, built);
+    assert.equal(h.api.windows.get(h.win).desktopCommands.pickListFocused, true);
+
+    report({ commands: ["close", "go-back"], pickListFocused: true });
+    assert.notEqual(h.calls.appMenu, built);
+  });
+
   it("names the page whose design tool's overlay holds the keys", (t) => {
     // A fresh design tools module, whose overlays are views made here.
     const Module = require("node:module");

@@ -6,7 +6,12 @@ import { ArrowLeftIcon, ChevronDownIcon, ChevronUpIcon, Loader2Icon } from "luci
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ComparisonOwnerContext, useComparisonOwner } from "@/hooks/useComparisonOwner";
+import {
+  ComparisonOwnerContext,
+  useComparisonOwner,
+  useComparisonRepository,
+  useComparisonWorkspaceKey,
+} from "@/hooks/useComparisonOwner";
 import { type WorkingCopyChanges, useWorkingCopyChanges } from "@/hooks/useWorkingCopyChanges";
 import type { BranchCommit } from "@/lib/branchCommits";
 import { type CommitComparisons, createCommitComparisons } from "@/lib/commitComparisons";
@@ -31,30 +36,37 @@ export interface CommitStepFocus {
 }
 
 /**
- * The owner that reads `spec`, made once a commit is first opened and kept for the
- * review's life, so stepping only changes what it compares.
+ * The owner that reads `spec`, made once a commit is first opened and kept while the review
+ * shows the same folder, so stepping only changes what it compares.
  */
-export function useCommitComparisons(spec: RevisionSpec | null): WorkingCopyComparisonOwner | null {
-  const instance = useRef<CommitComparisons | null>(null);
+export function useCommitComparisons(
+  spec: RevisionSpec | null,
+  repository = "",
+  workspaceKey = "",
+): WorkingCopyComparisonOwner | null {
+  const instance = useRef<{ comparisons: CommitComparisons; folder: string } | null>(null);
   const [owner, setOwner] = useState<WorkingCopyComparisonOwner | null>(null);
   const base = spec?.base;
   const head = spec?.head;
   useEffect(() => {
     if (base === undefined || head === undefined) return;
     const next = { base, head };
-    if (instance.current) {
-      instance.current.show(next);
+    // Stepping keeps the owner; a review of another folder lists from a new one.
+    const folder = `${workspaceKey}\u0000${repository}`;
+    if (instance.current?.folder === folder) {
+      instance.current.comparisons.show(next);
       return;
     }
+    instance.current?.comparisons.dispose();
     const created = createCommitComparisons(next, (customComparisons) =>
-      createComparisonOwner({ customComparisons, onlyTyped: true }),
+      createComparisonOwner({ customComparisons, onlyTyped: true, repository, workspaceKey }),
     );
-    instance.current = created;
+    instance.current = { comparisons: created, folder };
     setOwner(created.owner);
-  }, [base, head]);
+  }, [base, head, repository, workspaceKey]);
   useEffect(
     () => () => {
-      instance.current?.dispose();
+      instance.current?.comparisons.dispose();
       instance.current = null;
     },
     [],
@@ -81,7 +93,8 @@ export function OpenBranchCommit({
   renderChanges: (changes: WorkingCopyChanges) => React.ReactNode;
 }) {
   const spec = commitRevisions(commit.oid, { root: commit.root });
-  const owner = useCommitComparisons(spec);
+  // A commit of a repository folder's review is listed from that folder.
+  const owner = useCommitComparisons(spec, useComparisonRepository(), useComparisonWorkspaceKey());
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="changes-review-open-commit">
       <BranchCommitToolbar

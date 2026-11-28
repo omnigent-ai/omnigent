@@ -6,6 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "re
 import {
   COMPOSER_INPUT_ID_ATTRIBUTE,
   COMPOSER_INPUT_SELECTOR,
+  composerTargetElement,
   composerTargetOf,
   type ComposerInputEngine,
   type ComposerTextTarget,
@@ -14,6 +15,8 @@ import {
 interface HandoffSnapshot {
   /** The active input's id ("tail" or a reply quote's), which both engines render. */
   inputId: string;
+  /** The input's text, which the selection's offsets index. */
+  value: string;
   selectionStart: number;
   selectionEnd: number;
   scrollTop: number;
@@ -47,6 +50,7 @@ function capture(root: HTMLElement, activeId: string | null): HandoffSnapshot | 
   if (!target || inputId === null) return null;
   return {
     inputId,
+    value: target.value,
     selectionStart: target.selectionStart,
     selectionEnd: target.selectionEnd,
     scrollTop: target.scrollTop,
@@ -56,11 +60,28 @@ function capture(root: HTMLElement, activeId: string | null): HandoffSnapshot | 
 }
 
 function restore(root: HTMLElement, snapshot: HandoffSnapshot): ComposerTextTarget | null {
-  const target = composerTargetOf(inputWithId(root, snapshot.inputId));
+  // An input the new engine lacks, like a quote's in one document, hands over to the tail.
+  const element = inputWithId(root, snapshot.inputId) ?? composerInputs(root).at(-1);
+  const target = composerTargetOf(element);
   if (!target) return null;
-  target.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
-  target.scrollTop = snapshot.scrollTop;
-  target.scrollLeft = snapshot.scrollLeft;
+  // The tail ends the one document, so a selection in it moves by the text before it. Any other
+  // selection indexes text the new input doesn't hold, and the caret goes to the end.
+  const found = inputIdOf(element) === snapshot.inputId;
+  const { value } = target;
+  const shift = value.length - snapshot.value.length;
+  const nested = value.endsWith(snapshot.value) || snapshot.value.endsWith(value);
+  const carried = found && nested && snapshot.selectionStart + shift >= 0;
+  const end = value.length;
+  target.setSelectionRange(
+    carried ? snapshot.selectionStart + shift : end,
+    carried ? snapshot.selectionEnd + shift : end,
+  );
+  // Scroll belongs to the old input's text, so it carries only when that text is unchanged.
+  const same = found && value === snapshot.value;
+  if (same) {
+    target.scrollTop = snapshot.scrollTop;
+    target.scrollLeft = snapshot.scrollLeft;
+  }
   if (snapshot.focused) target.focus({ preventScroll: true });
   return target;
 }
@@ -77,6 +98,8 @@ export interface ComposerHandoffOptions {
   activeInputId?: string | null;
   /** The active input after a switch, now on the new engine, so the owner's refs stay current. */
   onActiveInputChange?: (target: ComposerTextTarget) => void;
+  /** The engine rendered, told at mount and in the same commit as each switch. */
+  onRenderedEngineChange?: (engine: ComposerInputEngine) => void;
 }
 
 /**
@@ -92,6 +115,7 @@ export function useComposerEngineHandoff(
     draftKey = null,
     activeInputId,
     onActiveInputChange,
+    onRenderedEngineChange,
   }: ComposerHandoffOptions = {},
 ): ComposerInputEngine {
   const [rendered, setRendered] = useState(requested);
@@ -103,9 +127,16 @@ export function useComposerEngineHandoff(
   const lastFocusedId = useRef<string | null>(null);
   const pending = useRef<HandoffSnapshot | null>(null);
   const onActiveInputChangeRef = useRef(onActiveInputChange);
+  const onRenderedEngineChangeRef = useRef(onRenderedEngineChange);
   const activeInputIdRef = useRef(activeInputId);
+  // Told at mount too, so an owner that started on another engine agrees from the first commit.
+  const [mountedEngine] = useState(requested);
+  useLayoutEffect(() => {
+    onRenderedEngineChangeRef.current?.(mountedEngine);
+  }, [mountedEngine]);
   useLayoutEffect(() => {
     onActiveInputChangeRef.current = onActiveInputChange;
+    onRenderedEngineChangeRef.current = onRenderedEngineChange;
     activeInputIdRef.current = activeInputId;
     switchWaiting.current = requested !== rendered;
   });
@@ -173,6 +204,7 @@ export function useComposerEngineHandoff(
       activeInputIdRef.current === undefined ? lastFocusedId.current : activeInputIdRef.current;
     pending.current = root ? capture(root, activeId) : null;
     setRendered(requested);
+    onRenderedEngineChangeRef.current?.(requested);
   }, [requested, rendered, dictating, busyTick, draftKey, rootRef]);
 
   // After the new engine has mounted its inputs, put the user back where they were.
@@ -181,9 +213,9 @@ export function useComposerEngineHandoff(
     const root = rootRef.current;
     pending.current = null;
     if (!snapshot || !root) return;
-    // The restored input stays the remembered one for the next switch, focused or not.
-    lastFocusedId.current = snapshot.inputId;
     const target = restore(root, snapshot);
+    // The restored input stays the remembered one for the next switch, focused or not.
+    lastFocusedId.current = target ? inputIdOf(composerTargetElement(target)) : snapshot.inputId;
     if (target) onActiveInputChangeRef.current?.(target);
   }, [rendered, rootRef]);
 

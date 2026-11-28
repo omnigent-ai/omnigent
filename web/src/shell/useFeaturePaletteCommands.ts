@@ -60,6 +60,11 @@ export function useFeaturePaletteCommands(open: boolean): FeaturePaletteCommands
   );
 
   const runAfterClose = useRef<(() => void) | null>(null);
+  // Reopened before the last close handed focus back, the user moved on: that close's command
+  // never runs, rather than on some later, unrelated close.
+  useEffect(() => {
+    if (open) runAfterClose.current = null;
+  }, [open]);
   const accept = useCallback(
     (row: FeaturePaletteRow, close: () => void) => {
       const command = source?.command(row.id) ?? null;

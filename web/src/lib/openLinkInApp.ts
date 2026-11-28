@@ -119,7 +119,56 @@ export function parseHttpUrl(href: string): URL | null {
 
 /** Open `href` where links open: the in-app browser when the user opted in, else a new window. */
 export function openLink(conversationId: string | undefined, href: string): void {
-  if (!maybeOpenLinkInApp(conversationId, href)) window.open(href, "_blank", "noopener,noreferrer");
+  if (!routeLink(conversationId, href)) window.open(href, "_blank", "noopener,noreferrer");
+}
+
+/**
+ * Hand `href` to the in-app browser when the user opted in, else to the desktop shell, whose
+ * window-open policy opens it and answers null by design. False in a plain browser.
+ */
+function routeLink(conversationId: string | undefined, href: string): boolean {
+  if (maybeOpenLinkInApp(conversationId, href)) return true;
+  if (!isNativeShell()) return false;
+  window.open(href, "_blank", "noopener,noreferrer");
+  return true;
+}
+
+/**
+ * How opening a link went: handed to the in-app browser or the desktop shell, which open it on
+ * their own; opened in a new browser tab; or refused by the browser, e.g. by its pop-up blocker.
+ */
+export type LinkOpenOutcome = "routed" | "opened" | "blocked";
+
+/**
+ * Open `href` as {@link openLink} does, saying how it went, for a caller opening several that
+ * must report the ones that didn't open. Call it during the click, so a refused pop-up is
+ * reported; most browsers allow one per click. It opens a blank tab first and leads it to
+ * `href`, because a `noopener` window.open answers null even when it opens. A link that isn't
+ * http(s) isn't opened, and reads as blocked.
+ */
+export function openLinkWithOutcome(
+  conversationId: string | undefined,
+  href: string,
+): LinkOpenOutcome {
+  const url = parseHttpUrl(href);
+  if (!url) return "blocked";
+  if (routeLink(conversationId, url.href)) return "routed";
+  const tab = window.open("about:blank", "_blank");
+  if (!tab) return "blocked";
+  try {
+    tab.opener = null;
+    const link = tab.document.createElement("a");
+    link.href = url.href;
+    link.target = "_self";
+    link.rel = "noopener noreferrer";
+    tab.document.body.append(link);
+    link.click();
+    return "opened";
+  } catch {
+    // Don't leave an empty tab behind when it can't be led to the link.
+    tab.close();
+    return "blocked";
+  }
 }
 
 /**
@@ -127,9 +176,22 @@ export function openLink(conversationId: string | undefined, href: string): void
  * opted in. Returns true when routed (the caller cancels the default click).
  */
 export function maybeOpenLinkInApp(conversationId: string | undefined, href: string): boolean {
-  if (!conversationId || !supportsBrowser() || !readOpenLinksInApp()) return false;
+  if (!readOpenLinksInApp()) return false;
+  return openLinkInSidebar(conversationId, href);
+}
+
+/** Whether {@link openLinkInSidebar} can open `href` here: an http(s) link in a session's chat, on the desktop. */
+export function canOpenLinkInSidebar(conversationId: string | undefined, href: string): boolean {
+  return !!conversationId && supportsBrowser() && parseHttpUrl(href) !== null;
+}
+
+/**
+ * Open an http(s) `href` in a matching or new in-app browser tab in the session's sidebar,
+ * whatever the link-opening preference, as a link menu's Open in Sidebar asks. False when it can't.
+ */
+export function openLinkInSidebar(conversationId: string | undefined, href: string): boolean {
   const url = parseHttpUrl(href);
-  if (!url) return false;
+  if (!conversationId || !supportsBrowser() || !url) return false;
   const key = JSON.stringify([conversationId, url.href]);
   if (!pendingLinks.has(key)) {
     pendingLinks.add(key);

@@ -20,6 +20,7 @@ import {
   type ListWorkingCopyChangesResponse,
   type ResolveRepositoryContextResponse,
   type WorkingCopyBase,
+  PullRequestFailureSchema,
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
@@ -29,9 +30,9 @@ import { authenticatedFetch } from "@/lib/identity";
 import { splitGlobList } from "@/lib/globList";
 import { workspaceSocketBridge, type WorkspaceSocketRequest } from "@/lib/nativeBridge";
 
-type WorkspaceClient = Client<typeof WorkspaceService>;
-type Route = "direct" | "server";
-type Method = keyof typeof WorkspaceService.method;
+export type WorkspaceClient = Client<typeof WorkspaceService>;
+export type Route = "direct" | "server";
+export type Method = keyof typeof WorkspaceService.method;
 /** What a Git comparison compares; see `Comparison` in workspace.proto. */
 export type ComparisonInit = MessageInitShape<typeof ComparisonSchema>;
 
@@ -94,13 +95,7 @@ function routeKey(route: Route, sessionId: string, sshTarget?: string | null): s
 }
 
 function routesFor(sessionId: string, sshTarget?: string | null): Route[] {
-  const info = getCachedServerInfo() ?? "loading";
-  const routes: Route[] = [];
-  if (workspaceSocketBridge() && isFeatureEnabled(info, "workspace_direct_access")) {
-    routes.push("direct");
-  }
-  if (isFeatureEnabled(info, "workspace_api_server_access")) routes.push("server");
-  return routes.filter(
+  return enabledWorkspaceRoutes().filter(
     (route) => (failedUntil.get(routeKey(route, sessionId, sshTarget)) ?? 0) <= Date.now(),
   );
 }
@@ -226,10 +221,12 @@ async function callOn<T>(
     const grant = await abortable(pending, signal);
     return await call(directClient(grant, send, sshTarget));
   } catch (error) {
-    // The host accepted the token if it answered about the request or method.
+    // The host accepted the token if it answered about the request or method, unless
+    // the token predates a pull request the session has linked since.
     const answered =
       error instanceof ConnectError &&
-      (answerCodes.has(error.code) || error.code === Code.Unimplemented);
+      (answerCodes.has(error.code) || error.code === Code.Unimplemented) &&
+      !pullRequestNotGranted(error);
     // Drop only the grant this read used; a parallel read may have renewed it.
     if (!answered && !signal?.aborted && grants.get(sessionId)?.pending === pending) {
       grants.delete(sessionId);
@@ -833,40 +830,55 @@ export function searchTextViaWorkspaceApi(
 // request the host rejects throws its ConnectError, whose message says why.
 const GIT_OPTIONS = { throwAnswers: true } as const;
 
-/** The optional features a comparison relies on: a host may serve the method without them. */
-function comparisonFeatures(comparison: ComparisonInit): string[] {
-  return comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : [];
+/** The feature a request naming a repository folder needs; an older host would answer for the workspace. */
+const REPOSITORY_FEATURE = "comparison.repository";
+
+function repositoryFeatures(repository: string): string[] {
+  return repository ? [REPOSITORY_FEATURE] : [];
 }
 
-/** Resolve a comparison's base and head commits. */
+/** The optional features a comparison relies on: a host may serve the method without them. */
+function comparisonFeatures(comparison: ComparisonInit, repository: string): string[] {
+  return [
+    ...(comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : []),
+    ...repositoryFeatures(repository),
+  ];
+}
+
+/**
+ * Resolve a comparison's base and head commits. `repository`, a folder relative to the
+ * workspace such as a worktree inside it, compares that repository; empty for the workspace.
+ */
 export function resolveWorkingCopyBaseViaWorkspaceApi(
   sessionId: string,
   comparison: ComparisonInit,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<WorkingCopyBase | null> {
   return viaWorkspaceApi(
     sessionId,
     "resolveWorkingCopyBase",
     async (client) => {
-      const response = await client.resolveWorkingCopyBase({ comparison }, { signal });
+      const response = await client.resolveWorkingCopyBase({ comparison, repository }, { signal });
       if (!response.base) throw new UnusableAnswerError("The workspace API sent no base");
       return response.base;
     },
-    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison, repository) },
   );
 }
 
-/** List the files a comparison changes, with its resolved base. */
+/** List the files a comparison changes, with its resolved base; paths are `repository`'s. */
 export function listWorkingCopyChangesViaWorkspaceApi(
   sessionId: string,
   comparison: ComparisonInit,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListWorkingCopyChangesResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listWorkingCopyChanges",
-    (client) => client.listWorkingCopyChanges({ comparison }, { signal }),
-    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
+    (client) => client.listWorkingCopyChanges({ comparison, repository }, { signal }),
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison, repository) },
   );
 }
 
@@ -881,12 +893,18 @@ export function readBaseFileViaWorkspaceApi(
   sessionId: string,
   file: { commit: string; path: string; object: string },
   signal?: AbortSignal,
+  repository = "",
 ): Promise<FileContentResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "readBaseFile",
-    (client) => collectFile(file.path, client.readBaseFile(file, { signal })),
-    { ...GIT_OPTIONS, signal, answerCodes: FILE_STATE_ANSWER_CODES },
+    (client) => collectFile(file.path, client.readBaseFile({ ...file, repository }, { signal })),
+    {
+      ...GIT_OPTIONS,
+      signal,
+      answerCodes: FILE_STATE_ANSWER_CODES,
+      features: repositoryFeatures(repository),
+    },
   );
 }
 
@@ -912,12 +930,13 @@ export function readLinkTextViaWorkspaceApi(
 export function listRepositoryRefsViaWorkspaceApi(
   sessionId: string,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListRepositoryRefsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listRepositoryRefs",
-    (client) => client.listRepositoryRefs({}, { signal }),
-    { ...GIT_OPTIONS, signal },
+    (client) => client.listRepositoryRefs({ repository }, { signal }),
+    { ...GIT_OPTIONS, signal, features: repositoryFeatures(repository) },
   );
 }
 
@@ -929,16 +948,23 @@ export function listBranchCommitsViaWorkspaceApi(
   sessionId: string,
   range: RevisionSpec,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListBranchCommitsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listBranchCommits",
     (client) =>
-      client.listBranchCommits({ baseRevision: range.base, headRevision: range.head }, { signal }),
+      client.listBranchCommits(
+        { baseRevision: range.base, headRevision: range.head, repository },
+        { signal },
+      ),
     {
       ...GIT_OPTIONS,
       signal,
-      features: range.head ? ["branch_commits", "branch_commits.head"] : ["branch_commits"],
+      features: [
+        ...(range.head ? ["branch_commits", "branch_commits.head"] : ["branch_commits"]),
+        ...repositoryFeatures(repository),
+      ],
     },
   );
 }
@@ -954,4 +980,188 @@ export function resolveRepositoryContextViaWorkspaceApi(
     (client) => client.resolveRepositoryContext({}, { signal }),
     { ...GIT_OPTIONS, signal },
   );
+}
+
+// A pull request call's refusals are its answer: a denied caller, a moved head or bad
+// input is shown as is, never retried on another route or through REST.
+const PULL_REQUEST_ANSWER_CODES: ReadonlySet<Code> = new Set([
+  ...ANSWER_CODES,
+  Code.FailedPrecondition,
+  Code.PermissionDenied,
+]);
+/** The routes this app's flags and shell turn on, most direct first, whatever has failed. */
+export function enabledWorkspaceRoutes(): Route[] {
+  const info = getCachedServerInfo() ?? "loading";
+  const routes: Route[] = [];
+  if (workspaceSocketBridge() && isFeatureEnabled(info, "workspace_direct_access")) {
+    routes.push("direct");
+  }
+  if (isFeatureEnabled(info, "workspace_api_server_access")) routes.push("server");
+  return routes;
+}
+/** The machine-readable reason a refused pull request call carries, e.g. "pull_request_changed". */
+export function pullRequestFailureReason(error: unknown): string | null {
+  if (!(error instanceof ConnectError)) return null;
+  return error.findDetails(PullRequestFailureSchema)[0]?.reason ?? null;
+}
+/**
+ * The direct host refused a pull request its token doesn't list, e.g. one linked
+ * after the token was signed. The host checks this before it acts.
+ */
+function pullRequestNotGranted(error: unknown): boolean {
+  return (
+    error instanceof ConnectError &&
+    error.code === Code.FailedPrecondition &&
+    pullRequestFailureReason(error) === "pull_request_not_granted"
+  );
+}
+/**
+ * Read through a pull request method of the workspace API, on the first route whose
+ * host lists it for this caller.
+ *
+ * Resolves `null` when no route serves the method, or the route is away, so the
+ * caller reads through REST. A refusal (see `PULL_REQUEST_ANSWER_CODES`) is thrown,
+ * and no other route is tried. Only for reads: a read is safe to repeat elsewhere.
+ * A pull request the direct token doesn't list gets one fresh token and one retry.
+ */
+export async function callPullRequestMethod<T>(
+  sessionId: string,
+  method: Method,
+  call: (client: WorkspaceClient) => Promise<T>,
+  { signal }: { signal?: AbortSignal } = {},
+): Promise<T | null> {
+  const options = { signal, answerCodes: PULL_REQUEST_ANSWER_CODES, throwAnswers: true };
+  try {
+    return await viaWorkspaceApi(sessionId, method, call, options);
+  } catch (error) {
+    // The refusal dropped the token, so the same route is tried with a fresh one.
+    if (!pullRequestNotGranted(error)) throw error;
+    return viaWorkspaceApi(sessionId, method, call, options);
+  }
+}
+/** A route of the session whose host answered its capability check. */
+export interface ServingRoute {
+  route: Route;
+  /** Names this route for the session; it stays the same when the session moves to another host. */
+  key: string;
+  served: ReadonlySet<string>;
+}
+/** The session's routes that answered their capability check, and why the rest didn't. */
+export interface RouteAnswers {
+  /** In the order calls try them. */
+  serving: ServingRoute[];
+  /** One per route that couldn't say what it serves, such as one that's away. */
+  failures: unknown[];
+}
+/**
+ * Ask each of the session's routes what its host serves, sharing the cached capability
+ * checks that calls make.
+ */
+export async function servingRoutes(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<RouteAnswers> {
+  const answers = await Promise.all(
+    routesFor(sessionId).map(async (route) => {
+      try {
+        const served = await abortable(routeCapabilities(route, sessionId), signal);
+        return { route, key: routeKey(route, sessionId), served };
+      } catch (error) {
+        signal?.throwIfAborted();
+        return { error };
+      }
+    }),
+  );
+  return {
+    serving: answers.filter((answer): answer is ServingRoute => "served" in answer),
+    failures: answers.flatMap((answer) => ("error" in answer ? [answer.error] : [])),
+  };
+}
+/** The name `GetCapabilities` lists `method` by, e.g. "GetPullRequest". */
+export function workspaceMethodName(method: Method): string {
+  return capabilityName(method);
+}
+/**
+ * A write whose route failed after the request left, so the host may have acted on it.
+ * It's never sent again: the caller re-reads to see whether it landed.
+ */
+export class PullRequestMaybeSentError extends Error {
+  constructor(cause: unknown) {
+    super("This may have been sent. Refresh to check.", { cause });
+    this.name = "PullRequestMaybeSentError";
+  }
+}
+/**
+ * Send a pull request write through the workspace API, at most once.
+ *
+ * The route is the first whose host lists `method` for this caller. A failure before
+ * the request is sent, such as a route that can't say what it serves, moves on to the
+ * next route. The same goes for an answer that the host didn't act on: `UNIMPLEMENTED`,
+ * or a direct token the host refused before dispatch (expired, or not listing the pull
+ * request), which gets one fresh grant on the same route. A refusal is thrown as is.
+ * Any other failure, a cancel after the request left included, is thrown as
+ * {@link PullRequestMaybeSentError}, and the write isn't
+ * retried anywhere, REST included, since many writes (comments, reactions) would land
+ * twice. That includes a connection refused after the capability check: neither route
+ * tells it apart from one dropped mid-call, so it stays on the safe side.
+ *
+ * Resolves `null` only when no route served the method and nothing was sent, so the
+ * caller writes through REST.
+ */
+export async function callPullRequestWrite<T>(
+  sessionId: string,
+  method: Method,
+  call: (client: WorkspaceClient) => Promise<T>,
+  { signal }: { signal?: AbortSignal } = {},
+): Promise<T | null> {
+  // Each route's attempt must settle before the next is tried.
+  /* oxlint-disable no-await-in-loop */
+  for (const route of routesFor(sessionId)) {
+    const key = routeKey(route, sessionId);
+    if ((unsupportedUntil.get(`${key}:${method}`) ?? 0) > Date.now()) continue;
+    let served: ReadonlySet<string>;
+    try {
+      served = await abortable(routeCapabilities(route, sessionId), signal);
+    } catch {
+      signal?.throwIfAborted();
+      continue; // nothing was sent
+    }
+    if (!served.has(capabilityName(method))) continue;
+    for (let attempt = 0; ; attempt++) {
+      // Set once the request is handed to the route; before that, nothing was sent.
+      let sent = false;
+      const send = (client: WorkspaceClient) => {
+        sent = true;
+        return call(client);
+      };
+      try {
+        return await callOn(route, sessionId, send, signal, null, PULL_REQUEST_ANSWER_CODES);
+      } catch (error) {
+        if (!sent) {
+          signal?.throwIfAborted();
+          break; // no grant or no shell, so nothing was sent
+        }
+        // Cancelling stops the wait, not the host, which may still act on the request.
+        if (signal?.aborted) throw new PullRequestMaybeSentError(error);
+        const code = error instanceof ConnectError ? error.code : null;
+        // Refused before dispatch, and the refusal dropped the token: one fresh one.
+        if (route === "direct" && pullRequestNotGranted(error) && attempt === 0) continue;
+        if (code !== null && PULL_REQUEST_ANSWER_CODES.has(code)) throw error;
+        if (code === Code.Unimplemented) {
+          unsupportedUntil.set(`${key}:${method}`, Date.now() + ROUTE_RETRY_MS);
+          break; // the host answered without acting
+        }
+        // The host checks a direct token before it dispatches, so a refused one sent nothing.
+        if (route === "direct" && code === Code.Unauthenticated && attempt === 0) {
+          // A restarted host may serve other methods, so its capabilities are read again.
+          capabilities.delete(key);
+          continue;
+        }
+        if (code === Code.Unauthenticated) throw error;
+        throw new PullRequestMaybeSentError(error);
+      }
+    }
+  }
+  /* oxlint-enable no-await-in-loop */
+  return null;
 }

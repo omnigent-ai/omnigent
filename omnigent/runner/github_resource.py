@@ -62,6 +62,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -71,8 +72,10 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
-from omnigent.git_providers import host_of
+from omnigent.git_providers import EnvInstances, host_of
+from omnigent.git_providers.github import GitHubProvider
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.runner import github_review_fields as review_fields
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
     COMMIT_OBJECT,
@@ -102,6 +105,20 @@ _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
 # The host the current panel step's ``gh`` calls are for, set by the provider facet.
 _gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
+# The token one pull request action resolved up front, by the PR's URL (see _one_pr_account).
+_bound_pr_token: ContextVar[tuple[str, str | None] | None] = ContextVar(
+    "bound_pr_token", default=None
+)
+
+
+@dataclass
+class GhCallCount:
+    """How many ``gh`` processes started inside a :func:`_gh_call_count_scope`."""
+
+    started: int = 0
+
+
+_gh_call_count: ContextVar[GhCallCount | None] = ContextVar("gh_call_count", default=None)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
 # reviews, labels, and the merge fields feed the Summary and Comments tabs.
@@ -262,6 +279,8 @@ def _gh(
             _gh_timed_out.set(True)
             return None, "", "gh deadline exceeded"
     invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    if (count := _gh_call_count.get()) is not None:
+        count.started += 1
     result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
@@ -286,6 +305,17 @@ def _gh_deadline_scope(deadline: float) -> Iterator[None]:
     finally:
         _gh_timed_out.reset(timed_out_token)
         _gh_deadline.reset(deadline_token)
+
+
+@contextmanager
+def _gh_call_count_scope() -> Iterator[GhCallCount]:
+    """Count every ``gh`` process the block starts, including inside other helpers."""
+    count = GhCallCount()
+    token = _gh_call_count.set(count)
+    try:
+        yield count
+    finally:
+        _gh_call_count.reset(token)
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -365,6 +395,17 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return rc == 0, []
 
 
+def _known_github_host(host: str) -> bool:
+    """Whether the user set ``host`` up for GitHub: github.com, ``GH_HOST``, a configured
+    GitHub instance, or a host with a stored ``gh`` login.
+
+    It never runs ``gh``. A pull request URL can name any host, and with an enterprise token
+    in the environment ``gh`` treats every host but github.com as signed in, so a command or
+    check naming an unknown host would send that token there.
+    """
+    return GitHubProvider().matches_host(host, EnvInstances())
+
+
 def _gh_signed_in_to_host(root: str, host: str) -> bool:
     """Whether ``gh`` reports a login on ``host``.
 
@@ -416,6 +457,14 @@ def _workspace_key(root: str) -> str | None:
 def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
     """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
     rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _gh_active_token(root: str, host: str = "github.com") -> str | None:
+    """Return the token of ``gh``'s active account on *host* (never logged)."""
+    rc, out, _ = _gh(["auth", "token", "-h", host], cwd=root)
     if rc != 0:
         return None
     return out.strip() or None
@@ -550,14 +599,26 @@ def _shape_comments(
         if not isinstance(comment, dict) or comment.get("isMinimized"):
             continue
         author = comment.get("author")
-        shaped.append(
-            {
-                "author": author.get("login") if isinstance(author, dict) else None,
-                "body": str(comment.get("body") or ""),
-                "created_at": comment.get("createdAt") or None,
-                "url": comment.get("url") or None,
-            }
-        )
+        entry: dict[str, Any] = {
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "body": str(comment.get("body") or ""),
+            "created_at": comment.get("createdAt") or None,
+            "url": comment.get("url") or None,
+        }
+        node_id = comment.get("id")
+        if isinstance(node_id, str) and review_fields.NODE_ID.fullmatch(node_id):
+            entry["id"] = node_id
+        number = _issue_comment_number(comment.get("url"))
+        if number is not None:
+            entry["database_id"] = number
+        # Only GitHub's GraphQL read says who reacted, and what the host's account may do.
+        if "viewerCanReact" in comment:
+            entry["reactions"] = review_fields.reactions(comment.get("reactionGroups"))
+            entry["can_react"] = comment.get("viewerCanReact") is True
+            entry["can_update"] = comment.get("viewerCanUpdate") is True
+            entry["can_delete"] = comment.get("viewerCanDelete") is True
+            entry["viewer_did_author"] = comment.get("viewerDidAuthor") is True
+        shaped.append(entry)
     for review in reviews if isinstance(reviews, list) else []:
         if (
             not isinstance(review, dict)
@@ -578,6 +639,45 @@ def _shape_comments(
         )
     shaped.sort(key=lambda comment: comment["created_at"] or "")
     return shaped[-_MAX_COMMENTS:] if cap else shaped
+
+
+# Bounded, so an anchor too long for an exact ID can't fail the read.
+_ISSUE_COMMENT_ANCHOR = re.compile(r"#issuecomment-(\d{1,19})$")
+
+
+def _issue_comment_number(url: Any) -> int | None:
+    """A conversation comment's number, from the anchor GitHub's URL for it ends with."""
+    match = _ISSUE_COMMENT_ANCHOR.search(url) if isinstance(url, str) else None
+    return review_fields.database_id(match.group(1)) if match else None
+
+
+# What GitHub's read adds to a comment gh listed: its reactions and the account's rights.
+_COMMENT_ACCOUNT_KEYS = (
+    "viewerCanReact",
+    "viewerCanUpdate",
+    "viewerCanDelete",
+    "viewerDidAuthor",
+    "reactionGroups",
+)
+
+
+def _with_comment_rights(listed: Any, latest: list[Any]) -> Any:
+    """gh's comments, each with what GitHub's read said of it; its text stays gh's."""
+    if not isinstance(listed, list):
+        return listed
+    read = {
+        node["id"]: node
+        for node in latest
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    }
+    merged = []
+    for comment in listed:
+        node_id = comment.get("id") if isinstance(comment, dict) else None
+        node = read.get(node_id) if isinstance(node_id, str) else None
+        if node is not None:
+            comment = {**comment, **{key: node.get(key) for key in _COMMENT_ACCOUNT_KEYS}}
+        merged.append(comment)
+    return merged
 
 
 def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -656,6 +756,8 @@ def _timeline_payload(raw: Any) -> dict[str, Any]:
 _LABEL_COLOR = re.compile(r"[0-9a-fA-F]{6}")
 # The label picker lists at most this many of the repository's labels.
 _MAX_REPO_LABELS = 1000
+# A label search answers its best matches, enough for one picker page.
+_MAX_LABEL_MATCHES = 50
 # Every ``gh`` call of one label, reviewer, or merge request shares this budget,
 # under the 20-second waits of the server and the host tunnel.
 _PR_EDIT_REQUEST_SECONDS = 15.0
@@ -897,6 +999,38 @@ def _gh_pr_view(
     return data
 
 
+# How long gh keeps a conversation read, and the PRs whose conversation changed since.
+_CONVERSATION_CACHE_SECONDS = 30
+_CHANGED_CONVERSATIONS: dict[str, float] = {}
+_CHANGED_CONVERSATIONS_LOCK = threading.Lock()
+
+
+def conversation_changed(pr_url: str) -> None:
+    """Read ``pr_url``'s conversation past gh's cache until the copy it holds expires."""
+    now = time.monotonic()
+    with _CHANGED_CONVERSATIONS_LOCK:
+        # Drop expired marks here too, so the table stays bounded without later reads.
+        expired = [
+            url
+            for url, changed_at in _CHANGED_CONVERSATIONS.items()
+            if now - changed_at >= _CONVERSATION_CACHE_SECONDS
+        ]
+        for url in expired:
+            del _CHANGED_CONVERSATIONS[url]
+        _CHANGED_CONVERSATIONS[pr_url] = now
+
+
+def _conversation_changed_recently(pr_url: str) -> bool:
+    with _CHANGED_CONVERSATIONS_LOCK:
+        changed_at = _CHANGED_CONVERSATIONS.get(pr_url)
+        if changed_at is None:
+            return False
+        if time.monotonic() - changed_at < _CONVERSATION_CACHE_SECONDS:
+            return True
+        del _CHANGED_CONVERSATIONS[pr_url]
+        return False
+
+
 def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
     """Read recent comments and activity, preserving gh's comments if this read fails."""
     url = data.get("url")
@@ -907,14 +1041,19 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
         host = _host_args(cwd, reference)
     except ValueError:
         return
-    comments = data.get("comments")
-    refresh_comments = isinstance(comments, list) and len(comments) >= _MAX_COMMENTS
+    comments_listed = data.get("comments")
+    refresh_comments = isinstance(comments_listed, list) and len(comments_listed) >= _MAX_COMMENTS
+    cached = not refresh_comments and not _conversation_changed_recently(reference.url)
     owner, name = reference.repository.split("/", 1)
-    query = """query($owner: String!, $name: String!, $number: Int!, $includeComments: Boolean!) {
+    query = """query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
-          comments(last: 100) @include(if: $includeComments) {
-            nodes { author { login } body createdAt url isMinimized }
+          comments(last: 100) {
+            nodes {
+              id author { login } body createdAt url isMinimized
+              viewerCanReact viewerCanUpdate viewerCanDelete viewerDidAuthor
+              reactionGroups { content viewerHasReacted reactors { totalCount } }
+            }
           }
           timelineItems(last: 100, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT]) {
             pageInfo { hasPreviousPage }
@@ -939,8 +1078,8 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
             "api",
             *host,
             "graphql",
-            # ponytail: gh handles token-scoped caching; busy comment tails stay fresh.
-            *([] if refresh_comments else ["--cache", "30s"]),
+            # gh caches per token; busy tails and just-changed comments read fresh.
+            *(["--cache", f"{_CONVERSATION_CACHE_SECONDS}s"] if cached else []),
             "-f",
             f"query={query}",
             "-f",
@@ -949,8 +1088,6 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
             f"name={name}",
             "-F",
             f"number={reference.number}",
-            "-F",
-            f"includeComments={str(refresh_comments).lower()}",
         ],
         cwd=cwd,
         token=token,
@@ -966,8 +1103,12 @@ def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) 
     data["timelineItems"] = conversation.get("timelineItems")
     comments = conversation.get("comments")
     latest = comments.get("nodes") if isinstance(comments, dict) else None
-    if isinstance(latest, list):
-        data["comments"] = latest
+    if not isinstance(latest, list):
+        return
+    # A busy PR's latest comments come from this uncached read; gh's are fresher otherwise.
+    data["comments"] = (
+        latest if refresh_comments else _with_comment_rights(comments_listed, latest)
+    )
 
 
 def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -1169,12 +1310,72 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        return bound[1]
     if _in_sandbox():
         return None
     login = _config.github_account_preference(_repo_argument(reference))
     if login:
         return _gh_auth_token(root, login, reference.host)
     return None
+
+
+_ACTIVE_ACCOUNT_UNREADABLE = (
+    "Couldn't read the host's GitHub sign-in. Nothing was sent; sign in with gh and try again."
+)
+
+
+def _signed_out_account(login: str) -> str:
+    return (
+        f"The selected GitHub account {login} isn't signed in on the host. "
+        "Sign in with gh or choose another account."
+    )
+
+
+def _write_token(root: str, reference: PullRequestRef, *, timed_out: str) -> str | None:
+    """The token a write runs with; refuses before the send rather than run as another account.
+
+    Call it inside the write's deadline scope. Without the token of the login chosen for the
+    repository, ``gh`` would run as whichever account is active on the host.
+    """
+    # Read the login before the lookup, so clearing it mid-write can't let this one through.
+    login = None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        raise ValueError(timed_out)
+    if login and token is None:
+        raise ValueError(_signed_out_account(login))
+    return token
+
+
+@contextmanager
+def _one_pr_account(root: str, reference: PullRequestRef, *, timed_out: str) -> Iterator[None]:
+    """Run every read and write in the block as one account: the one chosen at its start.
+
+    The token is looked up once, and a chosen login without one refuses before anything is
+    read, so a check can't run as one account and the write it guards as another. With no
+    login chosen, the active account's token is bound, so switching it mid-action can't
+    split one either. Only a sandbox, which has a single identity, runs without a token.
+    """
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        yield
+        return
+    sandbox = _in_sandbox()
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        token = _write_token(root, reference, timed_out=timed_out)
+        if token is None and not sandbox:
+            token = _gh_active_token(root, reference.host)
+            if _gh_timed_out.get():
+                raise ValueError(timed_out)
+            if token is None:
+                raise ValueError(_ACTIVE_ACCOUNT_UNREADABLE)
+    binding = _bound_pr_token.set((reference.url, token))
+    try:
+        yield
+    finally:
+        _bound_pr_token.reset(binding)
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
@@ -1357,10 +1558,18 @@ def _set_preference(
 
 
 def github_info(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    account_rights: bool = False,
 ) -> dict[str, Any]:
-    """Return the panel payload; see :func:`pr_resource.pr_info`."""
-    return pr_resource.pr_info(root, session_id=session_id, pr_url=pr_url)
+    """Return the panel payload; see :func:`pr_resource.pr_info`.
+
+    :param account_rights: Whether to include what the host's account may do with each comment.
+    """
+    info = pr_resource.pr_info(root, session_id=session_id, pr_url=pr_url)
+    return info if account_rights else review_fields.info_without_account_rights(info)
 
 
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
@@ -2029,11 +2238,15 @@ def _pr_file_contents(
     }
 
 
-def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
-    """List the PR repository's labels by name for the label picker.
+def _repo_labels(root: str, reference: PullRequestRef, *, text: str = "") -> dict[str, Any]:
+    """List the PR repository's labels for the label picker, by name or by best match.
 
+    :param text: Words to match in a label's name or description; empty lists them all.
     :raises ValueError: When ``gh`` cannot list them within :data:`_PR_EDIT_REQUEST_SECONDS`.
     """
+    limit = _MAX_LABEL_MATCHES if text else _MAX_REPO_LABELS
+    # ``--search=`` keeps text that starts with a dash from reading as a flag.
+    search = [f"--search={text}"] if text else []
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         _host_args(root, reference)
         rc, out, _ = _gh(
@@ -2042,11 +2255,12 @@ def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
                 "list",
                 "-R",
                 _repo_argument(reference),
+                *search,
                 "--json",
                 "name,color,description",
                 "--limit",
                 # One past the cap tells a full list from a truncated one.
-                str(_MAX_REPO_LABELS + 1),
+                str(limit + 1),
             ],
             cwd=root,
             token=_pr_token(root, reference),
@@ -2058,10 +2272,11 @@ def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
     except ValueError as exc:
         raise ValueError("GitHub returned an unexpected label list") from exc
     raw = raw if isinstance(raw, list) else []
-    labels = sorted(
-        _shape_labels(raw[:_MAX_REPO_LABELS]), key=lambda label: str(label["name"]).casefold()
-    )
-    return {"object": "list", "data": labels, "has_more": len(raw) > _MAX_REPO_LABELS}
+    labels = _shape_labels(raw[:limit])
+    if not text:
+        labels.sort(key=lambda label: str(label["name"]).casefold())
+    # A search keeps gh's best-match order.
+    return {"object": "list", "data": labels, "has_more": len(raw) > limit}
 
 
 def _labels_api(
@@ -2122,10 +2337,7 @@ def _apply_label_edit(
     A final read supplies the labels when every removed label was already absent.
     """
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        # The selected account's token is unknown, so the edit must not run as another.
-        raise ValueError(_LABEL_EDIT_TIMED_OUT)
+    token = _write_token(root, reference, timed_out=_LABEL_EDIT_TIMED_OUT)
     endpoint = f"repos/{reference.repository}/issues/{reference.number}/labels"
     labels: list[Any] | None = None
     for name in remove:
@@ -2258,10 +2470,7 @@ def _run_pr_merge(
                 + (f", {sandbox_login}." if sandbox_login else ".")
             )
         if login and token is None:
-            raise ValueError(
-                f"The selected GitHub account {login} isn't signed in on the host. "
-                "Sign in with gh or choose another account."
-            )
+            raise ValueError(_signed_out_account(login))
         rc, _, err = _gh(
             ["pr", "merge", str(reference.number), "-R", _repo_argument(reference), *flags],
             cwd=root,
@@ -2497,10 +2706,7 @@ def _apply_reviewer_edit(
 ) -> dict[str, Any]:
     """Make the edit's requests, then read the PR's reviewers with their review states."""
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        # The selected account's token is unknown, so the edit must not run as another.
-        raise ValueError(_REVIEWER_EDIT_TIMED_OUT)
+    token = _write_token(root, reference, timed_out=_REVIEWER_EDIT_TIMED_OUT)
     endpoint = f"repos/{reference.repository}/pulls/{reference.number}/requested_reviewers"
     if remove:
         _reviewers_api(root, host, token, ["-X", "DELETE", endpoint, *_reviewer_fields(remove)])
@@ -2526,6 +2732,7 @@ _DETAILS_EDIT_TIMED_OUT = (
 # so a video has time to reach GitHub.
 _ATTACHMENT_REQUEST_SECONDS = 110.0
 _ATTACHMENT_TIMED_OUT = "GitHub took too long to upload the file. Try again."
+COMMENT_AUTHENTICATION_TIMED_OUT = "GitHub authentication timed out. Your comment was not sent."
 
 
 def _pr_json_write(
@@ -2577,9 +2784,7 @@ def _post_comment(
     """Publish once within the caller's deadline; preserve uncertainty after dispatch."""
     uncertain = "Could not confirm comment posting. Check GitHub before retrying."
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+    token = _write_token(root, reference, timed_out=COMMENT_AUTHENTICATION_TIMED_OUT)
     rc, out, err = _pr_json_write(
         root,
         host=host,
@@ -2615,10 +2820,7 @@ def _edit_details(
     """
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         host = _host_args(root, reference)
-        token = _pr_token(root, reference)
-        if _gh_timed_out.get():
-            # The selected account's token is unknown, so the edit must not run as another.
-            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+        token = _write_token(root, reference, timed_out=_DETAILS_EDIT_TIMED_OUT)
         fields = {
             key: value for key, value in (("title", title), ("body", body)) if value is not None
         }
@@ -2675,10 +2877,7 @@ def _upload_attachment(
     """
     with _gh_deadline_scope(time.monotonic() + _ATTACHMENT_REQUEST_SECONDS):
         host = _host_args(root, reference)
-        token = _pr_token(root, reference)
-        if _gh_timed_out.get():
-            # The selected account's token is unknown, so the upload must not run as another.
-            raise ValueError(_ATTACHMENT_TIMED_OUT)
+        token = _write_token(root, reference, timed_out=_ATTACHMENT_TIMED_OUT)
         rc, out, _ = _gh(
             ["api", *host, f"repos/{reference.repository}", "--jq", ".id"],
             cwd=root,

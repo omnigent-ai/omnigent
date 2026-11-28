@@ -78,6 +78,8 @@ describe("resolveWorkspaceActiveView", () => {
       "files",
     ],
     ["the side-chat mode with no side chat selected", { rightRailTab: "sidechat" }, {}, "files"],
+    ["a gadget", { rightRailTab: "gadget", selectedGadgetKey: "gadget:1" }, {}, "gadget"],
+    ["the gadget mode with no gadget selected", { rightRailTab: "gadget" }, {}, "files"],
   ] as const)("shows %s as the %s page", (_name, selection, availability, scope) => {
     expect(resolve(selection, availability).scope).toBe(scope);
   });
@@ -103,7 +105,7 @@ describe("resolveWorkspaceActiveView", () => {
   it.each([
     ["an open file", { selectedFilePath: "a.ts" }],
     ["a selected shell, even with its terminal missing", { selectedTerminalKey: "terminal:zsh" }],
-  ])("doesn't select a browser or side chat behind %s", (_name, inFront) => {
+  ])("doesn't select a browser, side chat or gadget behind %s", (_name, inFront) => {
     const availability = { terminalPresent: () => false };
     const browser = resolve(
       { rightRailTab: "browser", selectedBrowserId: "b1", ...inFront },
@@ -113,8 +115,13 @@ describe("resolveWorkspaceActiveView", () => {
       { rightRailTab: "sidechat", selectedSideChatId: "c1", ...inFront },
       availability,
     );
+    const gadget = resolve(
+      { rightRailTab: "gadget", selectedGadgetKey: "gadget:1", ...inFront },
+      availability,
+    );
     expect(browser).toMatchObject({ browserSelected: false, scope: "files" });
     expect(sideChat).toMatchObject({ sideChatSelected: false, scope: "files" });
+    expect(gadget).toMatchObject({ gadgetSelected: false, scope: "files" });
   });
 
   it("keeps a side chat selected on a phone though the rail doesn't show it", () => {

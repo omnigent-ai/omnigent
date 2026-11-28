@@ -28,6 +28,24 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that leaves the editor (switching sessions, a new-session handoff, a recovered
   send) keeps each chip's file as a tray attachment with its `@name` text
   unchanged.
+- `reply-quote-cards`: with the CodeMirror editor (see `codemirror-input`),
+  selecting text in a chat message and choosing **Reply** quotes it in the main
+  chat's one editor, each quote a card on a line of its own. Arrow keys step over a card, and the caret never rests on one. Backspace
+  at the start of the line after a card, Delete at the end of the line before
+  it, or the card's X removes it; undo brings it back. After Reply the caret is
+  on the empty line under the new card. Copy, cut and drag give a quote as `> `
+  markdown, and a readline kill (⌃K, ⌃U, ⌃W) stops at a card. Message-text
+  setters, including slash-command clears, `/side`, and attachments, change only
+  the tail; recall and send replace the whole draft. Removing a card takes its
+  line and a blank line that only separates it,
+  and keeps the text around it as shown, so the text above and below joins with
+  one line break; the textarea joins them with a blank line, so the sent text
+  can differ. Discarding a dictation puts back the text from before the take
+  only when nothing else edited the draft during it. A draft saved on one engine
+  restores on the other. An engine switch keeps a caret that is in the text
+  after the last card; one anywhere else goes to the end of the draft. When a
+  take ends, focus goes back to the editor. Only the main chat has the cards:
+  side chats, and the textarea, keep one input per quote.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -331,7 +349,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in the session view (not on mobile).
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
   opens and focuses the new-session composer in browsers. Native shells use
-  ⌘/Ctrl+N. Embedded apps require focus inside the app.
+  ⌘/Ctrl+N. Embedded apps require focus inside the app. Where that chord is
+  Ctrl+N, an open pick list that steps on Ctrl-N keeps it. In the Windows and
+  Linux desktop app the menu's New Session accelerator yields Ctrl+N while a
+  pick list has focus, and takes it otherwise.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn. Mod+Enter inverts Always steer for one
   message: with it on, the draft waits in the queue until the turn ends; with it
@@ -339,8 +360,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   steer the same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
   after its current step in the timestamp row. The note stays visible, with
-  truncation, on desktop and touch until the agent reads the message, while the
-  row's timestamp and actions keep their hover reveal on desktop.
+  truncation, on desktop and touch until the agent reads the message, and the
+  row's timestamp and actions stay visible beside it; once the note clears they
+  return to their hover reveal on desktop.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
@@ -413,6 +435,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
+- `gadget-quotes`: selecting text inside a gadget offers **Reply**, **Ask in
+  side chat** and **Add comment**; the first two quote the selection, with where it
+  is in the gadget, in the session's composer or a side chat, and the third saves a
+  comment on it in the gadget's Comments. New session opened from a full screen
+  gadget keeps the gadget full screen; its **Create session** menu holds the
+  host, permission and harness pickers in one row and starts the session there.
 
 ## How to get to it (user POV)
 
@@ -492,6 +520,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
   pick a prompt (search, or **Load older prompts** in a long session). The new
   chat opens with that prompt, and its attachments, in the composer.
+- With `chat_composer_codemirror` on, at a desktop width, select text in an
+  agent's message and choose **Reply**: the quote becomes a card in the main
+  chat's message box, with the caret on the line under it
+  (`reply-quote-cards`). A side chat, and the textarea without the flag, show
+  each quote as its own block with an input above it.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -1067,6 +1100,16 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   Restart the server with
   `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
   state on click, and the fake transcript in the message box.
+- **`reply-quote-cards`:** component coverage, run with vitest from `web/`:
+  `web/src/lib/replyDraftDocument.test.ts`,
+  `web/src/components/composer/engine/CodeMirrorComposerInput.test.tsx` and its
+  `.mac.test.tsx`, and `web/src/pages/ChatPage.composer.test.tsx`
+  (`Composer reply quotes in the CodeMirror editor`). Manually, with
+  `chat_composer_codemirror` on: choose **Reply** on a passage, type under the
+  card, step over it with ← and →, then press Backspace at the start of the
+  line under it to remove it, and ⌘Z (Ctrl+Z) to bring it back. Its X also
+  removes it. Send, and the message matches what the textarea sends. Repeat in
+  a side chat to see its stacked quote inputs, which this doesn't change.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -1200,6 +1243,13 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   server agent keeps the dialog open with the server's reason.
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
+- **`gadget-quotes`:** no browser test drives it.
+  `web/src/lib/gadgetComposerQuotes.test.tsx` covers quotes reaching the session's
+  composer once it can take them, `web/src/pages/ChatPage.composer.test.tsx` the
+  composer accepting a queued quote, `web/src/components/chat/SelectionPopup.test.tsx`
+  the Reply / Ask in side chat buttons, and `web/src/shell/NewChatDialog.flow.test.tsx`
+  ("starts the session from a full screen gadget's Create session menu as Start does")
+  the Create session menu.
 
 ## Gotchas
 

@@ -38,13 +38,18 @@ import { RevealBaseContext } from "../RevealInFileManager";
 import type { FolderListing } from "../folderTreeSync";
 import {
   type TreeChange,
+  type TreePatterns,
+  hasTreePatterns,
   listingsVersion,
   treeMetadata,
+  treePathFilter,
+  visibleChangedFiles,
   visibleEntries,
   withChangedFiles,
 } from "./filesTreeListings";
 import { treeChangeStatuses, treeIgnoredStatuses } from "./treeChangeStatus";
 import { SingleSelection } from "./treeSelection";
+import { hasFocusWithin, rebuildTreeInPlace, topVisibleRow } from "./rebuildTree";
 import { treeComparator, treeOrderSignature } from "./treeSort";
 import { scrollRowIntoView } from "./revealScroll";
 import { rowPathOf } from "./treeRowPath";
@@ -76,6 +81,8 @@ export interface FilesTreeProps {
   showHidden: boolean;
   /** List what Git ignores, marked as ignored; otherwise the host leaves it out. */
   showIgnored: boolean;
+  /** The filter's include and exclude patterns, applied to every folder the tree lists. */
+  patterns?: TreePatterns;
   refreshToken: number;
   /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
@@ -112,19 +119,6 @@ const parentFolder = (path: string) => {
   return slash < 0 ? "" : trimmed.slice(0, slash);
 };
 const trimFolder = (path: string) => (path.endsWith("/") ? path.slice(0, -1) : path);
-/** Whether keyboard focus is on the tree or one of its rows. */
-const hasFocusWithin = (host: HTMLElement | null): boolean =>
-  host !== null && host.contains(document.activeElement);
-
-/** The first row actually on screen, skipping overscan. */
-function topVisibleRow(host: HTMLElement): string | null {
-  const box = host.getBoundingClientRect();
-  for (const row of host.querySelectorAll<HTMLElement>('[role="treeitem"][data-item-path]')) {
-    const rect = row.getBoundingClientRect();
-    if (rect.height > 0 && rect.bottom > box.top + 1) return row.getAttribute("data-item-path");
-  }
-  return null;
-}
 
 const FILES_TREE_THEME = {
   ...FILE_TREE_THEME,
@@ -152,18 +146,17 @@ function FilesTreeRows(props: FilesTreeProps) {
     hideIgnored: !showIgnored,
   });
 
+  // Held by value, so a caller's fresh object for the same patterns changes nothing.
+  const include = props.patterns?.include ?? "";
+  const exclude = props.patterns?.exclude ?? "";
+  const patterns = useMemo<TreePatterns>(() => ({ include, exclude }), [include, exclude]);
   const rootListing = useMemo<FolderListing>(
-    () => ({ folder: "", entries: visibleEntries(props.rootEntries, showHidden) }),
-    [props.rootEntries, showHidden],
+    () => ({ folder: "", entries: visibleEntries(props.rootEntries, showHidden, patterns) }),
+    [props.rootEntries, showHidden, patterns],
   );
   const visibleChanges = useMemo(
-    () =>
-      showHidden
-        ? props.changedFiles
-        : props.changedFiles.filter(
-            (change) => !change.path.split("/").some((part) => part.startsWith(".")),
-          ),
-    [props.changedFiles, showHidden],
+    () => visibleChangedFiles(props.changedFiles, showHidden, patterns),
+    [props.changedFiles, showHidden, patterns],
   );
   const [initial] = useState(() =>
     initialFolderTree(withChangedFiles([rootListing], visibleChanges)),
@@ -173,10 +166,12 @@ function FilesTreeRows(props: FilesTreeProps) {
   // Options the tree reads once go through refs, so they always see the latest props.
   const latest = useRef(props);
   latest.current = props;
-  const sortState = useRef({
-    sort: props.sort,
-    meta: treeMetadata(withChangedFiles([rootListing], visibleChanges)),
-  });
+  const sortState = useRef(
+    (() => {
+      const meta = treeMetadata(withChangedFiles([rootListing], visibleChanges));
+      return { sort: props.sort, meta, compare: treeComparator(props.sort, meta) };
+    })(),
+  );
   const selectionRef = useRef<SingleSelection | null>(null);
   const [menu, setMenu] = useState<{
     path: string;
@@ -195,8 +190,7 @@ function FilesTreeRows(props: FilesTreeProps) {
       ...treeIgnoredStatuses(rootListing.entries),
       ...treeChangeStatuses(props.changedFiles),
     ],
-    sort: (left, right) =>
-      treeComparator(sortState.current.sort, sortState.current.meta)(left, right),
+    sort: (left, right) => sortState.current.compare(left, right),
     // Opening is driven by the input that chose a row; selection changes only stay single.
     onSelectionChange: () => selectionRef.current?.normalize(),
   });
@@ -228,9 +222,9 @@ function FilesTreeRows(props: FilesTreeProps) {
     const data = directories.get(folder)?.data;
     if (data) rawListings.push({ folder, entries: data });
   }
-  const rawVersion = `${listingsVersion(rawListings)}\u0002${showHidden}\u0002${listingsVersion([
-    { folder: "changes", entries: visibleChanges as unknown as WorkspaceFile[] },
-  ])}`;
+  const rawVersion = `${listingsVersion(rawListings)}\u0002${showHidden}\u0002${include}\u0002${exclude}\u0002${listingsVersion(
+    [{ folder: "changes", entries: visibleChanges as unknown as WorkspaceFile[] }],
+  )}`;
   const latestRaw = useRef(rawListings);
   latestRaw.current = rawListings;
   const listings = useMemo<FolderListing[]>(
@@ -238,7 +232,8 @@ function FilesTreeRows(props: FilesTreeProps) {
       withChangedFiles(
         latestRaw.current.map(({ folder, entries }) => ({
           folder,
-          entries: folder === "" ? rootListing.entries : visibleEntries(entries, showHidden),
+          entries:
+            folder === "" ? rootListing.entries : visibleEntries(entries, showHidden, patterns),
         })),
         visibleChanges,
       ),
@@ -246,13 +241,31 @@ function FilesTreeRows(props: FilesTreeProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [rawVersion],
   );
-  const { wantedFolders, isEmpty, present, loadedFolders, currentPresent } = useLazyFolderTree(
-    model,
-    initial,
-    listings,
-    listingsVersion(listings),
-    [""],
+  // The order follows the sort and the metadata it reads, before this commit's sync
+  // runs: a sync that rebuilds the tree then already sorts the new way.
+  const meta = useMemo(() => treeMetadata(listings), [listings]);
+  const compare = useMemo(() => treeComparator(props.sort, meta), [props.sort, meta]);
+  sortState.current = { sort: props.sort, meta, compare };
+  const orderSignature = treeOrderSignature(props.sort, meta);
+  const appliedOrder = useRef(orderSignature);
+  const containerRef = useRef<HTMLDivElement>(null);
+  // While a filter is on, what it hides leaves the tree, even rows a chain hint once added.
+  const treeShows = useMemo(
+    () =>
+      showHidden && !hasTreePatterns(patterns) ? undefined : treePathFilter(showHidden, patterns),
+    [showHidden, patterns],
   );
+  const { wantedFolders, isEmpty, present, loadedFolders, currentPresent, synced } =
+    useLazyFolderTree(model, initial, listings, listingsVersion(listings), [""], {
+      shows: treeShows,
+      // A folder adding hundreds of entries rebuilds once, in this render's order.
+      rebuild: (paths) => {
+        rebuildTreeInPlace(model, paths, {
+          host: treeRoot(containerRef.current),
+        });
+        appliedOrder.current = orderSignature;
+      },
+    });
   useEffect(() => {
     setLoadingFolders((current) =>
       current.length === wantedFolders.length &&
@@ -293,27 +306,14 @@ function FilesTreeRows(props: FilesTreeProps) {
   }, [model, listings, props.changedFiles]);
 
   // A new sort, or metadata it orders by, re-sorts in place, keeping where the reader was.
-  const meta = useMemo(() => treeMetadata(listings), [listings]);
-  const orderSignature = treeOrderSignature(props.sort, meta);
-  const appliedOrder = useRef(orderSignature);
-  const containerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    sortState.current = { sort: props.sort, meta };
     if (appliedOrder.current === orderSignature) return;
     appliedOrder.current = orderSignature;
-    const host = treeRoot(containerRef.current);
-    const anchor = host ? topVisibleRow(host) : null;
-    const selected = model.getSelectedPaths();
-    const focused = model.getFocusedPath();
-    const hadFocus = hasFocusWithin(host);
-    // The sync may have changed the tree in this same commit; reset to what it holds now.
-    model.resetPaths([...currentPresent()], {
-      initialExpandedPaths: [...(expandedCache.get(cacheKey) ?? [])],
+    // The sync may have changed the tree in this same commit; rebuild from what it holds now.
+    rebuildTreeInPlace(model, currentPresent(), {
+      host: treeRoot(containerRef.current),
     });
-    for (const path of selected) model.getItem(path)?.select();
-    if (focused && hadFocus) model.focusPath(focused);
-    if (anchor) model.scrollToPath(anchor, { offset: "top", focus: false });
-  }, [model, props.sort, meta, orderSignature, currentPresent, cacheKey]);
+  }, [model, orderSignature, currentPresent]);
 
   // The focused row is ⌘K's file, from first entry and re-entry as well as arrow moves.
   const [activePath, setActivePath] = useState<string | null>(null);
@@ -448,7 +448,8 @@ function FilesTreeRows(props: FilesTreeProps) {
     model,
     selection: selectionRef.current,
     file: props.activeFile ?? null,
-    request: props.activeReveal ?? null,
+    // A request waits for the sync, so a change of patterns can't miss it against old rows.
+    request: synced ? (props.activeReveal ?? null) : null,
     onRequestHandled: props.onActiveRevealHandled,
     onRequestMissed: props.onActiveRevealMissed,
     present,

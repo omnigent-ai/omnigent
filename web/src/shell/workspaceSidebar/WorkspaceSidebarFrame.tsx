@@ -18,6 +18,7 @@ import { TabStripScroller } from "../TabStripScroller";
 import type { TabStripWidth } from "../workspaceTabs/useTabStripWidth";
 import type { TabId } from "../workspaceTabs/workspacePlace";
 import { TAB_GAP } from "../workspaceTabs/tabStripWidth";
+import { useStripControlsWidth } from "./stripControlsWidth";
 import { StripDragContext, StripEntryDragKeyContext } from "./stripDrag";
 import { TAB_STRIP_MOTION, tabStripMotionStyle } from "./tabStripMotion";
 import { StripEntryMotionContext, useTabStripPresence } from "./useTabStripPresence";
@@ -65,6 +66,7 @@ export function WorkspaceSidebarFrame({
   trailing,
   banner,
   contentRef,
+  onControlsWidth,
   children,
 }: {
   stripWidth: TabStripWidth;
@@ -81,9 +83,12 @@ export function WorkspaceSidebarFrame({
   /** Between the strip and the content, such as a notice about the selected tab. */
   banner?: ReactNode;
   contentRef?: RefObject<HTMLDivElement | null>;
+  /** Told the sidebar width at which the strip's fixed controls, such as Collapse, just fit. */
+  onControlsWidth?: (width: number) => void;
   /** The tabs' content: a `WorkspaceSidebarTabPanel` each, and anything shown over them. */
   children: ReactNode;
 }) {
+  useStripControlsWidth(stripWidth.areaRef, onControlsWidth);
   return (
     <>
       <div

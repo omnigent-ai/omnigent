@@ -1675,10 +1675,39 @@ against the snapshot to reconcile accepted inputs.
 Native shell-mode inputs (`!cmd`) settle when the matching `terminal_command`
 input is persisted. Its output does not acknowledge an input, and no
 `session.input.consumed` event is emitted for the shell command. Clients should
-remove only the sent bubble matching that command. During a mixed-version
+remove only the submission named by the input's server-owned `submission`:
+`{"pending_id": "...", "stable_id": "..."}`. `pending_id` names the queued entry;
+`stable_id`, when supplied by the sender, also correlates an optimistic bubble
+before the POST response arrives. This identity is persisted with the item and
+included in live events and history, so reconnect can acknowledge a missed input.
+Forwarded shell submissions retain correlation beyond the pending-entry cleanup
+timeout while awaiting their mirror, under the existing queue cap. Active-pending
+eligibility still expires after ten minutes and ends on an identity-linked failure,
+rejection or cancellation. A runner turn completing after typing into the native CLI
+does not establish shell execution. Retained correlation alone does not keep a
+session working or replay a bubble.
+A sufficiently delayed command can therefore disappear from a reload's pending list
+while its later terminal record still acknowledges the original submission.
+An empty `submission: {}` means no web submission was correlated to the record. Missing
+`submission` means a legacy record; clients must not infer history acknowledgements
+from command text. Output items carry no submission identity. During a mixed-version
 rollout, an older client can retain that bubble until refreshing its snapshot;
 an older server can still report the command as `native_prompt_not_recorded`.
 Updated clients preserve later bubbles when that older server's receipt arrives.
+
+Reconnect settlement covers the fetched history window. The fresh-window fallback
+loads only the newest 100 items; a terminal input older than that window cannot
+acknowledge an outstanding bubble through this recovery path. Paging older history
+currently renders those records without repeating shell settlement. Correlation
+before terminal persistence uses command text. Non-retired identical shell
+submissions take precedence over retired ones, including a match held for
+persistence. Retired entries remain fallback correlation when no non-retired
+match exists. Queue and interruption ordering apply within the non-retired
+group; retired entries do not count as intervening inputs. Age alone does not
+prove command loss. A silently lost command and a delayed one are
+indistinguishable by text, as are a retired command's late
+mirror and a newer identical submission. Persisted identity records that
+matching decision; it does not prove that the named submission executed.
 
 ### Sessions Typical Flow
 

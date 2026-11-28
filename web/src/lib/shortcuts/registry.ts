@@ -3,8 +3,20 @@
 
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
-import { type Chord, chordKeys, chordMatches, type KeyChordInput } from "@/lib/shortcuts/chord";
+import {
+  type DesktopCommand,
+  isNativeShell,
+  shellRoutesDesktopCommands,
+  supportsDesktopCommands,
+} from "@/lib/nativeBridge";
+import {
+  type Chord,
+  chordAriaShortcut,
+  chordKeyLabel,
+  chordKeys,
+  chordMatches,
+  type KeyChordInput,
+} from "@/lib/shortcuts/chord";
 
 /** What a binding's chords depend on. */
 export interface ShortcutEnvironment {
@@ -13,9 +25,13 @@ export interface ShortcutEnvironment {
   native: boolean;
   /** The desktop shell's menus own some chords (⌘, for Settings) and hand the command to the page. */
   desktopMenu: boolean;
+  /** The desktop menu's Go items own ⌘[ / ⌘]: the shell says it routes Go Back and Go Forward. */
+  goMenu: boolean;
   /** The composer sends with ⌘↵ and inserts a newline with ↵. */
   submitWithModEnter: boolean;
 }
+
+const GO_COMMANDS: readonly DesktopCommand[] = ["go-back", "go-forward"];
 
 /** Environments built here, which read each field once, on first use. */
 const resolvedEnvironments = new WeakSet<object>();
@@ -42,6 +58,9 @@ export function currentShortcutEnvironment(
     },
     get desktopMenu() {
       return read("desktopMenu", supportsDesktopCommands);
+    },
+    get goMenu() {
+      return read("goMenu", () => shellRoutesDesktopCommands(GO_COMMANDS));
     },
     get submitWithModEnter() {
       return read("submitWithModEnter", readSubmitWithModEnter);
@@ -98,6 +117,8 @@ export interface ShortcutPageContext {
   desktopCommands: boolean;
   /** Always steer is on, so ⌘↵ queues a follow-up instead of sending now. */
   alwaysSteer: boolean;
+  /** quick_pick_palette is on, so Ctrl+Tab steps to the next session instead of switching. */
+  quickPick: boolean;
 }
 
 /** What a page row's keys may depend on. */
@@ -105,6 +126,40 @@ interface ShortcutRowContext {
   context: ShortcutPageContext;
   environment: ShortcutEnvironment;
 }
+
+/**
+ * What acts on a binding's chord. `app`: a window-level hotkey hook; `widget`: the focused
+ * widget's own key handler. Both match through this registry. `elsewhere`: code that reads the
+ * key itself or a desktop menu item; `unhandled`: nothing binds the chord yet, so only the
+ * action's other entry points run it.
+ */
+export type ShortcutHandler =
+  | { scope: "app" | "widget"; module: string }
+  | { scope: "elsewhere"; owner: string }
+  | { scope: "unhandled"; reason: string };
+
+const app = (module: string): ShortcutHandler => ({ scope: "app", module });
+const widget = (module: string): ShortcutHandler => ({ scope: "widget", module });
+const elsewhere = (owner: string): ShortcutHandler => ({ scope: "elsewhere", owner });
+const unhandled = (reason: string): ShortcutHandler => ({ scope: "unhandled", reason });
+
+const QUICK_PICK_HOST = app("shell/quickPickShortcuts/QuickPickShortcutHost.tsx");
+const RECENT_SESSION_SWITCH = app("hooks/useRecentSessionSwitch.ts");
+const GO_TO_FILE = app("shell/goToFile/goToFileCommands.ts");
+const WORKSPACE_TAB_CHORDS = app("shell/workspaceCommands/useWorkspaceTabChords.ts");
+const WORKSPACE_HISTORY = app("shell/workspaceCommands/useWorkspaceHistoryCommands.ts");
+const WORKSPACE_TAB_STEPPING = app("shell/workspaceTabs/useWorkspaceTabStepping.ts");
+const WORKSPACE_TAB_STRIP = widget("shell/workspaceSidebar/useWorkspaceSidebarTabActions.ts");
+const FILE_EDITOR = widget("shell/codeMirror/CodeMirrorFileViewer.tsx");
+/** The editing commands' keymap, built from these bindings. */
+const EDITOR_COMMANDS = widget("shell/codeMirror/codeMirrorEditorCommands.ts");
+const DESKTOP_MENU = elsewhere("The desktop app's menu item, which hands the command to the page.");
+const COMPOSER_KEYS = elsewhere("The composer's own key handling.");
+const QUESTION_KEYS = elsewhere("A pending question's own keys.");
+const SUGGESTION_KEYS = elsewhere("The open suggestions menu's own keys.");
+const PULL_REQUEST_PAGE = unhandled(
+  "The new pull request page binds it, once that page is routed.",
+);
 
 interface ShortcutBindingDefinition {
   label: string;
@@ -119,6 +174,8 @@ interface ShortcutBindingDefinition {
    * the action's chord.
    */
   chords: (environment: ShortcutEnvironment) => Chord[];
+  /** What acts on the chord. */
+  handler: ShortcutHandler;
   /** The desktop menu's accelerators for the action, shown where it owns them; never matched here. */
   menuChords?: (environment: ShortcutEnvironment) => Chord[];
   /** Listed on another binding's page row as its alternative chord; that binding's id. */
@@ -131,16 +188,61 @@ interface ShortcutBindingDefinition {
   shownWhen?: (context: ShortcutPageContext) => boolean;
   /** Left off touch and narrow layouts, where Enter inserts a newline instead of submitting. */
   desktopOnly?: true;
+  /** More chords that run the action but are never shown, such as a variant with Shift held. */
+  secondaryChords?: (environment: ShortcutEnvironment) => Chord[];
+  /** The feature flag a binding waits for; it's left out of `SHORTCUT_BINDINGS` until then. */
+  flag?: "quick_pick_palette";
 }
 
-/** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
-export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
+/** A binding the Keyboard shortcuts page leaves out, such as one its ⌘K command lists. */
+const NOT_LISTED = (): boolean => false;
+
+/** A session step's Ctrl+Tab chord and its Ctrl+Alt+Shift arrow, the one a browser tab reaches. */
+function sessionStepChords(
+  environment: ShortcutEnvironment,
+  tab: Chord,
+  arrow: "ArrowDown" | "ArrowUp",
+): Chord[] {
+  const arrowChord: Chord = { ctrl: true, alt: true, shift: true, key: arrow, exactKey: true };
+  return environment.native ? [tab, arrowChord] : [arrowChord, tab];
+}
+
+// The transcript's message steps. AltGr matches on macOS only, where Firefox reports Option as
+// AltGr; elsewhere AltGr types a character.
+function messageStepChord(key: "ArrowUp" | "ArrowDown", environment: ShortcutEnvironment): Chord {
+  return { mod: true, alt: true, key, exactKey: true, matchesAltGraph: environment.mac };
+}
+
+// Shift variants are macOS-only; elsewhere they're Next and Previous session's chords.
+function messageStepWithShift(
+  key: "ArrowUp" | "ArrowDown",
+  environment: ShortcutEnvironment,
+): Chord[] {
+  return environment.mac ? [{ ...messageStepChord(key, environment), shift: true }] : [];
+}
+
+/** The open session's Pin, Fork and Archive chords, as the desktop app's Session menu binds them. */
+export const OPEN_SESSION_CHORDS = {
+  pin: { mod: true, alt: true, code: "KeyP" },
+  fork: { mod: true, alt: true, code: "KeyF" },
+  archive: { mod: true, shift: true, key: "a" },
+} as const satisfies Record<string, Chord>;
+
+// The desktop menu owns these chords; elsewhere Ctrl+Alt+P and Ctrl+Alt+F are Go to a file
+// and Search text in files, so the browser takes Pin and Fork on macOS only.
+const browserOpenSessionChord =
+  (chord: Chord, alsoOffMac: boolean) => (environment: ShortcutEnvironment) =>
+    environment.desktopMenu || (!environment.mac && !alsoOffMac) ? [] : [chord];
+
+/** Sidebar slots in order: ⌘1–⌘9 pick the first nine. ⌘0 stays the menu's Actual Size. */
+export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
 /** Workspace rail tabs ⌃1–⌃9, by position. */
 const WORKSPACE_TAB_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
-const BINDINGS = {
+const APP_BINDINGS = {
   "session.new": {
+    handler: app("hooks/useNewSessionHotkey.ts"),
     group: "general",
     label: "Start a new session",
     // A browser keeps ⌘N for a new window. Match the key that types N or O, on any layout.
@@ -153,6 +255,7 @@ const BINDINGS = {
         : keys.map((key) => (key === "⇧" ? "Shift" : key)),
   },
   "session.addSibling": {
+    handler: app("hooks/useAddSiblingSessionHotkey.ts"),
     group: "general",
     label: "Add nested agent",
     // The physical key, because Option changes the character it types.
@@ -160,6 +263,7 @@ const BINDINGS = {
     shownWhen: (context) => context.siblingSessions,
   },
   "palette.commands": {
+    handler: app("hooks/useCommandPaletteHotkey.ts"),
     group: "general",
     label: "Open command palette",
     // Exactly k or K: case-folding would also take characters such as the Kelvin sign.
@@ -169,22 +273,26 @@ const BINDINGS = {
     ],
   },
   "palette.sessions": {
+    handler: app("hooks/useCommandPaletteHotkey.ts"),
     group: "general",
     label: "Find a session by name",
     chords: () => [{ mod: true, alt: true, code: "KeyS" }],
   },
   "session.rename": {
+    handler: app("hooks/useRenameSessionHotkey.ts"),
     group: "general",
     label: "Rename current session",
     // The physical key, because Option changes the character it types.
     chords: () => [{ mod: true, alt: true, code: "KeyR" }],
   },
   "session.toggleUnread": {
+    handler: app("hooks/useToggleUnreadHotkey.ts"),
     group: "general",
     label: "Mark current session unread or read",
     chords: () => [{ mod: true, alt: true, code: "KeyU" }],
   },
   "settings.open": {
+    handler: app("hooks/useSettingsHotkey.ts"),
     group: "general",
     label: "Open Settings",
     // The desktop menu's Settings item owns ⌘, there; a browser keeps ⌘, for its own settings.
@@ -193,50 +301,57 @@ const BINDINGS = {
     menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "Comma" }] : []),
   },
   "shortcuts.show": {
+    handler: app("components/KeyboardShortcutsDialog.tsx"),
     group: "general",
     label: "Show keyboard shortcuts",
     chords: () => [{ mod: true, key: "/", exactKey: true, matchesAltGraph: true }],
   },
   // The desktop app's menu items, whose accelerators reach the page as commands.
   "tab.close": {
+    handler: DESKTOP_MENU,
     group: "general",
     label: "Close tab, or leave the session",
     chords: () => [],
     menuChords: (environment) => (environment.desktopMenu ? [{ mod: true, code: "KeyW" }] : []),
   },
   "window.close": {
+    handler: DESKTOP_MENU,
     group: "general",
     label: "Close window",
     chords: () => [],
     menuChords: (environment) =>
       environment.desktopMenu ? [{ mod: true, shift: true, code: "KeyW" }] : [],
   },
-  // The desktop app's Session menu items.
+  // The desktop app's Session menu items. With quick_pick_palette on, a browser runs them too.
   "session.pin": {
+    handler: QUICK_PICK_HOST,
     group: "general",
     label: "Pin or unpin current session",
-    chords: () => [],
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, alt: true, code: "KeyP" }] : [],
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.pin, false),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.pin] : []),
     shownWhen: (context) => context.desktopCommands,
   },
   "session.archive": {
+    handler: QUICK_PICK_HOST,
     group: "general",
     label: "Archive current session",
-    chords: () => [],
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, shift: true, key: "a" }] : [],
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.archive, true),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.archive] : []),
     shownWhen: (context) => context.desktopCommands,
   },
   "session.fork": {
+    handler: QUICK_PICK_HOST,
     group: "general",
     label: "Fork current session",
-    chords: () => [],
-    menuChords: (environment) =>
-      environment.desktopMenu ? [{ mod: true, alt: true, code: "KeyF" }] : [],
+    chords: browserOpenSessionChord(OPEN_SESSION_CHORDS.fork, false),
+    flag: "quick_pick_palette",
+    menuChords: (environment) => (environment.desktopMenu ? [OPEN_SESSION_CHORDS.fork] : []),
     shownWhen: (context) => context.desktopCommands,
   },
   "app.quit": {
+    handler: DESKTOP_MENU,
     group: "general",
     label: "Quit Omnigent",
     chords: () => [],
@@ -244,12 +359,14 @@ const BINDINGS = {
   },
   // The composer's own keys. Touch and narrow layouts insert a newline on Enter instead.
   "composer.send": {
+    handler: COMPOSER_KEYS,
     group: "chats",
     label: "Send message",
     chords: (environment) => [environment.submitWithModEnter ? MOD_ENTER : ENTER],
     shownWhen: (context) => !context.preventsKeyboardSubmit,
   },
   "composer.sendWithQueue": {
+    handler: COMPOSER_KEYS,
     group: "chats",
     label: "Send now, with all queued messages",
     chords: (environment) => [
@@ -260,6 +377,7 @@ const BINDINGS = {
       context.alwaysSteer ? "Queue message until the agent finishes" : undefined,
   },
   "composer.newLine": {
+    handler: COMPOSER_KEYS,
     group: "chats",
     label: "New line in message",
     chords: (environment) => [
@@ -269,6 +387,7 @@ const BINDINGS = {
   },
   // Alt+Enter is a newline in both modes; the browser inserts the others itself.
   "composer.newLineWithAlt": {
+    handler: COMPOSER_KEYS,
     group: "chats",
     label: "New line in message",
     chords: () => [{ alt: true, key: "Enter" }],
@@ -277,34 +396,40 @@ const BINDINGS = {
     advertised: (environment) => !environment.submitWithModEnter,
   },
   "composer.previousPrompt": {
+    handler: COMPOSER_KEYS,
     group: "chats",
     label: "Recall previous prompt",
     chords: () => [{ key: "ArrowUp" }],
   },
   "composer.nextPrompt": {
+    handler: COMPOSER_KEYS,
     group: "chats",
     label: "Recall next prompt",
     chords: () => [{ key: "ArrowDown" }],
   },
   // Approval chords allow AltGr and compare the key exactly, as they always have.
   "approval.accept": {
+    handler: app("hooks/useApproveHotkey.ts"),
     group: "chats",
     label: "Accept approval prompt",
     chords: () => [{ mod: true, key: "Enter", exactKey: true, matchesAltGraph: true }],
   },
   "approval.decline": {
+    handler: app("hooks/useApproveHotkey.ts"),
     group: "chats",
     label: "Decline approval prompt",
     chords: () => [{ key: "Escape", exactKey: true, matchesAltGraph: true }],
   },
   // A pending question's own keys.
   "question.next": {
+    handler: QUESTION_KEYS,
     group: "chats",
     label: "Next question, or submit all answers",
     chords: () => [ENTER],
     desktopOnly: true,
   },
   "question.pickOption": {
+    handler: QUESTION_KEYS,
     group: "chats",
     label: "Pick a question option by number",
     chords: () => QUESTION_OPTION_DIGITS.map((digit) => ({ key: digit })),
@@ -312,6 +437,7 @@ const BINDINGS = {
     rowKeys: () => ["1…9"],
   },
   "question.cancel": {
+    handler: QUESTION_KEYS,
     group: "chats",
     label: "Cancel pending question",
     chords: () => [{ key: "Escape" }],
@@ -320,41 +446,92 @@ const BINDINGS = {
   // Literal Control on macOS too: ⌘⇧M is a browser's profile switcher and ⌘⌥M minimizes
   // every window. Physical keys, since Shift and Alt change the character.
   "model.picker": {
+    handler: app("hooks/useModelPickerHotkey.ts"),
     group: "chats",
     label: "Open model picker",
     chords: () => [{ ctrl: true, shift: true, code: "KeyM" }],
   },
   "model.cycle": {
+    handler: app("hooks/useComposerConfigCycleHotkeys.ts"),
     group: "chats",
     label: "Cycle model",
     chords: () => [{ ctrl: true, alt: true, code: "KeyM" }],
   },
   "effort.cycle": {
+    handler: app("hooks/useComposerConfigCycleHotkeys.ts"),
     group: "chats",
     label: "Cycle reasoning effort",
     chords: () => [{ ctrl: true, alt: true, code: "KeyE" }],
   },
   "composer.cyclePermissionMode": {
+    handler: COMPOSER_KEYS,
     group: "chats",
     label: "Cycle permission mode (in session)",
     chords: () => [{ shift: true, key: "Tab" }],
   },
   "composer.focus": {
+    handler: app("hooks/useFocusComposerHotkey.ts"),
     group: "chats",
     label: "Focus chat input",
     chords: () => [{ ctrl: true, shift: true, code: "KeyL" }],
   },
   "dictation.toggle": {
+    handler: app("hooks/useVoiceDictationHotkey.ts"),
     group: "chats",
     label: "Toggle voice dictation",
     chords: () => [{ mod: true, alt: true, code: "KeyV" }],
   },
   "response.stop": {
+    handler: elsewhere("The composer's Escape, which stops the turn."),
     group: "chats",
     label: "Stop response",
     chords: () => [{ key: "Escape" }],
   },
+  "message.previous": {
+    handler: app("hooks/useMessageNavHotkeys.ts"),
+    group: "chats",
+    label: "Go to previous message",
+    chords: (environment) => [messageStepChord("ArrowUp", environment)],
+    secondaryChords: (environment) => messageStepWithShift("ArrowUp", environment),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  "message.next": {
+    handler: app("hooks/useMessageNavHotkeys.ts"),
+    group: "chats",
+    label: "Go to next message",
+    chords: (environment) => [messageStepChord("ArrowDown", environment)],
+    secondaryChords: (environment) => messageStepWithShift("ArrowDown", environment),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  // With quick_pick_palette on, each runs its ⌘K command, and Ctrl+Tab steps instead of
+  // opening the recent switcher. A browser keeps Ctrl+Tab, so the desktop app lists it first.
+  "session.next": {
+    handler: QUICK_PICK_HOST,
+    group: "navigation",
+    label: "Next session",
+    chords: (environment) =>
+      sessionStepChords(environment, { ctrl: true, key: "Tab", exactKey: true }, "ArrowDown"),
+    flag: "quick_pick_palette",
+    shownWhen: (context) => context.electron && context.quickPick,
+  },
+  "session.previous": {
+    handler: QUICK_PICK_HOST,
+    group: "navigation",
+    label: "Previous session",
+    chords: (environment) =>
+      sessionStepChords(
+        environment,
+        { ctrl: true, shift: true, key: "Tab", exactKey: true },
+        "ArrowUp",
+      ),
+    flag: "quick_pick_palette",
+    shownWhen: (context) => context.electron && context.quickPick,
+  },
+  // With quick_pick_palette on, Ctrl+Tab is Next session instead.
   "sessions.recent": {
+    handler: app("shell/RecentSessionsSwitcher.tsx"),
     group: "navigation",
     label: "Switch recent sessions",
     // Shift steps backward through the list.
@@ -362,26 +539,34 @@ const BINDINGS = {
       { ctrl: true, key: "Tab", exactKey: true },
       { ctrl: true, shift: true, key: "Tab", exactKey: true },
     ],
-    shownWhen: (context) => context.electron,
+    shownWhen: (context) => context.electron && !context.quickPick,
   },
   "history.back": {
+    handler: app("hooks/useHistoryNavigation.ts"),
     group: "navigation",
     label: "Go back",
-    chords: () => [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
+    // A shell whose Go menu takes ⌘[ hands it over as a command, even from a browser view.
+    chords: (environment) =>
+      environment.goMenu ? [] : [{ mod: true, code: "BracketLeft", matchesAltGraph: true }],
+    menuChords: (environment) => (environment.goMenu ? [{ mod: true, code: "BracketLeft" }] : []),
     // A browser tab keeps its own Back and Forward.
     shownWhen: (context) => context.electron,
   },
   "history.forward": {
+    handler: app("hooks/useHistoryNavigation.ts"),
     group: "navigation",
     label: "Go forward",
-    chords: () => [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
+    chords: (environment) =>
+      environment.goMenu ? [] : [{ mod: true, code: "BracketRight", matchesAltGraph: true }],
+    menuChords: (environment) => (environment.goMenu ? [{ mod: true, code: "BracketRight" }] : []),
     // A browser tab keeps its own Back and Forward.
     shownWhen: (context) => context.electron,
   },
   "session.number": {
+    handler: app("hooks/useSessionNumberHotkeys.ts"),
     group: "navigation",
-    rowKeys: (keys) => withRangeLabel(keys, "1…0"),
-    label: "Jump to a sidebar session (1–10)",
+    rowKeys: (keys) => withRangeLabel(keys, "1…9"),
+    label: "Jump to a sidebar session (1–9)",
     // A browser keeps ⌘-digit for its tabs, so there Alt joins it, matched by the
     // physical key because Alt rewrites the digit on macOS.
     chords: (environment) =>
@@ -391,7 +576,26 @@ const BINDINGS = {
           : { mod: true, alt: true, code: `Digit${digit}` },
       ),
   },
+  // Hold Control and press ] or [ to walk recently visited sessions, then release to switch.
+  // macOS only: elsewhere Ctrl is the command key, and Ctrl+[ and Ctrl+] are taken.
+  "session.recent": {
+    handler: RECENT_SESSION_SWITCH,
+    group: "navigation",
+    label: "Switch to recent session",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketRight" }] : []),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
+  "session.recentReverse": {
+    handler: RECENT_SESSION_SWITCH,
+    group: "navigation",
+    label: "Switch to recent session (reverse)",
+    chords: (environment) => (environment.mac ? [{ ctrl: true, code: "BracketLeft" }] : []),
+    flag: "quick_pick_palette",
+    shownWhen: NOT_LISTED,
+  },
   "view.mode": {
+    handler: app("hooks/useViewModeToggleHotkey.ts"),
     group: "view",
     label: "Toggle Chat / Terminal view",
     chords: () => [{ mod: true, alt: true, code: "Backslash" }],
@@ -399,6 +603,7 @@ const BINDINGS = {
   // The desktop app uses ⌘B / ⇧⌘B; a browser keeps those for bookmarks, so there
   // ⌘⌥[ / ⌘⌥] by physical key, since Alt rewrites the brackets on macOS.
   "sidebar.left": {
+    handler: app("hooks/useSidebarToggleHotkeys.ts"),
     group: "view",
     label: "Toggle conversations sidebar",
     chords: (environment) =>
@@ -407,6 +612,7 @@ const BINDINGS = {
         : [{ mod: true, alt: true, code: "BracketLeft" }],
   },
   "sidebar.right": {
+    handler: app("hooks/useSidebarToggleHotkeys.ts"),
     group: "view",
     label: "Toggle workspace sidebar",
     chords: (environment) =>
@@ -415,12 +621,14 @@ const BINDINGS = {
         : [{ mod: true, alt: true, code: "BracketRight" }],
   },
   "workspace.searchContents": {
+    handler: elsewhere("The workspace panel's own key handling."),
     group: "view",
     label: "Search workspace contents",
     chords: () => [{ mod: true, shift: true, code: "KeyF" }],
     shownWhen: (context) => context.contentSearch,
   },
   "workspace.tab": {
+    handler: app("hooks/useWorkspaceTabHotkeys.ts"),
     group: "view",
     rowKeys: (keys, { context }) => withRangeLabel(keys, context.contentSearch ? "1…5" : "1…4"),
     label: "Select a workspace tab",
@@ -433,6 +641,7 @@ const BINDINGS = {
       ),
   },
   "browser.newTab": {
+    handler: DESKTOP_MENU,
     group: "view",
     label: "Open a new browser tab",
     chords: () => [],
@@ -440,12 +649,14 @@ const BINDINGS = {
     shownWhen: (context) => context.browser,
   },
   "terminal.new": {
+    handler: app("hooks/useNewShellHotkey.ts"),
     group: "view",
     label: "Open a new shell",
     // Literal Control on every platform, so it never meets macOS window cycling (⌘`).
     chords: () => [{ ctrl: true, code: "Backquote", matchesAltGraph: true }],
   },
   "tab.previous": {
+    handler: DESKTOP_MENU,
     group: "view",
     label: "Show the previous workspace tab",
     chords: () => [],
@@ -453,6 +664,7 @@ const BINDINGS = {
       environment.desktopMenu ? [{ mod: true, shift: true, code: "BracketLeft" }] : [],
   },
   "tab.next": {
+    handler: DESKTOP_MENU,
     group: "view",
     label: "Show the next workspace tab",
     chords: () => [],
@@ -460,6 +672,7 @@ const BINDINGS = {
       environment.desktopMenu ? [{ mod: true, shift: true, code: "BracketRight" }] : [],
   },
   "tab.reopen": {
+    handler: DESKTOP_MENU,
     group: "view",
     label: "Reopen the last closed tab",
     chords: () => [],
@@ -467,6 +680,7 @@ const BINDINGS = {
       environment.desktopMenu ? [{ mod: true, shift: true, code: "KeyT" }] : [],
   },
   "browser.reload": {
+    handler: DESKTOP_MENU,
     group: "view",
     label: "Reload the browser tab",
     chords: () => [],
@@ -474,6 +688,7 @@ const BINDINGS = {
     shownWhen: (context) => context.browser,
   },
   "browser.focusAddressBar": {
+    handler: DESKTOP_MENU,
     group: "view",
     label: "Focus the browser address bar",
     chords: () => [],
@@ -481,6 +696,7 @@ const BINDINGS = {
     shownWhen: (context) => context.browser,
   },
   "fileViewer.exitFullScreen": {
+    handler: elsewhere("The file viewer's own Escape handling."),
     group: "view",
     label: "Exit full screen from a file",
     chords: () => [{ key: "Escape" }],
@@ -488,24 +704,28 @@ const BINDINGS = {
     shownWhen: (context) => !context.preventsKeyboardSubmit,
   },
   "pane.previous": {
+    handler: app("hooks/usePaneCycleHotkey.ts"),
     group: "panes",
     label: "Focus previous pane",
     chords: () => [{ mod: true, alt: true, shift: true, code: "BracketLeft" }],
     shownWhen: (context) => context.grids || context.splitTerminal,
   },
   "pane.next": {
+    handler: app("hooks/usePaneCycleHotkey.ts"),
     group: "panes",
     label: "Focus next pane",
     chords: () => [{ mod: true, alt: true, shift: true, code: "BracketRight" }],
     shownWhen: (context) => context.grids || context.splitTerminal,
   },
   "terminal.splitRight": {
+    handler: app("hooks/useTerminalSplitHotkey.ts"),
     group: "panes",
     label: "Split terminal right",
     chords: () => [{ mod: true, alt: true, shift: true, code: "Backslash" }],
     shownWhen: (context) => context.splitTerminal,
   },
   "terminal.splitDown": {
+    handler: app("hooks/useTerminalSplitHotkey.ts"),
     group: "panes",
     label: "Split terminal down",
     chords: () => [{ mod: true, alt: true, code: "Minus" }],
@@ -513,50 +733,412 @@ const BINDINGS = {
   },
   // The open suggestions menu's own keys.
   "slash.previous": {
+    handler: SUGGESTION_KEYS,
     group: "slash",
     label: "Navigate suggestions",
     chords: () => [{ key: "ArrowUp" }],
     rowKeys: (keys, { environment }) => [...keys, ...chordKeys(SLASH_NEXT, environment.mac)],
   },
   "slash.next": {
+    handler: SUGGESTION_KEYS,
     group: "slash",
     label: "Navigate suggestions",
     chords: () => [SLASH_NEXT],
     partOf: "slash.previous",
   },
   "slash.apply": {
+    handler: SUGGESTION_KEYS,
     group: "slash",
     label: "Apply highlighted command",
     chords: () => [{ key: "Tab" }],
   },
   "slash.dismiss": {
+    handler: SUGGESTION_KEYS,
     group: "slash",
     label: "Dismiss menu",
     chords: () => [{ key: "Escape" }],
   },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
+const mod = (key: Chord): Chord => ({ mod: true, ...key });
+const modAlt = (key: Chord): Chord => ({ mod: true, alt: true, ...key });
+
+// The workspace sidebar's own shortcuts: its tabs and history, the code editor's commands,
+// find, searches, and opening a row in a new tab. The Keyboard Shortcuts page and ⌘K list
+// them only once the sidebar is routed.
+const WORKSPACE_SIDEBAR_DEFINITIONS = {
+  // A browser keeps ⌘T and ⌘W for its own tabs, so the sidebar's tabs add Option.
+  "workspace.newTab": {
+    handler: WORKSPACE_TAB_CHORDS,
+    group: "workspace",
+    label: "New workspace tab",
+    chords: () => [modAlt({ shift: true, code: "KeyN" })],
+  },
+  "workspace.closeTab": {
+    handler: WORKSPACE_TAB_CHORDS,
+    group: "workspace",
+    label: "Close workspace tab",
+    chords: () => [modAlt({ code: "KeyW" })],
+  },
+  "workspace.reopenTab": {
+    handler: WORKSPACE_TAB_CHORDS,
+    group: "workspace",
+    label: "Reopen closed workspace tab",
+    chords: () => [modAlt({ shift: true, code: "KeyT" })],
+  },
+  // ⌘← / ⌘→ in the macOS app, as in the browsers it follows; text keeps them for line start / end.
+  "workspace.back": {
+    handler: WORKSPACE_HISTORY,
+    group: "workspace",
+    label: "Go back in the workspace",
+    chords: (environment) => [
+      environment.mac && environment.native
+        ? mod({ key: "ArrowLeft" })
+        : modAlt({ shift: true, key: "ArrowLeft" }),
+    ],
+  },
+  "workspace.forward": {
+    handler: WORKSPACE_HISTORY,
+    group: "workspace",
+    label: "Go forward in the workspace",
+    chords: (environment) => [
+      environment.mac && environment.native
+        ? mod({ key: "ArrowRight" })
+        : modAlt({ shift: true, key: "ArrowRight" }),
+    ],
+  },
+  // A browser keeps ⇧⌘[ and ⇧⌘] for its own tabs.
+  "workspace.nextTab": {
+    handler: WORKSPACE_TAB_STEPPING,
+    group: "workspace",
+    label: "Next workspace tab",
+    chords: (environment) =>
+      environment.native ? [mod({ shift: true, code: "BracketRight" })] : [],
+  },
+  "workspace.previousTab": {
+    handler: WORKSPACE_TAB_STEPPING,
+    group: "workspace",
+    label: "Previous workspace tab",
+    chords: (environment) =>
+      environment.native ? [mod({ shift: true, code: "BracketLeft" })] : [],
+  },
+  "workspace.moveTabLeft": {
+    handler: WORKSPACE_TAB_STRIP,
+    group: "workspace",
+    label: "Move workspace tab left",
+    chords: () => [{ alt: true, shift: true, key: "ArrowLeft" }],
+  },
+  "workspace.moveTabRight": {
+    handler: WORKSPACE_TAB_STRIP,
+    group: "workspace",
+    label: "Move workspace tab right",
+    chords: () => [{ alt: true, shift: true, key: "ArrowRight" }],
+  },
+  "workspace.toggleFullScreen": {
+    handler: app("shell/workspaceCommands/useWorkspaceFullScreenCommand.ts"),
+    group: "workspace",
+    label: "Toggle workspace full screen",
+    chords: () => [mod({ shift: true, code: "KeyF" })],
+  },
+  "browser.new": {
+    handler: app("hooks/useNewBrowserHotkey.ts"),
+    group: "workspace",
+    label: "Open a new browser tab",
+    chords: () => [modAlt({ code: "KeyB" })],
+  },
+  // Physical keys, since Option rewrites letters; ⌃⌘F is the system's full screen on macOS.
+  // Elsewhere Ctrl+Alt+F and Ctrl+Alt+P are the Session menu's Fork and Pin.
+  "palette.text": {
+    handler: GO_TO_FILE,
+    group: "workspace",
+    label: "Search text in the open session's files",
+    chords: (environment) =>
+      environment.mac ? [{ ctrl: true, mod: true, code: "KeyO" }] : [modAlt({ code: "KeyO" })],
+  },
+  "palette.files": {
+    handler: GO_TO_FILE,
+    group: "workspace",
+    label: "Go to a file in the open session",
+    chords: (environment) =>
+      environment.mac
+        ? [{ ctrl: true, mod: true, code: "KeyP" }]
+        : [modAlt({ shift: true, code: "KeyP" })],
+  },
+  // The Explorer chord editors use.
+  "files.toggleTree": {
+    handler: app("shell/workspaceTabs/placeViews/useFilesTreeToggleCommand.ts"),
+    group: "workspace",
+    label: "Show or hide the Files tree",
+    chords: () => [mod({ shift: true, code: "KeyE" })],
+  },
+  "find.open": {
+    handler: app("lib/findRouting.ts"),
+    group: "workspace",
+    label: "Find in file",
+    chords: () => [mod({ key: "f" })],
+  },
+  "file.findAndReplace": {
+    handler: FILE_EDITOR,
+    group: "files",
+    label: "Find and replace",
+    // Windows and Linux editors also replace with Control+H.
+    chords: (environment) => [
+      modAlt({ shift: true, code: "KeyF" }),
+      ...(environment.mac ? [] : [{ ctrl: true, code: "KeyH" }]),
+    ],
+  },
+  "file.findInSelection": {
+    handler: FILE_EDITOR,
+    group: "files",
+    label: "Find in selection",
+    chords: () => [modAlt({ code: "KeyL" })],
+  },
+  "file.goToLine": {
+    handler: FILE_EDITOR,
+    group: "files",
+    label: "Go to line",
+    // Control on every platform, as in other editors.
+    chords: () => [{ ctrl: true, code: "KeyG" }],
+  },
+  "file.toggleLineComment": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Toggle line comment",
+    chords: () => [mod({ key: "/" })],
+  },
+  "file.toggleBlockComment": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Toggle block comment",
+    chords: () => [{ alt: true, shift: true, code: "KeyA" }],
+  },
+  "file.indentLines": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Indent lines",
+    chords: () => [mod({ code: "BracketRight" })],
+  },
+  "file.outdentLines": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Outdent lines",
+    chords: () => [mod({ code: "BracketLeft" })],
+  },
+  "file.moveLinesUp": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Move lines up",
+    chords: () => [{ alt: true, key: "ArrowUp" }],
+  },
+  "file.moveLinesDown": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Move lines down",
+    chords: () => [{ alt: true, key: "ArrowDown" }],
+  },
+  "file.copyLinesUp": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Copy lines up",
+    chords: () => [{ alt: true, shift: true, key: "ArrowUp" }],
+  },
+  "file.copyLinesDown": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Copy lines down",
+    chords: () => [{ alt: true, shift: true, key: "ArrowDown" }],
+  },
+  "file.deleteLines": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Delete lines",
+    chords: () => [mod({ shift: true, code: "KeyK" })],
+  },
+  "file.insertLineBelow": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Insert line below",
+    chords: () => [mod({ key: "Enter" })],
+  },
+  "file.insertLineAbove": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Insert line above",
+    chords: () => [mod({ shift: true, key: "Enter" })],
+  },
+  "file.trimTrailingWhitespace": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Trim trailing whitespace",
+    chords: () => [],
+  },
+  "file.undoCursor": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Undo cursor change",
+    chords: () => [mod({ code: "KeyU" })],
+  },
+  "file.addCursorAbove": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Add cursor above",
+    chords: () => [modAlt({ key: "ArrowUp" })],
+  },
+  "file.addCursorBelow": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Add cursor below",
+    chords: () => [modAlt({ key: "ArrowDown" })],
+  },
+  "file.selectNextOccurrence": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Select next occurrence",
+    chords: () => [mod({ key: "d" })],
+  },
+  "file.selectAllOccurrences": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Select all occurrences",
+    chords: () => [mod({ shift: true, code: "KeyL" })],
+  },
+  "file.expandLineSelection": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Expand selection to line",
+    chords: () => [mod({ code: "KeyL" })],
+  },
+  // ⇧⌥⌘ and an arrow belong to workspace history and line moves, so these stay unbound.
+  "file.columnSelectUp": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Column select up",
+    chords: () => [],
+  },
+  "file.columnSelectDown": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Column select down",
+    chords: () => [],
+  },
+  "file.columnSelectLeft": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Column select left",
+    chords: () => [],
+  },
+  "file.columnSelectRight": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Column select right",
+    chords: () => [],
+  },
+  "file.goToBracket": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Go to matching bracket",
+    chords: () => [mod({ shift: true, code: "Backslash" })],
+  },
+  // ⌘⌥[ and ⌘⌥] toggle the sidebars, so folding takes Control+Shift and a bracket.
+  "file.fold": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Fold",
+    chords: () => [{ ctrl: true, shift: true, code: "BracketLeft" }],
+  },
+  "file.unfold": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Unfold",
+    chords: () => [{ ctrl: true, shift: true, code: "BracketRight" }],
+  },
+  "file.foldAll": { handler: EDITOR_COMMANDS, group: "files", label: "Fold all", chords: () => [] },
+  "file.unfoldAll": {
+    handler: EDITOR_COMMANDS,
+    group: "files",
+    label: "Unfold all",
+    chords: () => [],
+  },
+  // A row that opens a place (a changed file, a commit or a pull request) opens it in a new tab.
+  "rows.openInNewTab": {
+    handler: widget("shell/pullRequestOpenIntent.ts"),
+    group: "workspace",
+    label: "Open the focused row in a new tab (⇧ to switch to it)",
+    chords: () => [mod({ key: "Enter" }), mod({ shift: true, key: "Enter" })],
+  },
+  // The new pull request page's: delete the selected rows from its list, and step down and up a
+  // PR's stack as on github.com. Text fields and menus keep these keys.
+  "pullRequests.removeSelected": {
+    handler: PULL_REQUEST_PAGE,
+    group: "workspace",
+    label: "Remove selected pull requests",
+    chords: () => [mod({ eitherCommandKey: true, key: "Backspace" })],
+  },
+  "pullRequestStack.next": {
+    handler: PULL_REQUEST_PAGE,
+    group: "workspace",
+    label: "Next in stack",
+    chords: () => [{ shift: true, code: "KeyJ" }],
+  },
+  "pullRequestStack.previous": {
+    handler: PULL_REQUEST_PAGE,
+    group: "workspace",
+    label: "Previous in stack",
+    chords: () => [{ shift: true, code: "KeyK" }],
+  },
+} satisfies Record<string, ShortcutBindingDefinition>;
+
+const BINDINGS = { ...APP_BINDINGS, ...WORKSPACE_SIDEBAR_DEFINITIONS };
+
+/** A shortcut any surface matches: one of the app's, or one of the workspace sidebar's. */
 export type ShortcutId = keyof typeof BINDINGS;
+
+export type WorkspaceSidebarShortcutId = keyof typeof WORKSPACE_SIDEBAR_DEFINITIONS;
 
 export interface ShortcutBinding extends ShortcutBindingDefinition {
   id: ShortcutId;
 }
 
-/** Every binding, in registry order. */
-export const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = Object.entries(BINDINGS).map(
-  ([id, binding]) => ({ id: id as ShortcutId, ...(binding as ShortcutBindingDefinition) }),
+const toBindings = (definitions: Record<string, ShortcutBindingDefinition>): ShortcutBinding[] =>
+  Object.entries(definitions).map(([id, binding]) => ({ id: id as ShortcutId, ...binding }));
+
+/** Every app binding in Keyboard shortcuts page order, those waiting for a flag included. */
+export const APP_SHORTCUT_BINDINGS: readonly ShortcutBinding[] = toBindings(APP_BINDINGS);
+
+/** Every app binding, in registry order, apart from those waiting for a flag. */
+export const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = APP_SHORTCUT_BINDINGS.filter(
+  (binding) => binding.flag === undefined,
+);
+
+/** The bindings that wait for quick_pick_palette, which only its ⌘K and hotkeys use. */
+export const QUICK_PICK_SHORTCUT_BINDINGS: readonly ShortcutBinding[] =
+  APP_SHORTCUT_BINDINGS.filter((binding) => binding.flag === "quick_pick_palette");
+
+/** The workspace sidebar's bindings, in order, for the Keyboard Shortcuts page once it's routed. */
+export const WORKSPACE_SIDEBAR_BINDINGS: readonly ShortcutBinding[] = toBindings(
+  WORKSPACE_SIDEBAR_DEFINITIONS,
 );
 
 const BINDINGS_BY_ID = new Map<ShortcutId, ShortcutBinding>(
-  SHORTCUT_BINDINGS.map((binding) => [binding.id, binding]),
+  [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map((binding) => [binding.id, binding]),
 );
 
 export function shortcutBinding(id: ShortcutId): ShortcutBinding {
   return BINDINGS_BY_ID.get(id)!;
 }
 
-/** The chords that run `id` now, for this environment. */
+/** Every chord that runs `id` now, the shown ones first, for matching and conflict checks. */
 export function activeShortcutChords(
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): Chord[] {
+  const resolved = currentShortcutEnvironment(environment);
+  const binding = shortcutBinding(id);
+  return [...binding.chords(resolved), ...(binding.secondaryChords?.(resolved) ?? [])];
+}
+
+/** The chords `id` shows now, never a secondary one. */
+export function primaryShortcutChords(
   id: ShortcutId,
   environment?: Partial<ShortcutEnvironment>,
 ): Chord[] {
@@ -587,11 +1169,11 @@ export function matchesShortcut(
 /** Key caps for the first of `id`'s chords here, or none when it has no chord. */
 export function shortcutKeys(id: ShortcutId, environment?: Partial<ShortcutEnvironment>): string[] {
   const resolved = currentShortcutEnvironment(environment);
-  const chord = activeShortcutChords(id, resolved)[0];
+  const chord = primaryShortcutChords(id, resolved)[0];
   return chord ? chordKeys(chord, resolved.mac) : [];
 }
 
-/** Keys with the last one replaced by a range label such as "1…0". */
+/** Keys with the last one replaced by a range label such as "1…9". */
 function withRangeLabel(keys: string[], range: string): string[] {
   return [...keys.slice(0, -1), range];
 }
@@ -612,7 +1194,7 @@ export function menuShortcutChords(
 
 /** Key caps for the chord `id` shows here: its own first chord, else the desktop menu's. */
 export function shortcutShownKeys(id: ShortcutId, environment: ShortcutEnvironment): string[] {
-  const chord = activeShortcutChords(id, environment)[0] ?? menuShortcutChords(id, environment)[0];
+  const chord = primaryShortcutChords(id, environment)[0] ?? menuShortcutChords(id, environment)[0];
   return chord ? chordKeys(chord, environment.mac) : [];
 }
 
@@ -625,4 +1207,41 @@ export function shortcutRowKeys(
   const keys = shortcutShownKeys(id, environment);
   const rowKeys = shortcutBinding(id).rowKeys;
   return rowKeys ? rowKeys(keys, { context, environment }) : keys;
+}
+
+const CODE_MIRROR_KEY_NAMES: Record<string, string> = {
+  Escape: "Escape",
+  Enter: "Enter",
+  Tab: "Tab",
+};
+
+/** The chord as a CodeMirror key name, such as `Mod-Alt-f`, for an editor keymap. */
+export function codeMirrorKey(chord: Chord): string {
+  const parts: string[] = [];
+  if (chord.mod) parts.push("Mod");
+  if (chord.ctrl) parts.push("Ctrl");
+  if (chord.alt) parts.push("Alt");
+  if (chord.shift) parts.push("Shift");
+  // A named key keeps its case, as CodeMirror's names need; a character is lowercased.
+  const key = chord.code !== undefined ? chordKeyLabel(chord) : (chord.key ?? "");
+  parts.push(CODE_MIRROR_KEY_NAMES[key] ?? (key.length === 1 ? key.toLowerCase() : key));
+  return parts.join("-");
+}
+
+/** `id`'s active chords as CodeMirror key names, for an editor keymap. */
+export function codeMirrorKeys(
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): string[] {
+  return activeShortcutChords(id, environment).map(codeMirrorKey);
+}
+
+/** `aria-keyshortcuts` for the first of `id`'s chords here, or none when it has no chord. */
+export function shortcutAriaKeys(
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): string | undefined {
+  const resolved = currentShortcutEnvironment(environment);
+  const chord = primaryShortcutChords(id, resolved)[0];
+  return chord ? chordAriaShortcut(chord, resolved.mac) : undefined;
 }

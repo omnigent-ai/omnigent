@@ -166,10 +166,15 @@ export function useProactiveInbox(
   /**
    * Apply *change* to one suggestion. Resolves to whether the server accepted
    * it, once its PATCH has settled, so a caller can keep its own view of the
-   * item until then.
+   * item until then. A failed PATCH shows a toast unless *onError* takes it,
+   * so a bulk caller can report many failures once.
    */
   const update = useCallback(
-    (id: string, change: SuggestionUpdate): Promise<boolean> => {
+    (
+      id: string,
+      change: SuggestionUpdate,
+      { onError }: { onError?: () => void } = {},
+    ): Promise<boolean> => {
       const scope = scopeState(queryClient, scopeKeyText);
       const notify = () => scope.listeners.forEach((listener) => listener());
       if ("status" in change && scope.resolved.has(id)) return Promise.resolve(false);
@@ -198,7 +203,8 @@ export function useProactiveInbox(
             if ("resolution" in change && change.resolution !== "none") {
               scope.resolved.delete(id);
             }
-            showToast("Couldn’t save your response to this suggestion. Try again.");
+            if (onError) onError();
+            else showToast("Couldn’t save your response to this suggestion. Try again.");
           }
           // A fetch that started while the PATCH was in flight may carry the old
           // status; drop it, then write the server's reply before releasing the overlay.

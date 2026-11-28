@@ -104,13 +104,23 @@ function ImageDownloadButton({ image, className }: { image: LightboxImage; class
 
 interface LightboxContextValue {
   open: (image: LightboxImage) => void;
+  /** Closes the lightbox if it shows `src`, before that URL's owner revokes it. */
+  closeFor: (src: string) => void;
 }
 
 // No-op fallback so image components keep working (just non-zoomable) when
 // rendered outside the provider — e.g. in isolated unit tests.
-const NOOP: LightboxContextValue = { open: () => {} };
+const NOOP: LightboxContextValue = { open: () => {}, closeFor: () => {} };
 
 const LightboxContext = createContext<LightboxContextValue | null>(null);
+
+// For owners outside React, such as a module cache that evicts a URL.
+let mountedCloseFor: ((src: string) => void) | null = null;
+
+/** Closes the lightbox if it shows `src`, before an owner outside React revokes it. */
+export function closeLightboxShowing(src: string): void {
+  mountedCloseFor?.(src);
+}
 
 export function useLightbox(): LightboxContextValue {
   return useContext(LightboxContext) ?? NOOP;
@@ -446,7 +456,17 @@ export function ImageLightboxProvider({ children }: { children: React.ReactNode 
 
   const open = useCallback((img: LightboxImage) => setImage(img), []);
   const close = useCallback(() => setImage(null), []);
-  const value = useMemo(() => ({ open }), [open]);
+  const closeFor = useCallback(
+    (src: string) => setImage((current) => (current?.src === src ? null : current)),
+    [],
+  );
+  const value = useMemo(() => ({ open, closeFor }), [open, closeFor]);
+  useEffect(() => {
+    mountedCloseFor = closeFor;
+    return () => {
+      if (mountedCloseFor === closeFor) mountedCloseFor = null;
+    };
+  }, [closeFor]);
 
   return (
     <LightboxContext.Provider value={value}>

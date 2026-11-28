@@ -277,6 +277,32 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* Added and removed lines in diffs: their own role, separate from status text. The line
+     and word tints mix the diff colours into each palette's background. */
+  --diff-addition-color: #2ea65c;
+  --diff-deletion-color: #c8324c;
+  --diff-line-strength: 7%;
+  --diff-word-strength: 15%;
+  --diff-addition-line: color-mix(
+    in lab,
+    var(--diff-addition-color) var(--diff-line-strength),
+    var(--background)
+  );
+  --diff-deletion-line: color-mix(
+    in lab,
+    var(--diff-deletion-color) var(--diff-line-strength),
+    var(--background)
+  );
+  --diff-addition-word: color-mix(
+    in lab,
+    var(--diff-addition-color) var(--diff-word-strength),
+    var(--background)
+  );
+  --diff-deletion-word: color-mix(
+    in lab,
+    var(--diff-deletion-color) var(--diff-word-strength),
+    var(--background)
+  );
   /* The warning amber, deepened to read as text on every palette's popover. */
   --search-match-foreground: #7b5300;
   /* Session active / idle-alive blue — a deeper, saturated azure
@@ -342,6 +368,11 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  --diff-addition-color: #2ea65c;
+  --diff-deletion-color: #e65b77;
+  /* Dark surfaces need stronger tints; at 20% lines match code diffs. */
+  --diff-line-strength: 20%;
+  --diff-word-strength: 40%;
   /* The warning amber, lightened to read as text on every dark palette's popover. */
   --search-match-foreground: #efb14a;
   /* Session active / idle-alive blue, lightened for the dark glass card so
@@ -1139,6 +1170,14 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   }
 }
 
+/* A gadget's Create session menu dims the whole page, the sidebar included: the sidebar's own
+   z-50 would lift it above the dimming (z-49) and leave it looking highlighted. The menu marks
+   the root element while it shows; a :has() selector there would restyle the page on every
+   DOM change. */
+:root[data-gadget-session-scrim] .conversations-sidebar {
+  z-index: auto;
+}
+
 .conversations-sidebar {
   @variant max-md {
     margin-top: -1px;
@@ -1370,6 +1409,11 @@ aside[aria-label="Workspace"][data-maximized] {
     padding-block: 0;
     left: var(--pane-gap-start, var(--pane-gap));
     right: calc(var(--workspace-panel-offset, 0px) + var(--pane-gap));
+  }
+  /* The tabs strip's end inset (px-2 inside the sidebar's 1px edge), so Expand right panel takes
+   * the spot of the open sidebar's Collapse button. */
+  .app-shell[data-floating-panes] [data-main-view] > .chat-header[data-corner-toggle] {
+    padding-right: calc(0.5rem + 1px - var(--pane-gap));
   }
   .app-shell[data-floating-panes] [data-main-view] > .chat-header.session-header-glass::before {
     display: none;
@@ -1691,8 +1735,9 @@ html[data-electron-mac] .canvas-workspace {
   padding-top: var(--fullscreen-overlay-inset-top);
 }
 /* The title-bar cluster below sits above the z-50 layer to clear the sidebar,
- * so it steps aside while a full-window view covers the app. */
-html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions {
+ * so it steps aside while a full-window view covers the app. The view marks the
+ * root (useMarkFullscreenOverlayOpen); `html:has()` would restyle every keystroke. */
+html[data-electron-mac][data-fullscreen-overlay-open] .electron-sidebar-header-actions {
   display: none;
 }
 /* Align to the native lights at y=24px, regardless of the host rem size.
@@ -3101,6 +3146,16 @@ body {
   margin-top: 0.5em;
   padding-top: 0.5em;
 }
+/* Diagram view hides the source: drop the divider so the diagram sits under
+   its toolbar. */
+.tiptap-md-content .ProseMirror .tiptap-code-block pre[hidden] + .tiptap-mermaid-preview {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+}
+.tiptap-md-content .ProseMirror .tiptap-code-block pre[hidden] + .tiptap-mermaid-preview > * {
+  margin-top: 0;
+}
 .tiptap-md-content .ProseMirror a {
   color: var(--primary);
   text-decoration: underline;
@@ -3387,4 +3442,98 @@ main[data-shell-header="hidden"] .extension-view-host {
 
 main[data-shell-header="hidden"] .extension-view-status {
   top: 0;
+}
+
+/* ── Rich Markdown diff (DiffReview) ──────────────────────────────────────
+   Added and removed blocks and their changed words take the palette's diff
+   tints (--diff-*-line / --diff-*-word), mixed into the palette's background. */
+.markdown-diff-preview {
+  padding: 16px 24px 24px;
+  /* The tints mix into this background, so it sits under them. */
+  background: var(--background);
+  font-family: var(--ui-font-family, var(--font-sans));
+  white-space: normal;
+  /* The diff view turns pointer events off while it scrolls; inheriting that would
+     restyle every node of a long document on each scroll. */
+  pointer-events: auto;
+}
+.markdown-diff-preview .prose {
+  max-width: min(100%, 72rem);
+}
+.markdown-diff-section {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0 12px;
+  border-left: 3px solid transparent;
+  border-radius: 2px;
+  /* The containment content-visibility gave each section, kept as it was. */
+  contain: layout style paint;
+}
+/* Off-screen groups of sections skip layout and paint in long documents. One group per few
+ * hundred nodes, not one per section: the browser checks each such element every frame. */
+.markdown-diff-group {
+  content-visibility: auto;
+}
+.markdown-diff-section > :first-child {
+  margin-top: 0;
+}
+.markdown-diff-section:is([data-markdown-diff-kind="added"], [data-markdown-diff-kind="removed"]) {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+.markdown-diff-section:is([data-markdown-diff-kind="added"], [data-markdown-diff-kind="removed"])
+  > :last-child {
+  margin-bottom: 0;
+}
+.markdown-diff-section[data-markdown-diff-kind="added"] {
+  --markdown-diff-color: var(--diff-addition-color);
+  --markdown-diff-line: var(--diff-addition-line);
+  --markdown-diff-word: var(--diff-addition-word);
+}
+.markdown-diff-section[data-markdown-diff-kind="removed"] {
+  --markdown-diff-color: var(--diff-deletion-color);
+  --markdown-diff-line: var(--diff-deletion-line);
+  --markdown-diff-word: var(--diff-deletion-word);
+}
+.markdown-diff-section:is([data-markdown-diff-kind="added"], [data-markdown-diff-kind="removed"]) {
+  border-left-color: var(--markdown-diff-color);
+  background: var(--markdown-diff-line);
+}
+.markdown-diff-section .markdown-diff-word {
+  border-radius: 2px;
+  background: var(--markdown-diff-word);
+}
+.markdown-diff-section[data-markdown-diff-kind="removed"] .markdown-diff-word {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in lab, var(--destructive) 60%, transparent);
+}
+.markdown-diff-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--muted-foreground);
+  font-size: var(--text-ui, 13px);
+}
+.markdown-diff-preview > .markdown-diff-status:has(+ .markdown-diff-outdated) {
+  position: sticky;
+  top: 40px;
+  z-index: 1;
+  padding: 4px 0;
+  background: var(--background);
+}
+.markdown-diff-outdated {
+  opacity: 0.55;
+  pointer-events: none;
+}
+.markdown-diff-empty,
+.markdown-diff-oversized {
+  color: var(--muted-foreground);
+}
+/* The rich diff renders outside CodeView's shadow roots, so find's current match is painted here too. */
+::highlight(diff-review-find-current) {
+  background-color: color-mix(in oklch, var(--warning) 70%, transparent);
 }

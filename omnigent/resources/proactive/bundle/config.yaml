@@ -65,6 +65,30 @@ guardrails:
           reason: The proactive agent does not share or read session files.
           on_phases: [tool_call]
           on_tools: [sys_files_upload, sys_files_list, sys_files_download]
+    # Denies the gadget tools; runners released before `tool_groups.gadgets` reject it.
+    no_gadgets:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.function.make_fixed_action_callable
+        arguments:
+          action: deny
+          reason: The proactive agent does not build or change gadgets.
+          on_phases: [tool_call]
+          on_tools:
+            - sys_gadget_describe
+            - sys_gadget_create
+            - sys_gadget_list
+            - sys_gadget_get
+            - sys_gadget_rename
+            - sys_gadget_action_list
+            - sys_gadget_action_update
+            - sys_gadget_comment_list
+            - sys_gadget_comment_update
+            - sys_gadget_revision_get
+            - sys_gadget_revision_create
+            - sys_gadget_publish
+            - sys_gadget_records
 
 prompt: |
   You are the user's proactive assistant. You run on a schedule, without the

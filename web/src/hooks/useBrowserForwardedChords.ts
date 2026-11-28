@@ -12,10 +12,7 @@ import {
   setBrowserForwardedChords,
 } from "@/lib/nativeBridge";
 import type { Chord } from "@/lib/shortcuts/chord";
-import {
-  activeShortcutChords,
-  type ShortcutId,
-} from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { activeShortcutChords, type ShortcutId } from "@/lib/shortcuts/registry";
 
 /**
  * The app chords a focused browser page hands over in the tabs sidebar. Back and Forward stay
@@ -34,10 +31,15 @@ const TABS_SIDEBAR_WITHOUT_REOPEN = TABS_SIDEBAR_FORWARDED_SHORTCUTS.filter(
 
 /**
  * The tabs sidebar's list now: forwarding moves focus to the app, so with no closed tab to
- * reopen, Reopen's chord stays with the page instead of taking its focus for nothing.
+ * reopen, Reopen's chord stays with the page instead of taking its focus for nothing. Full
+ * screen's chord joins only where the sidebar can fill the window.
  */
-export function tabsSidebarForwardedShortcuts(canReopen: boolean): readonly ShortcutId[] {
-  return canReopen ? TABS_SIDEBAR_FORWARDED_SHORTCUTS : TABS_SIDEBAR_WITHOUT_REOPEN;
+export function tabsSidebarForwardedShortcuts(
+  canReopen: boolean,
+  canFullScreen = false,
+): readonly ShortcutId[] {
+  const ids = canReopen ? TABS_SIDEBAR_FORWARDED_SHORTCUTS : TABS_SIDEBAR_WITHOUT_REOPEN;
+  return canFullScreen ? [...ids, "workspace.toggleFullScreen"] : ids;
 }
 
 /** `chord` as the physical keys it presses on this platform; null without a key to press. */

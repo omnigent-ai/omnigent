@@ -6,6 +6,7 @@ import {
   pickListInputProps,
   pickListOwnsKey,
   readlineListStep,
+  readlineStepAsArrow,
   translateReadlineStepInList,
   withReadlineListSteps,
 } from "./listNavigationKeys";
@@ -172,6 +173,24 @@ describe("translateReadlineStepInList", () => {
     const handler = withReadlineListSteps((event: KeyboardEvent) => event.preventDefault());
     handler(contentEvent(row, byId("parent"), {}));
     expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe("readlineStepAsArrow", () => {
+  it("re-sends Ctrl-N/Ctrl-P to the field as the arrows, and leaves other keys alone", () => {
+    const field = document.createElement("input");
+    document.body.append(field);
+    const arrows: string[] = [];
+    field.addEventListener("keydown", (event) => arrows.push(event.key));
+    for (const letter of ["n", "p"]) {
+      const event = key({ key: letter, code: `Key${letter.toUpperCase()}`, ctrlKey: true }, field);
+      expect(readlineStepAsArrow(event)).toBe(true);
+      expect(event.defaultPrevented).toBe(true);
+    }
+    expect(arrows).toEqual(["ArrowDown", "ArrowUp"]);
+    expect(readlineStepAsArrow(key({ key: "k", code: "KeyK", ctrlKey: true }, field))).toBe(false);
+    expect(readlineStepAsArrow(key({ key: "n", code: "KeyN" }, field))).toBe(false);
+    expect(arrows).toHaveLength(2);
   });
 });
 

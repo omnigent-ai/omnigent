@@ -194,6 +194,7 @@ an existing server. Nothing local is started: no backend, host, or pod.
 omnidev ui                                   # pick a recent server or enter a URL
 omnidev ui --server http://localhost:9000    # connect directly
 omnidev ui --server 'https://<workspace-host>/?o=<org-id>' --databricks-profile <name>
+omnidev ui --prod --server http://localhost:9000   # production build via `vite preview`
 ```
 
 - For a Databricks workspace, use the workspace URL. The proxy fills in the
@@ -210,6 +211,8 @@ omnidev ui --server 'https://<workspace-host>/?o=<org-id>' --databricks-profile 
   `${XDG_CACHE_HOME:-~/.cache}/omnidev/recent-servers.json`.
 - Vite runs in the foreground with `--open`, so its own shortcuts work (`h`
   lists them). It runs `pnpm install` first when web deps are missing or stale.
+- `--prod` runs `vite build` with the same server env, so the workspace flag is
+  inlined, into the pod dir's `web-ui-prod-<server-hash>/`, then serves it with `vite preview`.
 
 ## Managing your omnigent install
 

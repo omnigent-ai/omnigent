@@ -717,6 +717,28 @@ async def test_branding_logo_route_serves_only_validated_asset_pre_auth(
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
+def test_the_configs_read_only_code_hosts_reach_the_session_routes(
+    db_uri: str, runtime_init: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    received: list[object] = []
+    real_router = server_app.create_sessions_router
+
+    def recording_router(*args: Any, **kwargs: Any) -> Any:
+        received.append(kwargs.get("read_only_code_hosts"))
+        return real_router(*args, **kwargs)
+
+    monkeypatch.setattr(server_app, "create_sessions_router", recording_router)
+
+    _build_branding_app(
+        db_uri,
+        tmp_path,
+        "read-only-hosts",
+        server_config={"read_only_code_hosts": [" *.Code.Example.com "]},
+    )
+
+    assert received == [("*.code.example.com",)]
+
+
 @pytest.mark.asyncio
 async def test_branding_snapshot_performs_no_request_time_io_or_decode(
     db_uri: str,

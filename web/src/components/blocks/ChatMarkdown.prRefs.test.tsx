@@ -1,6 +1,6 @@
-// `#1234` in an assistant reply links to that PR in the session's repo. The
-// repo comes from the session's GitHub info, which usually loads after the
-// message has rendered, so these tests also pin that a late answer still links.
+// `#1234` in an assistant reply links to the PR the session links with that number. The
+// session's links come with its GitHub info, which usually loads after the message has
+// rendered, so these tests also pin that a late answer still links.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
@@ -70,12 +70,26 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
+/** PRs the session links: acme/app's #4242 to #4249, unless a test says otherwise. */
+const LINKED_NUMBERS = [4242, 4243, 4244, 4245, 4246, 4247, 4248, 4249];
+
+function linkedPullRequest(repository: string, number: number) {
+  return {
+    url: `https://github.com/${repository}/pull/${number}`,
+    host: "github.com",
+    repository,
+    number,
+    relationship: "attached" as const,
+  };
+}
+
 function githubInfo(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
   return {
     object: "session.github.info",
     available: true,
     repo: { name_with_owner: "acme/app", host: "github.com" },
     workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+    prs: LINKED_NUMBERS.map((number) => linkedPullRequest("acme/app", number)),
     ...overrides,
   };
 }
@@ -107,7 +121,7 @@ function hrefs(): string[] {
 }
 
 describe("pull request references in chat markdown", () => {
-  it("links bare references to the session repo and explicit ones to their own repo", () => {
+  it("links bare references to the session's linked PRs and explicit ones to their own repo", () => {
     seed(githubInfo());
     renderMarkdown("Landed in #4242; upstream: omnigent-ai/omnigent#9882.");
 
@@ -120,11 +134,42 @@ describe("pull request references in chat markdown", () => {
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
   });
 
-  it("leaves a bare reference as text when the session's repo is unknown", () => {
-    seed(githubInfo({ workspace_repo: { name_with_owner: null, host: "github.com" } }));
-    renderMarkdown("See #4242 and acme/app#12");
-    expect(hrefs()).toEqual(["https://github.com/acme/app/pull/12"]);
-    expect(screen.getByText("#4242")).toBeVisible();
+  it("leaves a bare number the session doesn't link as plain, selectable text", () => {
+    seed(githubInfo());
+    renderMarkdown("Compare #4242 with #9999 here.");
+    expect(hrefs()).toEqual(["https://github.com/acme/app/pull/4242"]);
+    // No anchor, so a double-click selects the number to copy it.
+    const unlinked = screen.getByText("#9999");
+    expect(unlinked.closest("a")).toBeNull();
+    expect(unlinked.tagName).toBe("SPAN");
+    expect(unlinked.textContent).toBe("#9999");
+  });
+
+  it("links a bare number to its linked PR's repo, unless two linked repos share it", () => {
+    seed(
+      githubInfo({
+        prs: [
+          linkedPullRequest("other/lib", 14971),
+          linkedPullRequest("acme/app", 3700),
+          linkedPullRequest("other/lib", 3700),
+        ],
+      }),
+    );
+    renderMarkdown("Opened #14971 upstream. Both have #3700: acme/app#3700 and other/lib#3700.");
+    // Not the workspace's repo: the link names where the PR is.
+    expect(hrefs()).toEqual([
+      "https://github.com/other/lib/pull/14971",
+      "https://github.com/acme/app/pull/3700",
+      "https://github.com/other/lib/pull/3700",
+    ]);
+    expect(screen.getByText("#3700").closest("a")).toBeNull();
+  });
+
+  it("keeps linking full pull request URLs, linked or not", () => {
+    seed(githubInfo({ prs: [] }));
+    renderMarkdown("See https://github.com/other/lib/pull/5 and #4242.");
+    expect(hrefs()).toEqual(["https://github.com/other/lib/pull/5"]);
+    expect(screen.getByText("#4242").closest("a")).toBeNull();
   });
 
   it("links once the session's repo arrives after the message rendered", async () => {
@@ -140,7 +185,9 @@ describe("pull request references in chat markdown", () => {
   });
 
   it("leaves code, existing links, URL fragments and non-references alone", () => {
-    seed(githubInfo());
+    // The session links every number here, so only the context can keep one as text.
+    const numbers = [1234, 5678, 4321, 2468, 1357, 3579, 9753, 8642];
+    seed(githubInfo({ prs: numbers.map((number) => linkedPullRequest("acme/app", number)) }));
     renderMarkdown(
       [
         "Inline `#1234` and [#5678](https://example.com/x) and https://example.com/page#4321.",
@@ -211,7 +258,7 @@ describe("pull request references in chat markdown", () => {
     expect(githubInfoRequests()).toHaveLength(calls);
   });
 
-  it("resolves a side chat's link against its own repo and opens it in the parent's browser", async () => {
+  it("resolves a side chat's link against its own links and opens it in the parent's browser", async () => {
     nativeShell.native = true;
     const openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
     Object.assign(window, {
@@ -221,7 +268,10 @@ describe("pull request references in chat markdown", () => {
     seed(githubInfo());
     client.setQueryData(
       ["github-info", "conv_child"],
-      githubInfo({ workspace_repo: { name_with_owner: "acme/lib", host: "github.com" } }),
+      githubInfo({
+        workspace_repo: { name_with_owner: "acme/lib", host: "github.com" },
+        prs: [linkedPullRequest("acme/lib", 4242)],
+      }),
     );
     renderMarkdown("See #4242", true, (children) => (
       <ConversationScopeContext.Provider value="conv_child">

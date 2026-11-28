@@ -13,6 +13,8 @@ from omnigent.server.pull_request_viewers import (
     READ_CAPABILITIES,
     PullRequestViewer,
     info_for_viewer,
+    review_comments_for_viewer,
+    review_threads_for_viewer,
 )
 
 _ACCOUNTS = [
@@ -92,3 +94,105 @@ def test_an_unknown_capability_from_a_newer_host_is_turned_off() -> None:
     shown = info_for_viewer(info, PullRequestViewer.EDITOR)
     assert shown["capabilities"]["rebasing"] is False
     assert shown["capabilities"]["line_counts"] is True
+
+
+def _comment() -> dict[str, Any]:
+    return {
+        "id": "PRRC_1",
+        "database_id": 5,
+        "author": "reviewer",
+        "reactions": [{"content": "EYES", "count": 3, "viewer_reacted": True}],
+        "can_react": True,
+        "can_update": True,
+        "can_delete": True,
+        "viewer_did_author": True,
+    }
+
+
+def _threads() -> dict[str, Any]:
+    thread = {
+        "id": "PRRT_1",
+        "can_reply": True,
+        "can_resolve": False,
+        "can_unresolve": True,
+        "comments": {"data": [_comment()], "has_more": True, "next_cursor": "n"},
+    }
+    return {"data": [thread], "head_sha": "a" * 40, "has_more": False}
+
+
+def test_the_owner_reads_threads_and_comments_unchanged() -> None:
+    threads, comments = _threads(), {"data": [_comment()]}
+    assert review_threads_for_viewer(threads, PullRequestViewer.OWNER) is threads
+    assert review_comments_for_viewer(comments, PullRequestViewer.OWNER) is comments
+
+
+@pytest.mark.parametrize("viewer", [PullRequestViewer.EDITOR, PullRequestViewer.VIEWER])
+def test_anyone_else_reads_threads_with_ids_and_counts_but_no_rights(
+    viewer: PullRequestViewer,
+) -> None:
+    threads = _threads()
+    shown = review_threads_for_viewer(threads, viewer)
+
+    [thread] = shown["data"]
+    assert {key: thread[key] for key in ("can_reply", "can_resolve", "can_unresolve")} == {
+        "can_reply": False,
+        "can_resolve": False,
+        "can_unresolve": False,
+    }
+    assert thread["comments"]["next_cursor"] == "n"
+    [comment] = thread["comments"]["data"]
+    assert comment == {
+        **_comment(),
+        "reactions": [{"content": "EYES", "count": 3, "viewer_reacted": False}],
+        "can_react": False,
+        "can_update": False,
+        "can_delete": False,
+        "viewer_did_author": False,
+    }
+    assert shown["head_sha"] == "a" * 40
+    # The host's answer itself is left as it was.
+    assert threads == _threads()
+
+
+def test_a_comment_page_hides_the_rights_and_keeps_its_paging() -> None:
+    shown = review_comments_for_viewer(
+        {"data": [_comment(), "unexpected"], "has_more": True}, PullRequestViewer.VIEWER
+    )
+    assert shown["has_more"] is True
+    assert shown["data"][0]["can_update"] is False
+    assert shown["data"][1] == "unexpected"
+
+
+def test_a_page_without_data_stays_empty() -> None:
+    assert review_threads_for_viewer({"warning": "x"}, PullRequestViewer.VIEWER) == {
+        "warning": "x",
+        "data": [],
+    }
+
+
+@pytest.mark.parametrize("viewer", [PullRequestViewer.EDITOR, PullRequestViewer.VIEWER])
+def test_anyone_else_reads_the_overviews_comments_without_the_accounts_rights(
+    viewer: PullRequestViewer,
+) -> None:
+    """Even from a host that sends them unasked, as an older or a forked host may."""
+    info = {"object": "session.github.info", "pr": {"number": 7, "comments": [_comment(), "x"]}}
+    shown = info_for_viewer(info, viewer)
+
+    [comment, unexpected] = shown["pr"]["comments"]
+    assert comment == {
+        **_comment(),
+        "reactions": [{"content": "EYES", "count": 3, "viewer_reacted": False}],
+        "can_react": False,
+        "can_update": False,
+        "can_delete": False,
+        "viewer_did_author": False,
+    }
+    assert unexpected == "x"
+    assert shown["pr"]["number"] == 7
+    assert info["pr"]["comments"][0] == _comment()
+
+
+@pytest.mark.parametrize("pr", [None, {"number": 7}, {"number": 7, "comments": None}])
+def test_an_overview_without_comments_keeps_its_pr_as_it_was(pr: object) -> None:
+    shown = info_for_viewer({"object": "session.github.info", "pr": pr}, PullRequestViewer.VIEWER)
+    assert shown["pr"] == pr

@@ -108,6 +108,9 @@ enum Command {
         /// Remembered with the server; pass "" to clear it.
         #[arg(long)]
         databricks_profile: Option<String>,
+        /// Build the production bundle and serve it with `vite preview` instead of HMR.
+        #[arg(long)]
+        prod: bool,
     },
 }
 
@@ -191,7 +194,8 @@ fn main() -> Result<()> {
         Some(Command::Ui {
             server,
             databricks_profile,
-        }) => remote_ui::run(server, databricks_profile),
+            prod,
+        }) => remote_ui::run(server, databricks_profile, prod),
         None => run_supervisor(args.run),
     }
 }

@@ -309,6 +309,9 @@ _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 
 
+_LAST_TASK_ERROR_AT_LABEL_KEY: str = "omnigent.last_task_error_at"
+
+
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
 

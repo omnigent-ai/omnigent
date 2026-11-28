@@ -21,14 +21,17 @@ are in the component tests (``useTerminalPaneHotkeys``, ``terminalPaneActions``,
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests.e2e_ui._shell_states import wait_until_shells_read
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, open_right_rail
 
 _AGENT_NAME = "panes_demo"
@@ -185,8 +188,9 @@ def test_split_move_between_list_and_close_panes_in_the_terminal_view(
     expect(shell).to_be_focused()
     shell_strip = panes.get_by_role("toolbar", name=re.compile(r"^zsh · .* pane$"))
     shell_strip.click(button="right")
+    # Once the runner reads the shell idle at its prompt, Close Pane ends it without asking.
+    wait_until_shells_read(base_url, session_id, ["idle"])
     page.get_by_role("menuitem", name="Close Pane").click()
-    page.get_by_role("button", name="Close shell").click()
     expect(panes.get_by_test_id("terminal-view")).to_have_count(1, timeout=30_000)
     expect(panes.locator(_AGENT_PANE)).to_be_visible()
 
@@ -273,8 +277,9 @@ def test_a_tabs_sidebar_shell_splits_keeps_both_shells_through_a_reload_and_clos
             "data-state", "connected", timeout=60_000
         )
 
+    # Once the runner reads both shells idle at their prompts, the split closes without asking.
+    wait_until_shells_read(base_url, session_id, ["idle", "idle"])
     sidebar.get_by_role("button", name=re.compile(r"^Close zsh · .* \+1$")).click()
-    page.get_by_role("button", name="Close shells").click()
     expect(sidebar.get_by_test_id("terminal-view")).to_have_count(0, timeout=30_000)
     expect(sidebar.get_by_role("tab", name=re.compile(r"^zsh · "))).to_have_count(0)
 
@@ -425,3 +430,92 @@ def test_a_split_resizes_through_a_whole_drag(
     ).json_value()
     # As the divider rounds it: Math.round, halves up.
     expect(divider).to_have_attribute("aria-valuenow", str(math.floor(saved * 100 + 0.5)))
+
+
+# Floating panes: an exiting shell and a pane row's move band.
+
+_WIDE_DESKTOP = {"width": 2200, "height": 900}
+
+
+def _capture(page: Page, name: str) -> None:
+    """Save what the page shows as `name`.png under OMNIGENT_E2E_CAPTURES, when it's set."""
+    if target := os.environ.get("OMNIGENT_E2E_CAPTURES"):
+        page.screenshot(path=str(Path(target, f"{name}.png")))
+
+
+# Resolves once two frames have painted, so a pointer move's re-render has landed.
+_TWO_FRAMES = "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+
+
+def test_a_split_pane_closes_as_soon_as_its_shell_exits(
+    page: Page, panes_session: tuple[str, str]
+) -> None:
+    """``exit`` in a split pane removes it within two seconds, before the runner reports the
+    exit, and the agent pane beside it takes the keyboard."""
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    shell = _split_from(page, panes, agent)
+    expect(shell).to_be_focused(timeout=30_000)
+
+    page.keyboard.type("exit")
+    page.keyboard.press("Enter")
+    # The runner lists an exited shell for about 3 s more; the pane goes on the attach's end.
+    expect(panes.get_by_test_id("terminal-view")).to_have_count(1, timeout=2_000)
+    expect(agent).to_be_focused()
+
+
+def _capture_both_schemes(page: Page, name: str) -> None:
+    """Save `name` in the light and the dark theme, leaving the page light."""
+    for scheme in ("light", "dark"):
+        page.emulate_media(color_scheme=scheme)
+        page.evaluate(_TWO_FRAMES)
+        _capture(page, f"{name}-{scheme}")
+    page.emulate_media(color_scheme="light")
+
+
+def test_a_floating_pane_maximizes_on_a_double_click_away_from_its_move_handle(
+    page: Page, panes_session: tuple[str, str]
+) -> None:
+    """A double-click on a pane's toolbar away from its handle maximizes the pane without lifting
+    it; a double-click in the band around the handle, which moves the pane, maximizes nothing."""
+    page.emulate_media(color_scheme="light")
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    page.set_viewport_size(_WIDE_DESKTOP)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    _split_from(page, panes, agent)
+    shell_pane = panes.locator(f"[data-terminal-pane]:not({_AGENT_PANE})").first
+    strip = shell_pane.locator("[data-pane-strip]")
+    box = strip.bounding_box()
+    assert box is not None
+    middle_x, middle_y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    # Any press that lifts the pane, however brief, stays in the record.
+    page.evaluate(
+        """() => {
+      window.__lifted = false;
+      new MutationObserver(() => {
+        if (document.querySelector("[data-pane-held]")) window.__lifted = true;
+      }).observe(document.body, {
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["data-pane-held"],
+      });
+    }"""
+    )
+    page.mouse.move(middle_x, middle_y)
+    _capture_both_schemes(page, "pane-move-band")
+
+    page.mouse.dblclick(middle_x, middle_y)
+    page.evaluate(_TWO_FRAMES)
+    expect(panes.locator("[data-pane-zoomed]")).to_have_count(0)
+    page.evaluate("window.__lifted = false")
+
+    page.mouse.dblclick(box["x"] + box["width"] - 140, middle_y)
+    expect(panes.locator("[data-pane-zoomed]")).to_have_count(1, timeout=10_000)
+    assert page.evaluate("window.__lifted") is False
+    _capture_both_schemes(page, "pane-maximized")

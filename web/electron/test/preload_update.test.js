@@ -294,22 +294,48 @@ describe("desktop command bridge", () => {
     assert.equal(h.hasListener("omnigent:desktop-command"), false);
   });
 
+  it("advertises exactly the menu commands main routes to the page", () => {
+    const { DESKTOP_COMMANDS } = require("../src/desktopCommands");
+    assert.deepEqual([...loadPreload().desktop.desktopCommands], [...DESKTOP_COMMANDS]);
+  });
+
   it("reports command state as plain values and asks main to open a session window, close the window or quit", async () => {
     const h = loadPreload();
     h.desktop.setDesktopCommandState({
       commands: ["close", 3],
       sessionPinned: 1,
       sessionArchived: true,
+      pickListFocused: "yes",
     });
+    h.desktop.setDesktopCommandState({ commands: ["go-back"], pickListFocused: true });
     h.desktop.setDesktopCommandState(undefined);
     assert.deepEqual(JSON.parse(JSON.stringify(h.sends)), [
       {
         channel: "omnigent:set-desktop-command-state",
-        args: { commands: ["close", "3"], sessionPinned: false, sessionArchived: true },
+        args: {
+          commands: ["close", "3"],
+          sessionPinned: false,
+          sessionArchived: true,
+          pickListFocused: false,
+        },
       },
       {
         channel: "omnigent:set-desktop-command-state",
-        args: { commands: [], sessionPinned: false, sessionArchived: false },
+        args: {
+          commands: ["go-back"],
+          sessionPinned: false,
+          sessionArchived: false,
+          pickListFocused: true,
+        },
+      },
+      {
+        channel: "omnigent:set-desktop-command-state",
+        args: {
+          commands: [],
+          sessionPinned: false,
+          sessionArchived: false,
+          pickListFocused: false,
+        },
       },
     ]);
 

@@ -2999,6 +2999,28 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         # decide whether a PTY watcher owns this session's status.
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
     )
+    browser_labels: list[object] = []
+    relay_labels = {"omnigent.test/source": "first-turn-fallback"}
+    if harness == "antigravity-native":
+        from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+        from omnigent.tools import browser_agent_tools
+
+        async def labels(**_kwargs: Any) -> dict[str, str]:
+            return relay_labels
+
+        async def skip_auto_create(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("exercise the first-turn relay fallback")
+
+        async def filter_browser_tools(schemas: Any, **kwargs: Any) -> Any:
+            browser_labels.append(kwargs.get("session_labels"))
+            return schemas
+
+        monkeypatch.setattr(agy_bridge, "_BRIDGE_ROOT", tmp_path / "agy-bridges")
+        monkeypatch.setattr(runner_app, "_session_labels_for_runner_spawn", labels)
+        monkeypatch.setattr(runner_app, "_auto_create_antigravity_terminal", skip_auto_create)
+        monkeypatch.setattr(
+            browser_agent_tools, "filter_native_relay_browser_tools", filter_browser_tools
+        )
     stream_finished = asyncio.Event()
     harness_client = _ScriptedHarnessClient([], stream_finished=stream_finished)
     app = create_runner_app(
@@ -3061,6 +3083,8 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         # DELETE cancels the background turn so it can't outlive the test.
         await client.delete(f"/v1/sessions/{session_id}")
 
+    if harness == "antigravity-native":
+        assert browser_labels == [relay_labels]
     assert statuses == expected_statuses, (
         f"harness={harness}: expected runner turn lifecycle statuses "
         f"{expected_statuses!r}, got {statuses!r}. Claude-native must rely "

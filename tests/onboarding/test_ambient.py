@@ -72,24 +72,42 @@ def clean_env(tmp_path, monkeypatch: pytest.MonkeyPatch):
     return tmp_path
 
 
-@pytest.mark.skipif(os.name == "nt", reason="directory symlinks require POSIX test support")
+@pytest.mark.parametrize(
+    "configured",
+    [
+        pytest.param(
+            "alias",
+            marks=pytest.mark.skipif(
+                os.name == "nt", reason="directory symlinks require POSIX test support"
+            ),
+        ),
+        pytest.param(None, id="unset"),
+        pytest.param("", id="empty"),
+    ],
+)
 def test_claude_user_settings_sources_include_alias_and_target(
-    clean_env: Path, monkeypatch: pytest.MonkeyPatch
+    clean_env: Path, monkeypatch: pytest.MonkeyPatch, configured: str | None
 ) -> None:
     workspace = clean_env / "workspace"
     workspace.mkdir()
-    config = clean_env / "parent-config"
+    config = clean_env / ("parent-config" if configured == "alias" else ".claude")
     config.mkdir()
     (config / "settings.json").write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"parent-only"}}')
-    (workspace / "alias").symlink_to(config, target_is_directory=True)
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "alias")
+    selected = workspace / "alias" if configured == "alias" else config
+    if configured == "alias":
+        selected.symlink_to(config, target_is_directory=True)
+    (workspace / "settings.json").write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"cwd-only"}}')
+    if configured is None:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", configured)
 
     settings, sources = ambient.read_claude_user_settings_with_sources(str(workspace))
 
     assert settings == {"env": {"ANTHROPIC_AUTH_TOKEN": "parent-only"}}
     assert set(sources) == {
-        workspace / "alias",
-        workspace / "alias" / "settings.json",
+        selected,
+        selected / "settings.json",
         config,
         config / "settings.json",
     }

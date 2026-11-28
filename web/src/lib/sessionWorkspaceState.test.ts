@@ -38,6 +38,19 @@ describe("sessionWorkspaceState", () => {
     });
   });
 
+  it("remembers a selected gadget tab", () => {
+    writeSessionWorkspaceState("conv_gadget", {
+      rightRailTab: "gadget",
+      selectedGadgetKey: "gadget:board",
+    });
+    expect(readSessionWorkspaceState("conv_gadget")).toEqual({
+      rightRailTab: "gadget",
+      selectedGadgetKey: "gadget:board",
+    });
+    resetSessionWorkspaceTabSelections();
+    expect(readSessionWorkspaceState("conv_gadget")).toEqual({});
+  });
+
   it("remembers a selected GitHub tab", () => {
     writeSessionWorkspaceState("conv_github", { rightRailTab: "github" });
     expect(readSessionWorkspaceState("conv_github").rightRailTab).toBe("github");

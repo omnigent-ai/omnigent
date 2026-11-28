@@ -96,7 +96,7 @@ pub fn recent_servers_path() -> Result<PathBuf> {
 
 /// FNV-1a 64-bit, rendered as 8 hex chars. No external dep needed — we only
 /// need a stable, collision-unlikely tag for a filesystem path.
-fn short_hash(bytes: &[u8]) -> String {
+pub fn short_hash(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         hash ^= b as u64;

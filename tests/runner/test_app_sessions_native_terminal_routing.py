@@ -954,12 +954,31 @@ async def test_create_session_repl_terminal_dispatch(
     assert created_sessions == (["5eef02d60f39cba3fbd0ae188348643f"] if expect_created else [])
 
 
-@pytest.mark.parametrize("cached_predecessor", [False, True])
+@pytest.mark.parametrize(
+    ("terminal_name", "cached_predecessor", "sub_agent_name", "resolution_failure"),
+    [
+        pytest.param("claude", False, "worker", None, id="claude-False"),
+        pytest.param("claude", True, "worker", None, id="claude-True"),
+        pytest.param("antigravity", False, "worker", None, id="antigravity-False"),
+        pytest.param("antigravity", True, "worker", None, id="antigravity-True"),
+        pytest.param("antigravity", False, "missing-worker", None, id="antigravity-missing-child"),
+        pytest.param("antigravity", False, "worker", "fetch", id="antigravity-fetch-failure"),
+        pytest.param(
+            "antigravity", False, "worker", "fetch-recovery", id="antigravity-fetch-recovery"
+        ),
+        pytest.param("antigravity", False, "worker", "auth", id="antigravity-auth-failure"),
+        pytest.param("antigravity", False, "worker", "policy", id="antigravity-policy-failure"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_ensure_terminal_route_recreates_dead_registered_pane(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     cached_predecessor: bool,
+    terminal_name: str,
+    sub_agent_name: str,
+    resolution_failure: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Ensure route detects a dead-but-registered pane and auto-creates.
 
@@ -977,25 +996,118 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     """
     sid = "deadbeef12345678deadbeef12345678"
     auto_create_calls: list[str] = []
+    resolution_attempts = 0
+    terminal_launches: list[dict[str, Any]] = []
+    child = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Child startup guidance.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+    root = AgentSpec(
+        spec_version=1,
+        name="parent",
+        instructions="Parent startup guidance.",
+        sub_agents=[child],
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolution_attempts
+        resolution_attempts += 1
+        assert (agent_id, session_id) == ("agent-root", sid)
+        if resolution_failure in ("fetch", "auth") or (
+            resolution_failure == "fetch-recovery" and resolution_attempts == 1
+        ):
+            from omnigent.runner._entry import _AgentSpecCache, _resolve_agent_spec_from_server
+
+            async with httpx.AsyncClient(
+                base_url="http://server.invalid",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(403 if resolution_failure == "auth" else 503)
+                ),
+            ) as client:
+                await _resolve_agent_spec_from_server(
+                    client, _AgentSpecCache(tmp_path / "bundle-cache"), agent_id, session_id
+                )
+            raise AssertionError("The bundle fetch must fail")
+        return root
+
+    if resolution_failure == "policy":
+        from omnigent.runner.policy import AgentStartPolicyError
+
+        async def reject_start(*_args: object, **_kwargs: object) -> None:
+            raise AgentStartPolicyError("startup", "denied")
+
+        monkeypatch.setattr("omnigent.runner.app._apply_agent_start_gate", reject_start)
+
+    class SnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any):
+            if url == f"/v1/sessions/{sid}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "agent_id": "agent-root",
+                        "sub_agent_name": sub_agent_name,
+                        "harness": f"{terminal_name}-native",
+                        "workspace": str(tmp_path),
+                    },
+                )
+            return await super().get(url, **kwargs)
+
+    from omnigent.runner.native import orchestration
+
+    actual_auto_create = getattr(orchestration, f"_auto_create_{terminal_name}_terminal")
+    if resolution_failure in ("fetch", "fetch-recovery"):
+        from omnigent.harnesses.antigravity_native import bridge
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.setenv("GEMINI_API_KEY", "test-fixture")
+        monkeypatch.setenv("RUNNER_SERVER_URL", "http://server.invalid")
+        monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+        monkeypatch.setattr(
+            "omnigent.harnesses.antigravity_native.launch.agy_binary_path", lambda: "agy"
+        )
+        monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
 
     async def _stub_auto_create(
         session_id: str,
         resource_registry: object,
         publish_event: object,
-        **_kwargs: object,
+        **kwargs: object,
     ) -> SessionResourceView:
         auto_create_calls.append(session_id)
+        if terminal_name == "antigravity":
+            selected = kwargs["agent_spec"]
+            if resolution_failure in ("fetch", "fetch-recovery"):
+                assert selected is None
+                return await actual_auto_create(
+                    session_id, resource_registry, publish_event, **kwargs
+                )
+            assert isinstance(selected, AgentSpec)
+            expected = child if sub_agent_name == "worker" else root
+            assert selected.name == expected.name
+            assert selected.instructions == expected.instructions
+
         return SessionResourceView(
-            id="terminal_claude_main", type="terminal", session_id=session_id, name="re-created"
+            id=f"terminal_{terminal_name}_main",
+            type="terminal",
+            session_id=session_id,
+            name="re-created",
         )
 
     monkeypatch.setattr(
-        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+        f"omnigent.runner.native.orchestration._auto_create_{terminal_name}_terminal",
+        _stub_auto_create,
     )
 
     registry = TerminalRegistry()
     dead_instance = TerminalInstance(
-        name="claude",
+        name=terminal_name,
         session_key="main",
         socket_path=tmp_path / "dead.sock",
         private_dir=tmp_path / "dead_private",
@@ -1015,39 +1127,90 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     dead_instance.close = _noop_close  # type: ignore[assignment]
 
     with registry._lock:
-        registry._by_conversation[sid] = {("claude", "main"): dead_instance}
-        registry._instance_locks[(sid, "claude", "main")] = threading.Lock()
+        registry._by_conversation[sid] = {(terminal_name, "main"): dead_instance}
+        registry._instance_locks[(sid, terminal_name, "main")] = threading.Lock()
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=SnapshotClient(),  # type: ignore[arg-type]
         terminal_registry=registry,
+        spec_resolver=resolve if terminal_name == "antigravity" else None,
     )
+
+    if resolution_failure in ("fetch", "fetch-recovery"):
+
+        async def record_process_launch(**kwargs: Any) -> SessionResourceView:
+            terminal_launches.append(kwargs)
+            if resolution_failure == "fetch":
+                raise AssertionError("Persistent bundle failure must precede terminal launch")
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=sid,
+                name="re-created",
+            )
+
+        async def no_native_io(*_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        monkeypatch.setattr(
+            app.state.session_resource_registry, "launch_required_terminal", record_process_launch
+        )
+        monkeypatch.setattr(orchestration, "_cold_start_agy_conversation", no_native_io)
+        monkeypatch.setattr(orchestration, "_run_antigravity_reader", no_native_io)
 
     async with _runner_client(app) as client:
         if cached_predecessor:
-            predecessor = make_test_terminal_instance("claude", "main", tmp_path / "old")
+            predecessor = make_test_terminal_instance(terminal_name, "main", tmp_path / "old")
             with registry._lock:
-                registry._by_conversation[sid][("claude", "main")] = predecessor
+                registry._by_conversation[sid][(terminal_name, "main")] = predecessor
             assert (
                 await app.state.session_resource_registry.get_terminal_resource(
-                    sid, "terminal_claude_main"
+                    sid, f"terminal_{terminal_name}_main"
                 )
                 is not None
             )
             with registry._lock:
-                registry._by_conversation[sid][("claude", "main")] = dead_instance
+                registry._by_conversation[sid][(terminal_name, "main")] = dead_instance
         resp = await client.post(
             f"/v1/sessions/{sid}/resources/terminals",
-            json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            json={
+                "terminal": terminal_name,
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
         )
 
+    if resolution_failure in ("auth", "policy"):
+        assert resp.status_code == 500, resp.text
+        assert auto_create_calls == []
+        assert "preparing framework guidance" not in caplog.text
+        return
+    if resolution_failure in ("fetch", "fetch-recovery"):
+        assert "Could not fetch Antigravity startup instructions" in caplog.text
+        assert resolution_attempts == 2
+        assert auto_create_calls == [sid]
+        if resolution_failure == "fetch":
+            assert "HTTP 503" in caplog.text
+            assert resp.status_code == 500, resp.text
+            assert terminal_launches == []
+            return
+        from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+
+        assert len(terminal_launches) == 1
+        rule = (
+            bridge.agy_gemini_dir(bridge.bridge_dir_for_bridge_id(sid))
+            / "config/rules/omnigent_instructions.md"
+        )
+        assert rule.read_text(encoding="utf-8") == (
+            f"---\ntrigger: always_on\n---\n\n{WORKSPACE_IMAGE_INSTRUCTION}\n"
+        )
     assert resp.status_code == 200, resp.text
     assert resp.json()["name"] == "re-created", (
         f"Expected ensure to auto-create after dead pane; got {resp.json()['name']!r}"
     )
     assert auto_create_calls == [sid], (
-        f"Expected _auto_create_claude_terminal to be called; got {auto_create_calls}"
+        f"Expected {terminal_name} auto-create to be called; got {auto_create_calls}"
     )
 
 

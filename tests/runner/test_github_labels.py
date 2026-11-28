@@ -118,6 +118,55 @@ def test_repo_labels_report_only_a_truncated_list(
     assert result["has_more"] is has_more
 
 
+@pytest.mark.parametrize("text", ["bu", "-R other/repo", "is:open label:bug"])
+def test_a_label_search_sends_the_text_as_one_search_value_and_keeps_gh_order(
+    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef, text: str
+) -> None:
+    calls: list[GhCall] = []
+    raw = [_label("bug", "D73A4A", "Broken"), _label("Build", description="CI")]
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [(0, json.dumps(raw), "")]))
+
+    result = github._repo_labels("/workspace", reference, text=text)
+
+    assert result == {
+        "object": "list",
+        "data": [
+            {"name": "bug", "color": "d73a4a", "description": "Broken"},
+            {"name": "Build", "color": "ededed", "description": "CI"},
+        ],
+        "has_more": False,
+    }
+    assert calls == [
+        (
+            [
+                "label",
+                "list",
+                "-R",
+                "github.com/acme/widgets",
+                f"--search={text}",
+                "--json",
+                "name,color,description",
+                "--limit",
+                "51",
+            ],
+            "selected-token",
+        )
+    ]
+
+
+@pytest.mark.parametrize("extra, has_more", [(0, False), (1, True)])
+def test_a_label_search_answers_at_most_its_best_matches(
+    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef, extra: int, has_more: bool
+) -> None:
+    raw = [_label(f"bug-{index:02}") for index in range(github._MAX_LABEL_MATCHES + extra)]
+    monkeypatch.setattr(github, "_gh", _fake_gh([], [(0, json.dumps(raw), "")]))
+
+    result = github._repo_labels("/workspace", reference, text="bug")
+
+    assert len(result["data"]) == github._MAX_LABEL_MATCHES
+    assert result["has_more"] is has_more
+
+
 @pytest.mark.parametrize(
     "response, message",
     [
@@ -384,6 +433,26 @@ def test_repo_labels_need_a_label_editing_provider(tracked: str) -> None:
         pr_resource.pr_labels(tracked, session_id="session")
     with pytest.raises(ValueError, match="GitLab merge request labels"):
         pr_resource.pr_labels(tracked, session_id="session", pr_url=GITLAB_MR_URL)
+    with pytest.raises(ValueError, match="GitLab merge request labels"):
+        pr_resource.pr_labels(tracked, session_id="session", pr_url=GITLAB_MR_URL, text="bug")
+
+
+@pytest.mark.parametrize("text, search", [("  bu ", ["--search=bu"]), ("   ", [])])
+def test_a_label_search_of_the_selected_pr_trims_its_text(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, text: str, search: list[str]
+) -> None:
+    calls: list[list[str]] = []
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(argv)
+        return 0, "[]", ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+
+    pr_resource.pr_labels(tracked, session_id="session", pr_url=PR_URL, text=text)
+
+    [argv] = calls
+    assert [arg for arg in argv if arg.startswith("--search")] == search
 
 
 async def test_runner_routes_list_and_edit_the_selected_prs_labels(

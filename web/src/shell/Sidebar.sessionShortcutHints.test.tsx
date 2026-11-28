@@ -4,9 +4,13 @@ import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { useConversations } from "@/hooks/useConversations";
 import { COMMAND_HOLD_REVEAL_DELAY_MS, useCommandHoldStore } from "@/hooks/useCommandHold";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { useLocation } from "react-router-dom";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { isCommandAvailable, type PaletteCommand } from "@/store/paletteCommands";
+
+import { useSessionNavigationCommands } from "./sessionNavigationCommands";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -103,6 +107,43 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+let navigationCommands: PaletteCommand[] = [];
+/** ⌘K's Next and Previous session as the palette reads them, and where they navigated. */
+function SessionStepProbe() {
+  navigationCommands = useSessionNavigationCommands();
+  return <output data-testid="location">{useLocation().pathname}</output>;
+}
+
+function navigationCommand(id: string): PaletteCommand {
+  const command = navigationCommands.find((candidate) => candidate.id === id);
+  if (!command) throw new Error(`no ${id} command`);
+  return command;
+}
+
+describe("Sidebar session order for ⌘K", () => {
+  it("lets Next and Previous session step through its rows with quick_pick_palette", async () => {
+    renderSidebar({ features: { quick_pick_palette: true }, children: <SessionStepProbe /> });
+    await waitFor(() =>
+      expect(isCommandAvailable(navigationCommand("next-session").availability)).toBe(true),
+    );
+    const rows = renderedRowIds();
+    // From no open session, Next enters at the top row and Previous then wraps to the bottom.
+    act(() => navigationCommand("next-session").run());
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`/c/${rows[0]}`));
+    act(() => navigationCommand("previous-session").run());
+    await waitFor(() =>
+      expect(screen.getByTestId("location")).toHaveTextContent(`/c/${rows.at(-1)}`),
+    );
+  });
+
+  it("offers neither without quick_pick_palette", async () => {
+    renderSidebar({ features: {}, children: <SessionStepProbe /> });
+    await waitFor(() => expect(renderedRowIds()).toHaveLength(5));
+    expect(isCommandAvailable(navigationCommand("next-session").availability)).toBe(false);
+    expect(isCommandAvailable(navigationCommand("previous-session").availability)).toBe(false);
+  });
+});
+
 describe("Sidebar numbered-row shortcut hints", () => {
   it("numbers the rows top to bottom only while the command key is held", async () => {
     renderSidebar();
@@ -145,13 +186,14 @@ describe("Sidebar numbered-row shortcut hints", () => {
     expect(hintKeys(rowOf(renderedRowIds()[3]!))).toEqual([MOD_KEY, "4"]);
   });
 
-  it("labels the tenth row 0 and gives no hint past it", async () => {
+  it("labels the ninth row 9 and gives no hint past it, leaving ⌘0 to Actual Size", async () => {
     mocks.pinned = pinnedFixtures(ELEVEN_PINNED_IDS);
     renderSidebar();
 
     pressCommand();
-    await waitForHints(10);
-    expect(hintKeys(rowOf("conv_10"))).toEqual([MOD_KEY, ALT_KEY, "0"]);
+    await waitForHints(9);
+    expect(hintKeys(rowOf("conv_9"))).toEqual([MOD_KEY, ALT_KEY, "9"]);
+    expect(rowOf("conv_10").querySelector("[data-session-shortcut-hint]")).toBeNull();
     expect(rowOf("conv_11").querySelector("[data-session-shortcut-hint]")).toBeNull();
     expect(rowOf("conv_x").querySelector("[data-session-shortcut-hint]")).toBeNull();
   });
@@ -164,6 +206,7 @@ describe("Sidebar numbered-row shortcut hints", () => {
       "aria-keyshortcuts",
       `${ARIA_MOD_KEY}+Alt+1`,
     );
+    expect(rowOf("conv_10").querySelector("a")).not.toHaveAttribute("aria-keyshortcuts");
     expect(rowOf("conv_11").querySelector("a")).not.toHaveAttribute("aria-keyshortcuts");
   });
 
