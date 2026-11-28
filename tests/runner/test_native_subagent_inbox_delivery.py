@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
@@ -534,6 +535,90 @@ async def test_undeliverable_native_completion_returns_503_not_silent_204(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_failure", ["transport_error", "server_error"])
+async def test_lost_child_with_unreadable_snapshot_is_retried_then_wakes_parent(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    read_failure: str,
+) -> None:
+    """A parent's runner that cannot read the child's identity yet asks for a retry.
+
+    A 204 would end the server's redelivery of a lost child's result, so the
+    parent would never be woken.
+    """
+    monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
+    child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+
+    class FlakyWakeClient(_SnapshotServerClient):
+        """Fail the first child snapshot read and record parent wakes."""
+
+        def __init__(self) -> None:
+            super().__init__(child_body)
+            self.child_reads = 0
+            self.wakes: list[dict[str, Any]] = []
+
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            if url.rstrip("/").endswith(CHILD_SESSION_ID):
+                self.child_reads += 1
+                if self.child_reads == 1:
+                    if read_failure == "transport_error":
+                        raise httpx.ConnectError("server unreachable")
+                    failed = self._Resp({})
+                    failed.status_code = 503
+                    return failed
+            return await super().get(url, **kwargs)
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url == f"/v1/sessions/{PARENT_SESSION_ID}/events":
+                self.wakes.append(kwargs["json"])
+            return await super().post(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return AgentSpec(
+            spec_version=1,
+            name="orchestrator" if agent_id == "ag_orchestrator" else "reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    server = FlakyWakeClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=server,  # type: ignore[arg-type]
+    )
+    lost = {
+        "type": "external_session_status",
+        "data": {"status": "failed", "output": "Runner disconnected unexpectedly."},
+    }
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": PARENT_SESSION_ID, "agent_id": "ag_orchestrator"},
+        )
+        assert response.status_code == 201, response.text
+
+        refused = await client.post(f"/v1/sessions/{CHILD_SESSION_ID}/events", json=lost)
+        assert refused.status_code == 503
+        assert refused.json()["reason"] == "missing_work_entry"
+        assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
+
+        delivered = await client.post(f"/v1/sessions/{CHILD_SESSION_ID}/events", json=lost)
+        assert delivered.status_code == 204, delivered.text
+        # Yield to the scheduled wake POST, which completes against the in-memory client.
+        await asyncio.sleep(0)
+
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
+    assert inbox.qsize() == 1
+    item = inbox.get_nowait()
+    assert item["task_id"] == CHILD_SESSION_ID
+    assert item["status"] == "failed"
+    assert item["output"] == "Runner disconnected unexpectedly."
+    assert len(server.wakes) == 1
+    assert "sys_read_inbox" in server.wakes[0]["data"]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_nested_subagent_parent_without_inbox_is_acked(
     _clean_subagent_registry: None,
 ) -> None:
@@ -559,6 +644,28 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
     assert entry is not None
     assert entry.status == "completed"
     assert entry.delivered is False
+
+
+@pytest.mark.asyncio
+async def test_nested_subagent_parent_on_another_runner_is_not_acked(
+    _clean_subagent_registry: None,
+) -> None:
+    """A sub-agent parent on its own runner keeps the retry so the server can route there."""
+    parent_body = {
+        **_parent_snapshot(parent_session_id="conv_top_level"),
+        "runner_id": "runner_parent_elsewhere",
+        "runner_online": True,
+        "labels": {WRAPPER_LABEL_KEY: "claude-code-native-ui"},
+    }
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=False,
+        register_work=False,
+        parent_body=parent_body,
+    )
+
+    assert http == 503
+    assert items == []
 
 
 @pytest.mark.asyncio

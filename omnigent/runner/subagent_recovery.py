@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 import httpx
 from fastapi import FastAPI
 
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.runner.subagent_work import (
     _SUBAGENT_TERMINAL_STATUSES,
     _deliver_subagent_completion,
@@ -89,6 +90,8 @@ def build_subagent_recovery(
             snapshot = await _session_snapshot(conv_id)
         except Exception:  # noqa: BLE001 — best-effort recovery
             return None
+        if snapshot.status_code is None or snapshot.status_code >= 500:
+            raise _SubagentRecoveryReadError(f"session {conv_id} returned {snapshot.status_code}")
         parent_id = snapshot.parent_session_id
         if not parent_id or parent_id == conv_id:
             return None
@@ -103,7 +106,7 @@ def build_subagent_recovery(
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
         """
-        Return whether an undelivered result's parent is itself a sub-agent.
+        Return whether an undelivered result's parent is itself a mirrored sub-agent.
 
         A mirrored claude-native sub-agent never runs on this runner, so its
         inbox never exists here and retrying its children's terminal status
@@ -114,13 +117,19 @@ def build_subagent_recovery(
         inbox is created (``_deliver_retained_subagent_results``). An unreadable
         parent snapshot reads as a top-level parent, so the retry contract still
         covers a parent that lives elsewhere or is re-initializing after a
-        restart.
+        restart. So does a dispatched native sub-agent parent, which runs its
+        own terminal and may be on another runner the server can route to.
 
         :param entry: Terminal work entry whose parent inbox was missing.
-        :returns: ``True`` when the parent's snapshot names its own parent.
+        :returns: ``True`` when the parent's snapshot names its own parent and
+            the parent does not run its own native terminal.
         """
         snapshot = await _session_snapshot(entry.parent_session_id)
-        return snapshot.ok and snapshot.parent_session_id is not None
+        return (
+            snapshot.ok
+            and snapshot.parent_session_id is not None
+            and native_coding_agent_for_wrapper_label(snapshot.wrapper_label) is None
+        )
 
     def _deliver_retained_subagent_results(parent_id: str) -> None:
         """

@@ -24,6 +24,8 @@ import json
 import re
 import tarfile
 import threading
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
 from unittest.mock import AsyncMock
@@ -38,7 +40,9 @@ from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME, HostHelloFrame
 from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions import orchestration as orchestration_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
+from omnigent.server.schemas import ErrorDetail
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -2407,6 +2411,305 @@ async def test_subagent_idle_forward_503s_when_recovery_also_fails(
     )
 
     assert resp.status_code == 503, resp.text
+
+
+_PARENT_RUNNER = "runner_parent_live"
+_CHILD_RUNNER = "runner_child_own"
+_RUNNER_DISCONNECTED = ErrorDetail(
+    code="runner_disconnected", message="Runner disconnected unexpectedly."
+)
+
+
+@dataclass
+class _ChildApartFromParent:
+    store: SqlAlchemyConversationStore
+    child_id: str
+    parent_id: str
+    parent_runner_requests: list[tuple[str, dict[str, Any]]]
+
+    def child_statuses_at_parent_runner(self) -> list[str]:
+        return [
+            body["data"]["status"]
+            for path, body in self.parent_runner_requests
+            if path == f"/v1/sessions/{self.child_id}/events"
+            and body.get("type") == "external_session_status"
+        ]
+
+    def child_events_at_parent_runner(self) -> list[dict[str, Any]]:
+        return [
+            body["data"]
+            for path, body in self.parent_runner_requests
+            if path == f"/v1/sessions/{self.child_id}/events"
+            and body.get("type") == "external_session_status"
+        ]
+
+
+def _runner_without_parent_inbox(request: httpx.Request) -> httpx.Response:
+    if request.method == "POST" and request.url.path == "/v1/sessions":
+        return httpx.Response(201, json={"id": json.loads(request.content)["session_id"]})
+    if request.url.path.endswith("/resources/terminals"):
+        return httpx.Response(
+            503,
+            json={
+                "error": {
+                    "code": "native_terminal_start_failed",
+                    "message": "Native Claude requires the 'claude' CLI on PATH.",
+                }
+            },
+        )
+    return httpx.Response(
+        503,
+        json={"error": "subagent_delivery_not_confirmed", "reason": "missing_parent_inbox"},
+    )
+
+
+@asynccontextmanager
+async def _child_apart_from_parent(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    name: str,
+    child_runner_handler: Callable[[httpx.Request], httpx.Response] | None,
+) -> AsyncIterator[_ChildApartFromParent]:
+    """Bind a native child and its parent to separate runners; ``None`` omits the child runner."""
+    child = await _create_native_child(client, name=name)
+    store = SqlAlchemyConversationStore(db_uri)
+    family = _ChildApartFromParent(store, child["id"], child["parent_session_id"], [])
+    assert store.set_runner_id(family.parent_id, _PARENT_RUNNER)
+    assert store.set_runner_id(family.child_id, _CHILD_RUNNER)
+
+    def record_parent_runner(request: httpx.Request) -> httpx.Response:
+        family.parent_runner_requests.append(
+            (request.url.path, json.loads(request.content or b"{}"))
+        )
+        return httpx.Response(204)
+
+    async with AsyncExitStack() as stack:
+        runners = {
+            _PARENT_RUNNER: await stack.enter_async_context(
+                httpx.AsyncClient(
+                    transport=httpx.MockTransport(record_parent_runner),
+                    base_url="http://parent-runner",
+                )
+            )
+        }
+        register_test_runner(app, _PARENT_RUNNER)
+        if child_runner_handler is not None:
+            runners[_CHILD_RUNNER] = await stack.enter_async_context(
+                httpx.AsyncClient(
+                    transport=httpx.MockTransport(child_runner_handler),
+                    base_url="http://child-runner",
+                )
+            )
+            register_test_runner(app, _CHILD_RUNNER)
+
+        async def resolve_bound_runner(
+            session_id: str,
+            runner_router: object,
+            *,
+            conversation: Any = None,
+            for_control: bool = False,
+        ) -> httpx.AsyncClient | None:
+            row = await asyncio.to_thread(store.get_conversation, session_id)
+            return runners.get(row.runner_id) if row is not None and row.runner_id else None
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve_bound_runner)
+        yield family
+
+
+def _start_child_turn(family: _ChildApartFromParent, monkeypatch: pytest.MonkeyPatch) -> None:
+    family.store.set_session_live_status(family.child_id, "running")
+    monkeypatch.setitem(sessions_module._session_status_cache, family.child_id, "running")
+    monkeypatch.setitem(
+        sessions_module._session_active_response_cache, family.child_id, "resp_child"
+    )
+
+
+async def test_subagent_idle_refused_by_its_own_runner_reaches_parent_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client,
+        app,
+        db_uri,
+        monkeypatch,
+        name="apart-idle",
+        child_runner_handler=_runner_without_parent_inbox,
+    ) as family:
+        resp = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "turn_completed": True, "output": "Found 3 issues."},
+            },
+        )
+
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_completed": True, "output": "Found 3 issues."}
+    ], resp.text
+    assert resp.status_code == 202, resp.text
+    assert family.store.get_conversation(family.child_id).runner_id == _CHILD_RUNNER
+
+
+async def test_unconfirmed_subagent_idle_refused_by_its_own_runner_stays_off_parent_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client,
+        app,
+        db_uri,
+        monkeypatch,
+        name="apart-bare-idle",
+        child_runner_handler=_runner_without_parent_inbox,
+    ) as family:
+        bare = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert bare.status_code == 503, bare.text
+        assert family.child_events_at_parent_runner() == []
+        confirmed = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "turn_completed": True, "output": "Found 3 issues."},
+            },
+        )
+
+    assert confirmed.status_code == 202, confirmed.text
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_completed": True, "output": "Found 3 issues."}
+    ]
+
+
+async def test_relaunched_subagent_result_replaces_pending_lost_runner_report(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client,
+        app,
+        db_uri,
+        monkeypatch,
+        name="apart-relaunched",
+        child_runner_handler=_runner_without_parent_inbox,
+    ) as family:
+        resolve_bound_runner = sessions_module._get_runner_client
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+        await orchestration_module._report_lost_subagent_to_parent_runner(
+            family.child_id,
+            family.store,
+            {"status": "failed", "output": _RUNNER_DISCONNECTED.message},
+        )
+        pending_report = orchestration_module._parent_report_retries[family.child_id].task
+        assert pending_report is not None
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve_bound_runner)
+        resp = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "turn_completed": True, "output": "Found 3 issues."},
+            },
+        )
+        with suppress(asyncio.CancelledError):
+            await pending_report
+
+    assert resp.status_code == 202, resp.text
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_completed": True, "output": "Found 3 issues."}
+    ]
+
+
+async def test_native_subagent_boot_failure_reaches_parent_on_another_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client,
+        app,
+        db_uri,
+        monkeypatch,
+        name="apart-boot-failure",
+        child_runner_handler=_runner_without_parent_inbox,
+    ) as family:
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        resp = await client.post(
+            f"/v1/sessions/{family.child_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "review"}]},
+            },
+        )
+
+    assert family.child_events_at_parent_runner() == [
+        {"status": "failed", "output": "Native Claude requires the 'claude' CLI on PATH."}
+    ], resp.text
+    assert resp.status_code == 202, resp.text
+
+
+async def test_subagent_whose_runner_departs_mid_turn_reaches_parent_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client, app, db_uri, monkeypatch, name="apart-departed", child_runner_handler=None
+    ) as family:
+        _start_child_turn(family, monkeypatch)
+        await sessions_module._mark_runner_sessions_offline(
+            family.store.list_conversations_by_runner_id(_CHILD_RUNNER),
+            _RUNNER_DISCONNECTED,
+            family.store,
+        )
+        assert sessions_module._session_status_cache[family.child_id] == "failed"
+
+    assert family.child_events_at_parent_runner() == [
+        {"status": "failed", "output": _RUNNER_DISCONNECTED.message}
+    ]
+
+
+async def test_subagent_stopped_mid_turn_reaches_parent_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _child_apart_from_parent(
+        client, app, db_uri, monkeypatch, name="apart-stopped", child_runner_handler=None
+    ) as family:
+        _start_child_turn(family, monkeypatch)
+        monkeypatch.setattr(
+            sessions_module, "_stop_session_host_runner", AsyncMock(return_value=True)
+        )
+        try:
+            assert await orchestration_module._stop_host_runner_intentionally(
+                family.child_id, "host-child", _CHILD_RUNNER, None, family.store
+            )
+            await sessions_module._mark_runner_sessions_offline(
+                family.store.list_conversations_by_runner_id(_CHILD_RUNNER),
+                _RUNNER_DISCONNECTED,
+                family.store,
+            )
+        finally:
+            sessions_module._intentional_stop_sessions.pop(family.child_id, None)
+        assert sessions_module._session_status_cache[family.child_id] == "idle"
+
+    assert family.child_events_at_parent_runner() == [
+        {"status": "idle", "turn_outcome": "cancelled"}
+    ]
 
 
 # ── message-send stale-runner heal (issue #3067) ─────────────────────────────

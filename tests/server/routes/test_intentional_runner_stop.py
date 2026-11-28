@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.host.frames import HostHelloFrame, HostStopRunnerFrame, decode_host_frame
+from omnigent.runner.subagent_work import SUBAGENT_DISPATCH_ID_LABEL_KEY
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state
 from omnigent.server.host_registry import HostRegistry, WebSocketLike
@@ -292,6 +296,210 @@ async def test_sweep_leaves_intent_for_a_matching_live_relay(
     finally:
         gate.set()
         await task
+
+
+async def test_sweep_reports_stopped_child_to_parent_on_another_runner(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    sessions._intentional_stop_sessions[child_id] = "runner-other"
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+    parent_runner_posts: list[tuple[str, object]] = []
+
+    def record_parent_runner(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(record_parent_runner), base_url="http://parent-runner"
+    ) as parent_runner:
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await sessions._mark_runner_sessions_offline(
+            store.list_conversations_by_runner_id("runner-other"), error, store
+        )
+
+    assert sessions._session_status_cache[child_id] == "idle"
+    assert parent_runner_posts == [
+        (
+            f"/v1/sessions/{child_id}/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "idle", "turn_outcome": "cancelled"},
+            },
+        )
+    ]
+
+
+_LOST_CHILD_STATUS = {"status": "failed", "output": "Runner disconnected unexpectedly."}
+
+
+def _delivery_refused(reason: str) -> httpx.Response:
+    return httpx.Response(503, json={"error": "subagent_delivery_not_confirmed", "reason": reason})
+
+
+async def _pending_report_task(child_id: str) -> None:
+    task = orchestration._parent_report_retries[child_id].task
+    assert task is not None
+    await task
+
+
+@pytest.mark.parametrize(
+    "first_attempt", ["parent_runner_offline", "transport_error", "missing_work_entry"]
+)
+async def test_lost_child_report_is_retried_until_parent_runner_takes_it(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    first_attempt: str,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    store.set_labels(child_id, {SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_first"})
+    monkeypatch.setattr(orchestration, "_PARENT_REPORT_RETRY_DELAYS_S", (0.0,))
+    parent_runner_posts: list[object] = []
+
+    def parent_runner_reconnecting(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append(json.loads(request.content))
+        if len(parent_runner_posts) == 1:
+            if first_attempt == "transport_error":
+                raise httpx.ConnectError("tunnel reconnecting", request=request)
+            if first_attempt == "missing_work_entry":
+                return _delivery_refused("missing_work_entry")
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(parent_runner_reconnecting), base_url="http://parent-runner"
+    ) as parent_runner:
+        lookups: list[str] = []
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            lookups.append(session_id)
+            if first_attempt == "parent_runner_offline" and len(lookups) == 1:
+                return None
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await orchestration._report_lost_subagent_to_parent_runner(
+            child_id, store, _LOST_CHILD_STATUS
+        )
+        await _pending_report_task(child_id)
+
+    assert parent_runner_posts[-1:] == [
+        {"type": "external_session_status", "data": _LOST_CHILD_STATUS}
+    ]
+    assert len(parent_runner_posts) == (1 if first_attempt == "parent_runner_offline" else 2)
+    assert child_id not in orchestration._parent_report_retries
+
+
+async def test_lost_child_report_kept_by_parent_runner_is_not_resent(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    parent_runner_posts: list[object] = []
+
+    def parent_runner_without_inbox(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append(json.loads(request.content))
+        return _delivery_refused("missing_parent_inbox")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(parent_runner_without_inbox), base_url="http://parent-runner"
+    ) as parent_runner:
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await orchestration._report_lost_subagent_to_parent_runner(
+            child_id, store, _LOST_CHILD_STATUS
+        )
+
+    assert parent_runner_posts == [{"type": "external_session_status", "data": _LOST_CHILD_STATUS}]
+    assert child_id not in orchestration._parent_report_retries
+
+
+async def test_child_outcome_waits_for_an_in_flight_lost_child_report(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    monkeypatch.setattr(orchestration, "_PARENT_REPORT_RETRY_DELAYS_S", (0.0,))
+    parent_runner_posts: list[object] = []
+    retry_in_flight = asyncio.Event()
+    release_retry = asyncio.Event()
+
+    async def parent_runner_slow(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append(json.loads(request.content))
+        if len(parent_runner_posts) == 1:
+            raise httpx.ConnectError("tunnel reconnecting", request=request)
+        retry_in_flight.set()
+        await release_retry.wait()
+        return _delivery_refused("missing_work_entry")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(parent_runner_slow), base_url="http://parent-runner"
+    ) as parent_runner:
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await orchestration._report_lost_subagent_to_parent_runner(
+            child_id, store, _LOST_CHILD_STATUS
+        )
+        retry = orchestration._parent_report_retries[child_id].task
+        assert retry is not None
+        await retry_in_flight.wait()
+        supersede = asyncio.create_task(orchestration._supersede_parent_report(child_id))
+        await asyncio.sleep(0.05)
+        assert not supersede.done()
+        release_retry.set()
+        await supersede
+        with contextlib.suppress(asyncio.CancelledError):
+            await retry
+
+    assert retry.done()
+    assert len(parent_runner_posts) == 2
+    assert child_id not in orchestration._parent_report_retries
+
+
+async def test_lost_child_report_retry_stops_when_child_gets_a_new_turn(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ids = family
+    child_id = ids["elsewhere"]
+    store.set_labels(child_id, {SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_first"})
+    monkeypatch.setattr(orchestration, "_PARENT_REPORT_RETRY_DELAYS_S", (0.0,))
+    parent_runner_posts: list[object] = []
+
+    def parent_runner_unreachable(request: httpx.Request) -> httpx.Response:
+        parent_runner_posts.append(json.loads(request.content))
+        raise httpx.ConnectError("tunnel reconnecting", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(parent_runner_unreachable), base_url="http://parent-runner"
+    ) as parent_runner:
+
+        async def resolve_runner(session_id: str, *_: object, **__: object) -> object:
+            return parent_runner if session_id == ids["parent"] else None
+
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+        await orchestration._report_lost_subagent_to_parent_runner(
+            child_id, store, _LOST_CHILD_STATUS
+        )
+        store.set_labels(child_id, {SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_second"})
+        await _pending_report_task(child_id)
+
+    assert parent_runner_posts == [{"type": "external_session_status", "data": _LOST_CHILD_STATUS}]
+    assert child_id not in orchestration._parent_report_retries
 
 
 @pytest.mark.parametrize("delivered", [True, False])

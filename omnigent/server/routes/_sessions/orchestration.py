@@ -17,6 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
@@ -385,6 +386,8 @@ from omnigent.server.routes._sessions.helpers import (
     _spec_harness,
     _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
+    _subagent_delivery_not_confirmed,
+    _subagent_delivery_refusal_reason,
     _usage_by_model_for_display,
     _validate_session_workspace,
     _validate_terminal_launch_args,
@@ -878,6 +881,8 @@ _ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S = 30.0
 _SELF_ARCHIVE_TURN_POLL_S = 2.0
 _SELF_ARCHIVE_TURN_WAIT_S = 60 * 60
 _RUNNER_STOP_STATUS_BATCH_SIZE = 200
+# A stopped turn is reported to the parent the way a confirmed interrupt is.
+_STOPPED_SUBAGENT_STATUS: dict[str, Any] = {"status": "idle", "turn_outcome": "cancelled"}
 
 
 async def _stop_host_runner_intentionally(
@@ -1002,6 +1007,9 @@ async def _stop_host_runner_intentionally(
                 if settled and (handle is None or handle.runner_id == runner_id):
                     session_live_state.forget_live_status(related_id)
                     _publish_status(related_id, "idle", persist_live_status=False)
+                    await _report_lost_subagent_to_parent_runner(
+                        related_id, conversation_store, _STOPPED_SUBAGENT_STATUS
+                    )
         return acknowledged
 
 
@@ -4719,6 +4727,299 @@ async def _recover_subagent_status_forward_via_parent(
     )
 
 
+async def _subagent_parent_on_another_runner(
+    child_conv: Conversation, conversation_store: ConversationStore
+) -> Conversation | None:
+    """
+    Return the parent holding a dispatched child's inbox apart from the child's runner.
+
+    :param child_conv: The sub-agent child whose status is being delivered.
+    :param conversation_store: Store used to look up the parent.
+    :returns: The parent, whose ``runner_id`` may be unset, or ``None`` when the
+        parent shares the child's runner, owns the child natively, or is gone.
+    """
+    from omnigent.server.child_session_recovery import is_parent_owned_subagent
+
+    parent_id = child_conv.parent_conversation_id
+    if (
+        child_conv.kind != "sub_agent"
+        or not parent_id
+        or parent_id == child_conv.id
+        or is_parent_owned_subagent(child_conv)
+    ):
+        return None
+    parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+    if parent is None or (
+        parent.runner_id is not None and parent.runner_id == child_conv.runner_id
+    ):
+        return None
+    return parent
+
+
+async def _post_subagent_status_to_parent_runner(
+    child_id: str,
+    parent: Conversation,
+    runner_router: RunnerRouter | None,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    POST a child's status event to its parent's bound runner.
+
+    :param child_id: Child session the event is for, e.g. ``"conv_child123"``.
+    :param parent: Parent conversation whose runner receives the event.
+    :param runner_router: Router used to resolve the parent's runner client.
+    :param forward_body: The ``external_session_status`` event body to POST.
+    :returns: The parent runner's result, or ``None`` when it is unreachable.
+    """
+    client = await _get_runner_client(parent.id, runner_router, conversation=parent)
+    if client is None:
+        return None
+    try:
+        resp = await client.post(f"/v1/sessions/{child_id}/events", json=forward_body, timeout=5.0)
+    except (httpx.HTTPError, ConnectionError):
+        _logger.warning(
+            "Sub-agent status for session=%s did not reach its parent's runner %s",
+            child_id,
+            parent.runner_id,
+            exc_info=True,
+            extra={"session_id": child_id},
+        )
+        return None
+    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
+
+
+async def _forward_subagent_status_to_parent_runner(
+    child_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    Deliver a sub-agent's terminal status to its parent's runner when the child runs elsewhere.
+
+    A child relaunched alone, or one whose parent is itself a sub-agent on another
+    runner, reports to a runner that has no inbox for its parent. The parent's
+    runner holds that inbox and rebuilds the child's work entry from the server.
+
+    :param child_conv: The sub-agent child whose status is being delivered.
+    :param runner_router: Router used to resolve the parent's runner client.
+    :param conversation_store: Store used to look up the parent.
+    :param forward_body: The ``external_session_status`` event body to POST.
+    :returns: The parent runner's result, or ``None`` when the parent shares the
+        child's runner, owns the child natively, or its runner is unreachable.
+    """
+    parent = await _subagent_parent_on_another_runner(child_conv, conversation_store)
+    if parent is None or parent.runner_id is None:
+        return None
+    return await _post_subagent_status_to_parent_runner(
+        child_conv.id, parent, runner_router, forward_body
+    )
+
+
+#: Backoff between redeliveries of a stopped child's status to its parent's runner.
+_PARENT_REPORT_RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 5.0, 15.0, 30.0)
+
+
+@dataclass(eq=False)
+class _PendingParentReport:
+    """
+    A stopped child's report that its parent's runner has not yet taken.
+
+    :param lock: Held for each delivery attempt, so a superseding outcome waits
+        for an attempt already in flight.
+    :param task: The background redelivery, once the first attempt fails.
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    task: asyncio.Task[None] | None = None
+
+
+#: The pending report that owns each stopped child's delivery, keyed by child id.
+_parent_report_retries: WorkspaceScopedCache[str, _PendingParentReport] = WorkspaceScopedCache()
+
+
+def _release_parent_report(child_id: str, report: _PendingParentReport) -> None:
+    if _parent_report_retries.get(child_id) is report:
+        del _parent_report_retries[child_id]
+
+
+async def _supersede_parent_report(child_id: str) -> None:
+    """
+    Drop a stopped child's pending report once a newer outcome replaces it.
+
+    Waits for an attempt already in flight, so the stale report cannot reach the
+    parent's runner after the newer outcome.
+
+    :param child_id: The sub-agent child, e.g. ``"conv_child123"``.
+    """
+    report = _parent_report_retries.pop(child_id, None)
+    if report is None:
+        return
+    async with report.lock:
+        if report.task is not None:
+            report.task.cancel()
+
+
+async def _deliver_report_to_parent_runner(
+    child: Conversation,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+) -> bool:
+    """
+    Send a stopped child's status to its parent's runner once.
+
+    :param child: The stopped sub-agent child.
+    :param conversation_store: Store used to load the parent.
+    :param forward_body: The ``external_session_status`` event body to POST.
+    :returns: Whether the report still needs delivery: the parent has no
+        reachable runner yet, or its runner did not keep the result.
+    """
+    from omnigent.runner.subagent_work import _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
+
+    parent = await _subagent_parent_on_another_runner(child, conversation_store)
+    if parent is None:
+        return False
+    if parent.runner_id is None:
+        return True
+    result = await _post_subagent_status_to_parent_runner(
+        child.id, parent, get_server_runner_router(), forward_body
+    )
+    if result is None:
+        return True
+    # A runner without the parent's inbox keeps the result until that inbox exists.
+    if result.status_code < 400 or (
+        _subagent_delivery_refusal_reason(result) == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
+    ):
+        return False
+    if result.status_code >= 500:
+        return True
+    _logger.warning(
+        "Parent's runner rejected stopped sub-agent session=%s with status %s: %s",
+        child.id,
+        result.status_code,
+        result.body[:500],
+        extra={"session_id": child.id},
+    )
+    return False
+
+
+async def _redeliver_report_to_parent_runner(
+    child_id: str,
+    report: _PendingParentReport,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+    *,
+    stopped_runner_id: str | None,
+    dispatch_id: str | None,
+) -> None:
+    """
+    Retry an unconfirmed stopped-child report until the parent's runner takes it.
+
+    Stops once the report is superseded, the child is rebound to another runner,
+    its dispatch is drained or replaced, or the offline-host hold expires.
+
+    :param child_id: The stopped sub-agent child, e.g. ``"conv_child123"``.
+    :param report: The pending report this task delivers.
+    :param conversation_store: Store used to reload the child and its parent.
+    :param forward_body: The ``external_session_status`` event body to POST.
+    :param stopped_runner_id: The child's runner when it stopped.
+    :param dispatch_id: The child's undelivered dispatch id when it stopped.
+    """
+    from omnigent.runner.subagent_work import undelivered_subagent_dispatch_id
+
+    deadline = time.monotonic() + HOST_OFFLINE_HOLD_S
+    attempt = 0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(
+            _PARENT_REPORT_RETRY_DELAYS_S[min(attempt, len(_PARENT_REPORT_RETRY_DELAYS_S) - 1)]
+        )
+        attempt += 1
+        async with report.lock:
+            if _parent_report_retries.get(child_id) is not report:
+                return
+            try:
+                child = await asyncio.to_thread(conversation_store.get_conversation, child_id)
+                if (
+                    child is None
+                    or child.runner_id not in (None, stopped_runner_id)
+                    or undelivered_subagent_dispatch_id(child.labels) != dispatch_id
+                ):
+                    return
+                if not await _deliver_report_to_parent_runner(
+                    child, conversation_store, forward_body
+                ):
+                    return
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Retrying stopped sub-agent session=%s report to its parent's runner failed",
+                    child_id,
+                    exc_info=True,
+                    extra={"session_id": child_id},
+                )
+    _logger.warning(
+        "Gave up reporting stopped sub-agent session=%s to its parent's runner",
+        child_id,
+        extra={"session_id": child_id},
+    )
+
+
+async def _report_lost_subagent_to_parent_runner(
+    child_id: str,
+    conversation_store: ConversationStore,
+    data: dict[str, Any],
+) -> None:
+    """
+    Tell a parent on another runner that its child stopped with its runner.
+
+    The child's runner and forwarder are gone, so no turn-end will arrive. An
+    unconfirmed report is retried in the background until the parent's runner
+    takes it or the child reports its own outcome. A parent sharing the lost
+    runner recovers its children on restart.
+
+    :param child_id: Session whose runner departed, e.g. ``"conv_child123"``.
+    :param conversation_store: Store used to load the child and its parent.
+    :param data: ``external_session_status`` data, e.g. ``{"status": "failed",
+        "output": "Runner disconnected unexpectedly."}``.
+    """
+    from omnigent.runner.subagent_work import undelivered_subagent_dispatch_id
+
+    await _supersede_parent_report(child_id)
+    report = _PendingParentReport()
+    _parent_report_retries[child_id] = report
+    forward_body = {"type": _EXTERNAL_SESSION_STATUS_TYPE, "data": data}
+    child: Conversation | None = None
+    pending = False
+    async with report.lock:
+        try:
+            child = await asyncio.to_thread(conversation_store.get_conversation, child_id)
+            pending = child is not None and await _deliver_report_to_parent_runner(
+                child, conversation_store, forward_body
+            )
+        except Exception:  # noqa: BLE001
+            pending = True
+            _logger.warning(
+                "Cannot report stopped sub-agent session=%s to its parent's runner",
+                child_id,
+                exc_info=True,
+                extra={"session_id": child_id},
+            )
+    if child is None or not pending or _parent_report_retries.get(child_id) is not report:
+        _release_parent_report(child_id, report)
+        return
+    report.task = asyncio.create_task(
+        _redeliver_report_to_parent_runner(
+            child_id,
+            report,
+            conversation_store,
+            forward_body,
+            stopped_runner_id=child.runner_id,
+            dispatch_id=undelivered_subagent_dispatch_id(child.labels),
+        ),
+        name=f"subagent-parent-report:{child_id}",
+    )
+    report.task.add_done_callback(lambda _task: _release_parent_report(child_id, report))
+
+
 def _drive_terminal_resolved_elicitation(session_id: str, persisted: ConversationItem) -> None:
     """
     Feed a mirrored tool item into the terminal-resolved fast path.
@@ -5072,6 +5373,9 @@ async def _mark_runner_sessions_offline_once(
                     ):
                         session_live_state.forget_live_status(conv.id)
                         _publish_status(conv.id, "idle", persist_live_status=False)
+                        await _report_lost_subagent_to_parent_runner(
+                            conv.id, conversation_store, _STOPPED_SUBAGENT_STATUS
+                        )
                 if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
                     _intentional_stop_sessions.pop(conv.id, None)
             continue
@@ -5151,6 +5455,9 @@ async def _mark_runner_sessions_offline_once(
         )
         await _persist_session_status_error_labels(
             conv.id, error, conversation_store, owner_runner_id=conv.runner_id
+        )
+        await _report_lost_subagent_to_parent_runner(
+            conv.id, conversation_store, {"status": "failed", "output": error.message}
         )
     return retry
 
@@ -7469,6 +7776,7 @@ async def _persist_native_terminal_failure(
         conv,
         error,
         runner_router,
+        conversation_store,
     )
     return consumed.id
 
@@ -7556,7 +7864,9 @@ async def _persist_host_launch_failure_turn(
     )
     # A host-launched sub-agent that cannot start must wake its parent,
     # the same way a boot failure does — no-ops for top-level sessions.
-    await _forward_native_subagent_terminal_failure(session_id, conv, error, runner_router)
+    await _forward_native_subagent_terminal_failure(
+        session_id, conv, error, runner_router, conversation_store
+    )
     return consumed.id
 
 
@@ -7565,6 +7875,7 @@ async def _forward_native_subagent_terminal_failure(
     conv: Conversation,
     error: ErrorData,
     runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Wake the parent runner when a native sub-agent fails to boot its terminal.
@@ -7573,8 +7884,9 @@ async def _forward_native_subagent_terminal_failure(
     ``failed`` branch of ``external_session_status`` in
     :func:`post_event`): forward an ``external_session_status: failed``
     edge — carrying the boot error as ``output`` so it lands in the
-    parent's inbox — to the sub-agent's own runner, then require the
-    forward to land. The runner's ``external_session_status`` handler
+    parent's inbox — to the sub-agent's own runner, or to the parent's
+    runner when the child's cannot deliver it, then require the forward
+    to land. The runner's ``external_session_status`` handler
     maps ``failed`` to ``mark_subagent_work_terminal(status="failed")``,
     which marks the parent's work entry terminal and wakes the parent.
 
@@ -7588,6 +7900,7 @@ async def _forward_native_subagent_terminal_failure(
     :param error: Boot error to relay to the parent as the turn result.
     :param runner_router: Router used to resolve the sub-agent's runner,
         or ``None`` (then the global client is used).
+    :param conversation_store: Store used to look up the parent's runner.
     :returns: None.
     :raises OmnigentError: If the parent's runner could not be reached
         or rejected the forwarded failure status — dropping it would
@@ -7606,6 +7919,12 @@ async def _forward_native_subagent_terminal_failure(
         runner_router,
         forward_body,
     )
+    if runner_result is None or _subagent_delivery_not_confirmed(runner_result):
+        via_parent = await _forward_subagent_status_to_parent_runner(
+            conv, runner_router, conversation_store, forward_body
+        )
+        if via_parent is not None:
+            runner_result = via_parent
     _require_external_status_forward(session_id, "failed", runner_result)
 
 
@@ -10381,6 +10700,7 @@ async def _relay_runner_stream(
                 ),
             )
             if decision == "intentional_stop":
+                stopped_mid_turn = _session_status_cache.get(session_id) in _MID_TURN_STATUSES
                 # An expected drop must not erase a real failure reported during
                 # teardown: preserve its labels when the sticky status stays failed.
                 _publish_status(session_id, "idle")
@@ -10389,6 +10709,10 @@ async def _relay_runner_stream(
                         session_id,
                         None,
                         conversation_store,
+                    )
+                if stopped_mid_turn:
+                    await _report_lost_subagent_to_parent_runner(
+                        session_id, conversation_store, _STOPPED_SUBAGENT_STATUS
                     )
             elif decision == "server_shutdown":
                 # This server closed the tunnel on its way down; the runner is
@@ -10462,6 +10786,11 @@ async def _relay_runner_stream(
                     disconnect_error,
                     conversation_store,
                     owner_runner_id=runner_id,
+                )
+                await _report_lost_subagent_to_parent_runner(
+                    session_id,
+                    conversation_store,
+                    {"status": "failed", "output": disconnect_error.message},
                 )
             return
 
@@ -15722,6 +16051,7 @@ __all__ = [
     "_forward_event_to_runner",
     "_forward_native_subagent_terminal_failure",
     "_forward_native_terminal_message",
+    "_forward_subagent_status_to_parent_runner",
     "_gateway_backed",
     "_get_session_snapshot",
     "_handle_mcp_tools_call",

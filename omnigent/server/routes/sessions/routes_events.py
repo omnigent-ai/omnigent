@@ -264,6 +264,7 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
     _stream_live_events,
+    _subagent_delivery_not_confirmed,
     _wait_for_runner_client,
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
@@ -302,6 +303,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _session_is_moving,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
+    _supersede_parent_report,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
     ensure_runner_connected,
@@ -3013,6 +3015,7 @@ def register_events_routes(
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            outcome: str | None = None
             if (
                 conv.parent_conversation_id is not None
                 and status in {"idle", "failed"}
@@ -3058,6 +3061,9 @@ def register_events_routes(
                         cost_usd=None,
                     )
                 )
+            if outcome is not None:
+                # The child's own outcome replaces a pending report of its lost runner.
+                await _supersede_parent_report(session_id)
             forward_body = body.model_dump(exclude={"workflow_run_id"})
             forward_body["data"] = data
             runner_result = await _forward_session_change_to_runner(
@@ -3076,6 +3082,8 @@ def register_events_routes(
                 # collab threads live in the app-server thread tree, and a
                 # devin sub-agent is a reconstructed chain of the parent
                 # session, never an omnigent-dispatched runner sub-agent.
+                from omnigent.server.routes import sessions as _sf
+
                 if runner_result is None:
                     # The child's pinned runner_id is stale — its runner was
                     # relaunched under a new id and only the parent was
@@ -3084,8 +3092,6 @@ def register_events_routes(
                     # parent hangs waiting for the child's inbox result. Heal
                     # the binding and re-deliver through the parent's live
                     # runner before failing.
-                    from omnigent.server.routes import sessions as _sf
-
                     recovered = await _sf._recover_subagent_status_forward_via_parent(
                         conv,
                         runner_router,
@@ -3095,6 +3101,14 @@ def register_events_routes(
                     )
                     if recovered is not None:
                         runner_result = recovered
+                elif outcome is not None and _subagent_delivery_not_confirmed(runner_result):
+                    # The child's live runner has no inbox for a parent bound elsewhere.
+                    # Only a confirmed outcome may go there: that runner cannot judge a bare idle.
+                    via_parent = await _sf._forward_subagent_status_to_parent_runner(
+                        conv, runner_router, conversation_store, forward_body
+                    )
+                    if via_parent is not None:
+                        runner_result = via_parent
                 _require_external_status_forward(
                     session_id,
                     status,
