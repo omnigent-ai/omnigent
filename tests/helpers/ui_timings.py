@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+# Set by the UI shard assigner so a sharded plan records how it was split.
+SHARD_PLAN: pytest.StashKey[dict[str, object]] = pytest.StashKey()
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--ui-timing-output", type=Path, help="Write per-phase JSONL timing records.")
@@ -59,21 +62,23 @@ class TimingRecorder:
 
     def pytest_collection_finish(self, session: pytest.Session) -> None:
         config = session.config
-        self.write(
-            {
-                "type": "plan",
-                "version": 1,
-                "splits": config.getoption("--splits", default=None),
-                "group": config.getoption("--group", default=None),
-                "worker": self.worker,
-                "nodeids": [item.nodeid for item in session.items],
-                "run_id": os.environ.get("GITHUB_RUN_ID"),
-                "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-                "commit": os.environ.get("GITHUB_SHA"),
-                "markexpr": config.option.markexpr,
-                "keyword": config.option.keyword,
-            }
-        )
+        record: dict[str, object] = {
+            "type": "plan",
+            "version": 1,
+            "splits": config.getoption("--splits", default=None),
+            "group": config.getoption("--group", default=None),
+            "worker": self.worker,
+            "nodeids": [item.nodeid for item in session.items],
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "commit": os.environ.get("GITHUB_SHA"),
+            "markexpr": config.option.markexpr,
+            "keyword": config.option.keyword,
+        }
+        sharding = config.stash.get(SHARD_PLAN, None)
+        if sharding is not None:
+            record["sharding"] = sharding
+        self.write(record)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         self.write(

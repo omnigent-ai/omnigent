@@ -1,13 +1,15 @@
 # UI timing artifacts
 
 Every UI CI shard uploads `e2e-ui-timings-<run>-<attempt>-shard<N>` with one or
-more `ui-timings*.jsonl` files, retained for 14 days. This only records measurements;
-the existing round-robin sharding, test selection, order, and retries stay the
-same. Timings are not used to schedule or exclude tests.
+more `ui-timings*.jsonl` files, retained for 14 days. A checked-in snapshot of
+these measurements, `durations.json`, balances the CI shards. Timings never
+exclude tests: every collected test belongs to exactly one shard.
 
 Each file contains:
 
 - A `plan` record with selected test IDs, shard, run/attempt/commit, and filters.
+  Sharded runs also record `sharding`: the algorithm, that shard's estimated
+  seconds, and how many collected tests had no snapshot entry.
 - A `phase` record for every reported setup, call, and teardown, including
   outcome, duration in seconds, and retry attempt (zero-based).
 - A `finish` record with pytest's exit status, when pytest finishes normally.
@@ -38,7 +40,7 @@ To verify, open the PR's **E2E UI Tests** workflow and check that each shard has
 an uploaded timing artifact. In a downloaded file, check that every selected
 ID has phase records and that the final record reports exit status 0 for a
 successful nonempty shard. Compare total setup/call/teardown time across
-shards and investigate retries separately before choosing scheduling changes.
+shards and investigate retries separately before refreshing the snapshot.
 
 To record timings locally:
 
@@ -46,3 +48,30 @@ To record timings locally:
 uv run --no-sync pytest tests/e2e_ui -k TEST_NAME \
   --ui-timing-output=/tmp/ui-timings.jsonl
 ```
+
+## Scheduling
+
+`--splits` and `--group` place the longest estimated tests on the least-loaded
+shard, then keep collection order inside the shard. Ties are deterministic.
+Assignment happens after marker and keyword filtering. Unsharded runs do not
+read the snapshot. A missing or malformed snapshot fails a sharded run.
+
+Tests absent from the snapshot use its median duration. Entries for tests that
+were not collected are ignored, so a stale snapshot cannot add or drop a test.
+
+Same-repo CI runs two pytest-xdist workers per shard (`E2E_UI_PARALLELISM`,
+`--dist=loadscope`). Fork PRs leave that variable unset and run each shard
+serially. The snapshot balances the sum of test time and does not change how
+many workers a shard starts.
+
+Refresh from several complete successful runs:
+
+```sh
+python -m tests.e2e_ui.update_durations /tmp/ui-run-a /tmp/ui-run-b
+```
+
+The updater sums setup, call, and teardown, takes the median, and skips skipped
+or retried tests. It combines the worker files from one shard. It rejects
+incomplete or failed runs, missing or duplicate shards, and overlapping plans.
+If the reference-policy check rejects a node id in the regenerated file, delete
+that entry. The test still runs, estimated at the median.
