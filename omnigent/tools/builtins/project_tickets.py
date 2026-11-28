@@ -163,24 +163,10 @@ _IDENTITY_PERSONA = Field(
 )
 
 
-_ROLE_OWNS = Field(
-    default=None,
-    max_length=12,
-    description="What the role owns and is accountable for, one short item each.",
-)
-_ROLE_DOES_NOT_OWN = Field(
-    default=None,
-    max_length=12,
-    description="What the role leaves to others, one short item each.",
-)
-
-
 class CreateIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = _IDENTITY_NAME
     instructions: str = _IDENTITY_PERSONA
-    owns: list[str] | None = _ROLE_OWNS
-    does_not_own: list[str] | None = _ROLE_DOES_NOT_OWN
 
 
 class UpdateIdentity(BaseModel):
@@ -197,15 +183,11 @@ class UpdateIdentity(BaseModel):
         max_length=PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
         description="The complete replacement persona.",
     )
-    owns: list[str] | None = _ROLE_OWNS
-    does_not_own: list[str] | None = _ROLE_DOES_NOT_OWN
 
     @model_validator(mode="after")
     def _has_change(self) -> "UpdateIdentity":
-        if all(
-            value is None for value in (self.name, self.instructions, self.owns, self.does_not_own)
-        ):
-            raise ValueError("Give a new name, instructions or scope")
+        if self.name is None and self.instructions is None:
+            raise ValueError("Give a new name or instructions")
         return self
 
 
@@ -527,7 +509,7 @@ class SysProjectIdentityCreateTool(_TicketTool):
         "persona, teammate or team member, use this, not sys_session_create or a sub-agent; "
         "if it's unclear whether they want a lasting role or a one-off helper, ask first. "
         "Also create one when a recurring workstream needs an owner. Give it a clear name and "
-        "complete persona text, and fill in what it owns and doesn't own. "
+        "complete persona text. "
         "It takes effect at once and appears in the project's Team dialog; tell the user "
         "what you created. Check "
         "sys_project_identity_list first and reuse a suitable role. Names are unique and 'Lead' "

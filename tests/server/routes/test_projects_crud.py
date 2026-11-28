@@ -1758,10 +1758,11 @@ async def test_only_the_owner_lists_other_projects_that_may_read_the_board(
     assert "board_readers" not in revoked.json()["config"]
 
 
-async def test_a_role_has_an_editable_owns_and_does_not_own_scope(
+async def test_a_role_keeps_a_stored_scope_its_session_never_sees(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """Scope is trimmed, edited as two lists, shown to the role's session and clearable."""
+    """Scope is still stored, trimmed, edited as two lists and clearable through the API,
+    but no longer reaches the role's session."""
     created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
     identities = f"/v1/projects/{created['id']}/identities"
     designer = (
@@ -1780,9 +1781,9 @@ async def test_a_role_has_an_editable_owns_and_does_not_own_scope(
         f"/v1/sessions/{designer['active_session_id']}",
         params={"include_project_mandate": "true"},
     )
-    assert snapshot.json()["project_identity"]["scope"] == (
-        "Owns: visual design; UX reviews\nDoesn't own: roadmap"
-    )
+    identity = snapshot.json()["project_identity"]
+    assert identity["instructions"] == "Design."
+    assert "scope" not in identity
 
     path = f"{identities}/{designer['id']}"
     edited = await project_client.patch(path, json={"scope": {"owns": ["icons"]}})

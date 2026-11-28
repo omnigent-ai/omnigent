@@ -371,17 +371,14 @@ async def test_an_unreadable_snapshot_skips_the_update_notice_not_the_turn():
         assert await project_instructions_update(client, "flaky") is None
 
 
-def test_project_identity_block_carries_the_role_scope() -> None:
+def test_project_identity_block_leaves_out_the_role_scope() -> None:
     from omnigent.runner.project_orchestrator import project_identity_instruction
 
+    # An older server may still send a scope; the role's instructions never carry it.
     block = project_identity_instruction(
         {"name": "Designer", "instructions": "Design.", "scope": "Owns: UX\nDoesn't own: roadmap"}
     )
     assert block is not None
-    assert (
-        "<project_identity_scope>\nOwns: UX\nDoesn't own: roadmap\n</project_identity_scope>"
-        in block
-    )
-    assert "<project_identity_scope>" not in (
-        project_identity_instruction({"name": "PM", "instructions": "Plan."}) or ""
-    )
+    assert "<project_identity_persona>\nDesign.\n</project_identity_persona>" in block
+    assert "<project_identity_scope>" not in block
+    assert "Owns: UX" not in block

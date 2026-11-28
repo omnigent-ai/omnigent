@@ -873,14 +873,55 @@ async def test_file_view_rejects_other_paths_and_workspace_escapes(tmp_path):
     assert all(path == f"/v1/sessions/{SOURCE}" for _, path, _ in seen)
 
 
-def test_scope_lists_fold_into_the_api_scope_and_keep_the_list_left_out() -> None:
-    from omnigent.runner.project_tickets import _with_scope
+async def test_identity_tools_no_longer_take_or_return_scope() -> None:
+    from omnigent.tools.builtins.project_tickets import CreateIdentity, UpdateIdentity
 
-    assert _with_scope({"name": "PM"}) == {"name": "PM"}
-    assert _with_scope({"owns": ["plans"]}) == {"scope": {"owns": ["plans"], "excludes": []}}
-    assert _with_scope(
-        {"does_not_own": ["code review"]}, {"owns": ["plans"], "excludes": ["old"]}
-    ) == {"scope": {"owns": ["plans"], "excludes": ["code review"]}}
+    for model in (CreateIdentity, UpdateIdentity):
+        assert {"owns", "does_not_own", "scope"}.isdisjoint(model.model_fields)
+    with pytest.raises(ValueError):
+        CreateIdentity(name="PM", instructions="Plan.", owns=["plans"])
+    with pytest.raises(ValueError, match="new name or instructions"):
+        UpdateIdentity(identity="PM")
+    assert "owns" not in TICKET_TOOLS["sys_project_identity_create"]().description()
+
+    stored_scope = {"owns": ["plans"], "excludes": []}
+    seen: list[tuple[str, str, dict | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body))
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        role = {
+            "id": "r1",
+            "name": "PM",
+            "instructions": "Plan.",
+            "builtin": False,
+            "scope": stored_scope,
+        }
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [role]})
+        return httpx.Response(200, json={**role, "instructions": "Plan more."})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        listed = json.loads(
+            await execute_ticket_tool("sys_project_identity_list", {}, client, SOURCE)
+        )
+        updated = json.loads(
+            await execute_ticket_tool(
+                "sys_project_identity_update",
+                {"identity": "PM", "instructions": "Plan more."},
+                client,
+                SOURCE,
+            )
+        )
+    assert "scope" not in listed["data"][0]
+    assert updated == {"identity": {"id": "r1", "name": "PM", "instructions": "Plan more."}}
+    # The edit sends no scope, so the stored one is left as it was.
+    patch = next(body for method, _, body in seen if method == "PATCH")
+    assert patch == {"instructions": "Plan more."}
 
 
 async def test_ticket_list_query_searches_and_keeps_the_match():

@@ -38,83 +38,56 @@ const BYTES_SHOWN_FROM = Math.floor(PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES * 0.
 interface IdentityDraft extends IdentitySessionChoice {
   name: string;
   instructions: string;
-  /** One scope item per line. */
-  owns: string;
-  excludes: string;
 }
 
 const EMPTY_DRAFT: IdentityDraft = {
   name: "",
   instructions: "",
-  owns: "",
-  excludes: "",
   agentId: "",
   model: "",
   effort: "",
 };
 
-/** Starting points for a new team member; each prefills its name, instructions and scope. */
-export const ROLE_TEMPLATES: readonly Pick<
-  IdentityDraft,
-  "name" | "instructions" | "owns" | "excludes"
->[] = [
+/** Starting points for a new team member; each prefills its name and instructions. */
+export const ROLE_TEMPLATES: readonly Pick<IdentityDraft, "name" | "instructions">[] = [
   {
     name: "Reviewer",
     instructions:
       "You are the code reviewer. Review each change for correctness, regressions and missing tests before it lands. Lead every comment with the exact commit you reviewed, separate blocking findings from suggestions, and approve only what you checked yourself.",
-    owns: "Code review\nApproving commits",
-    excludes: "Writing features\nProduct decisions",
   },
   {
     name: "Designer",
     instructions:
       "You are the product designer. Own how the product looks and feels: layouts, wording, states and accessibility. Turn requests into clear UI decisions, show before and after, and keep new screens consistent with the existing ones.",
-    owns: "Visual design\nUX copy\nAccessibility",
-    excludes: "Backend changes\nThe roadmap",
   },
   {
     name: "PM",
     instructions:
       "You are the product manager. Own scope, priorities and acceptance criteria. Turn requests into small, well-defined tickets with a clear done-when, keep the board ordered, and ask people for decisions only when they're really theirs to make. Write tickets, not code.",
-    owns: "Priorities\nTicket scope\nAcceptance criteria",
-    excludes: "Writing code\nCode review",
   },
   {
     name: "Engineer",
     instructions:
       "You are a software engineer. Take assigned tickets from plan to a tested, reviewable commit. Keep changes focused, run the relevant tests, and explain what changed and how you checked it when you hand off for review.",
-    owns: "Implementation\nTests for your changes",
-    excludes: "Approving your own work\nProduct decisions",
   },
 ];
 
-const TEMPLATE_FIELDS = ["name", "instructions", "owns", "excludes"] as const;
+const TEMPLATE_FIELDS = ["name", "instructions"] as const;
 
 /** Clears whatever a role template filled in, keeping the agent and model choice. */
 const BLANK_TEMPLATE: (typeof ROLE_TEMPLATES)[number] = {
   name: "",
   instructions: "",
-  owns: "",
-  excludes: "",
 };
 
 function draftOf(identity: ProjectIdentity): IdentityDraft {
   return {
     name: identity.name,
     instructions: identity.instructions,
-    owns: (identity.scope?.owns ?? []).join("\n"),
-    excludes: (identity.scope?.excludes ?? []).join("\n"),
     agentId: identity.agent_id ?? "",
     model: identity.model ?? "",
     effort: identity.effort ?? "",
   };
-}
-
-function scopeLines(text: string): string[] {
-  return text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
 }
 
 function inputOf(draft: IdentityDraft, builtin: boolean): ProjectIdentityInput {
@@ -124,14 +97,10 @@ function inputOf(draft: IdentityDraft, builtin: boolean): ProjectIdentityInput {
     model: draft.model.trim(),
     effort: draft.effort.trim(),
   };
-  // The Lead keeps its name and has no scope; its agent, model and effort are the
-  // project's defaults.
+  // The Lead keeps its name; its agent, model and effort are the project's defaults.
+  // Saves never send a scope, so any scope stored earlier is left as it was.
   if (builtin) return session;
-  return {
-    name: draft.name.trim(),
-    ...session,
-    scope: { owns: scopeLines(draft.owns), excludes: scopeLines(draft.excludes) },
-  };
+  return { name: draft.name.trim(), ...session };
 }
 
 /** Adds and edits the project's identities: named roles the user can talk to. */
@@ -424,34 +393,6 @@ export function ProjectTeamDialog({
                         </span>
                       )}
                     </label>
-                    {!isLead && (
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <label className="flex flex-col gap-1 text-sm">
-                          Owns
-                          <Textarea
-                            data-testid="project-team-owns"
-                            value={draft.owns}
-                            placeholder={"One per line, e.g.\nVisual design\nUX reviews"}
-                            className="min-h-20 text-sm"
-                            onChange={(event) => setDraft({ ...draft, owns: event.target.value })}
-                            disabled={busy}
-                          />
-                        </label>
-                        <label className="flex flex-col gap-1 text-sm">
-                          Doesn&apos;t own
-                          <Textarea
-                            data-testid="project-team-excludes"
-                            value={draft.excludes}
-                            placeholder={"One per line, e.g.\nThe roadmap\nCode review"}
-                            className="min-h-20 text-sm"
-                            onChange={(event) =>
-                              setDraft({ ...draft, excludes: event.target.value })
-                            }
-                            disabled={busy}
-                          />
-                        </label>
-                      </div>
-                    )}
                     {/* Keyed by member so each starts collapsed. */}
                     <Collapsible
                       key={selected ?? "new"}

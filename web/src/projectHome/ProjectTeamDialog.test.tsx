@@ -62,17 +62,18 @@ describe("ProjectTeamDialog", () => {
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(screen.getByTestId("project-team-persona")).toHaveValue(designer.instructions);
-    expect(screen.getByTestId("project-team-owns")).toHaveValue(designer.owns);
+    // A team member has no Owns / Doesn't own fields.
+    expect(screen.queryByText("Owns")).toBeNull();
+    expect(screen.queryByText("Doesn't own")).toBeNull();
     fireEvent.click(screen.getByTestId("project-team-save"));
     await waitFor(() =>
       expect(projectsApi.createProjectIdentity).toHaveBeenCalledWith(
         "project",
-        expect.objectContaining({
-          name: "Designer",
-          instructions: designer.instructions,
-          scope: { owns: designer.owns.split("\n"), excludes: designer.excludes.split("\n") },
-        }),
+        expect.objectContaining({ name: "Designer", instructions: designer.instructions }),
       ),
+    );
+    expect(vi.mocked(projectsApi.createProjectIdentity).mock.calls[0][1]).not.toHaveProperty(
+      "scope",
     );
     expect(screen.queryByRole("group", { name: "Start from a role (optional)" })).toBeNull();
   });
@@ -92,7 +93,7 @@ describe("ProjectTeamDialog", () => {
     expect(reviewer).toHaveAttribute("aria-pressed", "true");
     expect(blank).toHaveAttribute("aria-pressed", "false");
     fireEvent.click(blank);
-    for (const field of ["name", "persona", "owns", "excludes"]) {
+    for (const field of ["name", "persona"]) {
       expect(screen.getByTestId(`project-team-${field}`)).toHaveValue("");
     }
     expect(blank).toHaveAttribute("aria-pressed", "true");
@@ -203,5 +204,42 @@ describe("ProjectTeamDialog", () => {
     );
     expect(persona).toHaveAttribute("aria-invalid", "true");
     expect(screen.getByTestId("project-team-save")).toBeDisabled();
+  });
+
+  it("saves an edit without touching a role's stored scope", async () => {
+    identities.extra = [
+      {
+        id: "planner",
+        name: "Planner",
+        builtin: false,
+        instructions: "Own scope.",
+        scope: { owns: ["plans"], excludes: ["code"] },
+      },
+    ];
+    vi.mocked(projectsApi.updateProjectIdentity).mockResolvedValue({
+      id: "planner",
+      name: "Planner",
+      builtin: false,
+      instructions: "Own plans.",
+    } as projectsApi.ProjectIdentity);
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={new QueryClient()}>
+          <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(
+      within(screen.getByRole("navigation", { name: "Team members" })).getByText("Planner"),
+    );
+    expect(screen.queryByText("plans")).toBeNull();
+    fireEvent.change(screen.getByTestId("project-team-persona"), {
+      target: { value: "Own plans." },
+    });
+    fireEvent.click(screen.getByTestId("project-team-save"));
+    await waitFor(() => expect(projectsApi.updateProjectIdentity).toHaveBeenCalled());
+    const [, , input] = vi.mocked(projectsApi.updateProjectIdentity).mock.calls[0];
+    expect(input).toMatchObject({ name: "Planner", instructions: "Own plans." });
+    expect(input).not.toHaveProperty("scope");
   });
 });

@@ -377,31 +377,14 @@ def _role_summary(role: dict[str, Any]) -> dict[str, Any]:
         "id": role["id"],
         "name": role["name"],
         "instructions": role.get("instructions", ""),
-        "scope": role.get("scope"),
         "created_by": "agent" if role.get("created_by_session_id") else "owner",
         "session_id": role.get("active_session_id"),
         "session_state": role.get("active_session_state"),
     }
 
 
-def _with_scope(body: dict[str, Any], current: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Fold the tools' ``owns``/``does_not_own`` lists into the API's ``scope``.
-
-    A list left out keeps its *current* items, so updating one doesn't erase the other.
-    """
-    owns, excludes = body.pop("owns", None), body.pop("does_not_own", None)
-    if owns is not None or excludes is not None:
-        current = current or {}
-        body["scope"] = {
-            "owns": owns if owns is not None else current.get("owns") or [],
-            "excludes": excludes if excludes is not None else current.get("excludes") or [],
-        }
-    return body
-
-
 async def _create_identity(body: dict[str, Any], project_id: str, request: Any) -> str:
     """Create a role, or return the same-named one so retries and rollovers never duplicate."""
-    body = _with_scope(body)
     base = f"/v1/projects/{project_id}/identities"
     try:
         created = await request("POST", base, json=body)
@@ -484,10 +467,9 @@ async def _update_identity(body: dict[str, Any], project_id: str, request: Any) 
     identity, error = await _resolve_identity(body.pop("identity"), base, request)
     if identity is None:
         return error
-    body = _with_scope(body, identity.get("scope"))
     updated = await request("PATCH", f"{base}/{identity['id']}", json=body)
     return json.dumps(
-        {"identity": {key: updated.get(key) for key in ("id", "name", "instructions", "scope")}},
+        {"identity": {key: updated.get(key) for key in ("id", "name", "instructions")}},
         ensure_ascii=False,
     )
 

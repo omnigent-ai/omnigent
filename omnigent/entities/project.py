@@ -143,18 +143,6 @@ ROLE_SCOPE_ITEM_MAX_CHARS = 200
 PROJECT_IDENTITY_SCOPE_MAX_BYTES = 16383
 
 
-def role_scope_text(scope: dict[str, list[str]] | None) -> str:
-    """A role's scope as two short lines for its session, or ``""`` when it has none."""
-    if not scope:
-        return ""
-    lines = []
-    if scope.get("owns"):
-        lines.append("Owns: " + "; ".join(scope["owns"]))
-    if scope.get("excludes"):
-        lines.append("Doesn't own: " + "; ".join(scope["excludes"]))
-    return "\n".join(lines)
-
-
 @dataclass
 class ProjectIdentity:
     """

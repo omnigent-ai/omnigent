@@ -387,8 +387,6 @@ export interface ProjectIdentity {
   name: string;
   builtin: boolean;
   instructions: string;
-  /** What the role owns and leaves to others; absent or `null` when it has none. */
-  scope?: ProjectRoleScope | null;
   agent_id: string | null;
   model: string | null;
   effort: string | null;
@@ -402,17 +400,10 @@ export interface ProjectIdentity {
   router?: boolean;
 }
 
-/** A role's scope; two empty lists clear it. */
-export interface ProjectRoleScope {
-  owns: string[];
-  excludes: string[];
-}
-
 /** Fields an owner edits; an empty string clears `agent_id`, `model` or `effort`. */
 export interface ProjectIdentityInput {
   name?: string;
   instructions?: string;
-  scope?: ProjectRoleScope;
   agent_id?: string;
   model?: string;
   effort?: string;
