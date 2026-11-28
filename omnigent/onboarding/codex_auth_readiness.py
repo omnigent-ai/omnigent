@@ -41,21 +41,29 @@ def load_codex_config(config_path: Path) -> dict[str, object] | None:
         return None
 
 
-def effective_codex_model_provider(config: dict[str, object]) -> str | None:
-    """Resolve Codex's effective provider (active profile before top-level)."""
-    provider_id: object = config.get("model_provider")
+def _effective_codex_setting(config: dict[str, object], key: str) -> str | None:
+    """Resolve a Codex setting the active ``profile`` may override (profile before top-level)."""
+    value: object = config.get(key)
     active_profile = config.get("profile")
     if isinstance(active_profile, str) and active_profile.strip():
         profiles = config.get("profiles")
         if isinstance(profiles, dict):
             profile_table = profiles.get(active_profile)
-            if isinstance(profile_table, dict) and isinstance(
-                profile_table.get("model_provider"), str
-            ):
-                provider_id = profile_table["model_provider"]
-    if isinstance(provider_id, str) and provider_id.strip():
-        return provider_id
+            if isinstance(profile_table, dict) and isinstance(profile_table.get(key), str):
+                value = profile_table[key]
+    if isinstance(value, str) and value.strip():
+        return value
     return None
+
+
+def effective_codex_model_provider(config: dict[str, object]) -> str | None:
+    """Resolve Codex's effective provider (active profile before top-level)."""
+    return _effective_codex_setting(config, "model_provider")
+
+
+def effective_codex_model(config: dict[str, object]) -> str | None:
+    """Resolve Codex's effective model (active profile before top-level)."""
+    return _effective_codex_setting(config, "model")
 
 
 def effective_custom_provider_table(
