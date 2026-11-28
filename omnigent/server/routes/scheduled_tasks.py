@@ -2502,6 +2502,7 @@ def create_scheduled_tasks_router(
         load_owned_task=_load_owned_by_caller,
         conversation_store=conversation_store,
         permission_store=permission_store,
+        auth_provider=auth_provider,
     )
 
     # Agent timers are a session primitive, so the per-request automations gate
