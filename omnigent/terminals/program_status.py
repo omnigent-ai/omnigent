@@ -388,7 +388,16 @@ def relay(path: Path, app: str, command: list[str]) -> int:
                 os.killpg(pid, signal.SIGKILL)
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGKILL)
-            _, exit_status = os.waitpid(pid, 0)
+            # A child wedged in exit never becomes reapable; give up rather than block forever.
+            deadline = time.monotonic() + 2
+            while exit_status is None and time.monotonic() < deadline:
+                child, result = os.waitpid(pid, os.WNOHANG)
+                if child:
+                    exit_status = result
+                else:
+                    time.sleep(0.05)
+            if exit_status is None:
+                exit_status = signal.SIGKILL  # wait status meaning "killed by SIGKILL"
         os.close(master)
         with contextlib.suppress(OSError, termios.error):
             termios.tcsetattr(0, termios.TCSANOW, original)
