@@ -74,16 +74,27 @@ _Facet = TypeVar("_Facet", bound=type)
 
 
 def _for_reference_host(method: Callable[..., Any]) -> Callable[..., Any]:
-    """Run *method* with its ``reference``'s host as the target of its ``gh`` calls."""
+    """Run *method* with its ``reference``'s host as the scope of its ``gh`` calls.
+
+    A step with no reference reads the workspace's own pull request, so its scope is the
+    checkout's GitHub host, read when a call needs it; with none, the call is refused.
+    """
     parameters = list(inspect.signature(method).parameters)
-    position = parameters.index("reference")
+    position = parameters.index("reference") if "reference" in parameters else None
 
     @functools.wraps(method)
     def step(*args: Any, **kwargs: Any) -> Any:
         from omnigent.runner import github_resource
 
-        reference = kwargs["reference"] if "reference" in kwargs else args[position]
-        host = reference.host if isinstance(reference, PullRequestRef) else None
+        if "reference" in kwargs:
+            reference = kwargs["reference"]
+        else:
+            reference = args[position] if position is not None and position < len(args) else None
+        host = (
+            reference.host
+            if isinstance(reference, PullRequestRef)
+            else github_resource.CHECKOUT_SCOPE
+        )
         with github_resource.gh_target_host_scope(host):
             return method(*args, **kwargs)
 
@@ -91,12 +102,12 @@ def _for_reference_host(method: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _scoped_to_reference_hosts(facet: _Facet) -> _Facet:
-    """Wrap each public step that takes a ``reference`` with :func:`_for_reference_host`."""
+    """Wrap each public step that takes a ``root`` with :func:`_for_reference_host`."""
     for name, value in list(vars(facet).items()):
         if (
             not name.startswith("_")
             and inspect.isfunction(value)
-            and "reference" in inspect.signature(value).parameters
+            and "root" in inspect.signature(value).parameters
         ):
             setattr(facet, name, _for_reference_host(value))
     return facet

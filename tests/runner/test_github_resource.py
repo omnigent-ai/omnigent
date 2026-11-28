@@ -131,9 +131,10 @@ def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
 ) -> None:
     monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
 
-    github_resource._gh(["api", "user"], cwd="/workspace", timeout=90.0)
-    with github_resource._gh_deadline_scope(0.0):
-        late = github_resource._gh(["api", "user"], cwd="/workspace")
+    with github_resource.gh_target_host_scope("github.com"):
+        github_resource._gh(["api", "user"], cwd="/workspace", timeout=90.0)
+        with github_resource._gh_deadline_scope(0.0):
+            late = github_resource._gh(["api", "user"], cwd="/workspace")
 
     assert late == (None, "", "gh deadline exceeded")
     assert gh_starts == [
@@ -151,20 +152,22 @@ def test_concurrent_steps_keep_their_own_target_host(
     hosts_by_thread: dict[str, list[str | None]] = {}
     both_scoped = threading.Barrier(2, timeout=budget(10))
 
-    def recording(argv: list[str], *, token: str | None, host: str | None):
-        invocation = built(argv, token=token, host=host)
+    def recording(argv: list[str], *, token: str | None, host: str | None, cwd: str | None):
+        invocation = built(argv, token=token, host=host, cwd=cwd)
         hosts_by_thread.setdefault(threading.current_thread().name, []).append(invocation.host)
         return invocation
 
     monkeypatch.setattr(github_resource, "_gh_invocation", recording)
 
     def step(host: str) -> None:
+        argv = ["api", "--hostname", host.lower(), "user"]
         with github_resource.gh_target_host_scope(host):
             both_scoped.wait()
-            github_resource._gh(["api", "user"], cwd="/workspace")
+            github_resource._gh(argv, cwd="/workspace")
             both_scoped.wait()
-            github_resource._gh(["api", "user"], cwd="/workspace")
-        github_resource._gh(["api", "user"], cwd="/workspace")
+            github_resource._gh(argv, cwd="/workspace")
+        # Outside its scope, the same call is refused before it starts.
+        github_resource._gh(argv, cwd="/workspace")
 
     threads = [
         threading.Thread(target=step, args=(host,), name=name)
@@ -176,10 +179,12 @@ def test_concurrent_steps_keep_their_own_target_host(
         thread.join(budget(10))
 
     assert hosts_by_thread == {
-        "first": ["one.example.test", "one.example.test", None],
-        "second": ["two.example.test", "two.example.test", None],
+        "first": ["one.example.test", "one.example.test"],
+        "second": ["two.example.test", "two.example.test"],
     }
-    assert [start["argv"] for start in gh_starts] == [["gh", "api", "user"]] * 6
+    assert sorted(start["argv"][3] for start in gh_starts) == sorted(
+        ["one.example.test", "two.example.test"] * 2
+    )
 
 
 def test_the_github_facet_targets_each_steps_reference_host(
@@ -213,10 +218,17 @@ def test_the_github_facet_targets_each_steps_reference_host(
         and "reference" in inspect.signature(value).parameters
     }
 
-    assert seen == ["github.com", "ghe.example.test", None]
+    assert seen == ["github.com", "ghe.example.test", github_resource.CHECKOUT_SCOPE]
     assert github_resource._gh_target_host.get() is None
-    assert scoped == takes_reference
-    assert "reference_info" in scoped and "workspace_info" not in scoped
+    takes_root = {
+        name
+        for name, value in vars(type(facet)).items()
+        if not name.startswith("_")
+        and callable(value)
+        and "root" in inspect.signature(value).parameters
+    }
+    assert takes_reference <= scoped == takes_root
+    assert {"reference_info", "workspace_info"} <= scoped
 
 
 def _git_env() -> dict[str, str]:
@@ -1996,7 +2008,8 @@ def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> Non
         return 0, "", ""
 
     monkeypatch.setattr(github_resource, "_run", fake_run)
-    github_resource._gh(["api", "user"], cwd="/tmp")
+    with github_resource.gh_target_host_scope("github.com"):
+        github_resource._gh(["api", "user"], cwd="/tmp")
     assert captured["argv"] == ["gh", "api", "user"]
     env = captured["env"]
     assert isinstance(env, dict)
@@ -2015,7 +2028,8 @@ def test_gh_inherits_env_outside_sandbox(monkeypatch: pytest.MonkeyPatch) -> Non
         return 0, "", ""
 
     monkeypatch.setattr(github_resource, "_run", fake_run)
-    github_resource._gh(["pr", "diff"], cwd="/tmp")
+    with github_resource.gh_target_host_scope("github.com"):
+        github_resource._gh(["pr", "diff", "1", "-R", "github.com/o/r"], cwd="/tmp")
     assert captured["env"] is None
 
 
@@ -2031,7 +2045,10 @@ def test_gh_applies_account_token(monkeypatch: pytest.MonkeyPatch) -> None:
         return 0, "", ""
 
     monkeypatch.setattr(github_resource, "_run", fake_run)
-    github_resource._gh(["pr", "view"], cwd="/tmp", token="chosen-tok")
+    with github_resource.gh_target_host_scope("github.com"):
+        github_resource._gh(
+            ["pr", "view", "1", "-R", "github.com/o/r"], cwd="/tmp", token="chosen-tok"
+        )
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["GH_TOKEN"] == "chosen-tok"

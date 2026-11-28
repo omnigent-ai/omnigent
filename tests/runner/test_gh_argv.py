@@ -74,7 +74,8 @@ OTHER = "other.example.com"
         (["repo", "view", "--json", "nameWithOwner,url"], None, True),
         (["repo", "set-default", "--view"], None, True),
         (["repo", "set-default", "origin"], None, True),
-        (["repo", "set-default", "o/r"], None, False),
+        # set-default matches OWNER/REPO against the checkout's remotes.
+        (["repo", "set-default", "o/r"], None, True),
         (["pr", "view", "7", "-R", f"{HOST}/o/r", "--json", "number"], HOST, False),
         (["pr", "view", "7", f"-R{HOST}/o/r"], HOST, False),
         (["pr", "view", "7", f"--repo={HOST}/o/r"], HOST, False),

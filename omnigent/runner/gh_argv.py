@@ -256,4 +256,7 @@ def classify(argv: list[str]) -> GhTarget:
     host = next(iter(hosts), None)
     if host is None and spec.checkout and not named_repository:
         from_checkout = True
+    if host is None and command == ("repo", "set-default"):
+        # set-default matches OWNER/REPO against the checkout's remotes.
+        from_checkout = True
     return GhTarget(command=command, host=host, from_checkout=from_checkout and host is None)

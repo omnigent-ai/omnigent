@@ -224,33 +224,88 @@ def gh_target_host_scope(host: str | None) -> Iterator[None]:
 
     The value is per context, so concurrent steps in other threads keep their own.
     """
-    token = _gh_target_host.set(host.lower() if host else None)
+    token = _gh_target_host.set(host if host == CHECKOUT_SCOPE else host.lower() if host else None)
     try:
         yield
     finally:
         _gh_target_host.reset(token)
 
 
-def _gate(argv: list[str], scope: str | None) -> gh_argv.GhTarget:
+def _default_github_host() -> str:
+    """Where ``gh`` sends a call that names no host and reads no checkout."""
+    return (os.environ.get("GH_HOST") or "").strip().lower() or "github.com"
+
+
+def checkout_github_host(root: str) -> str | None:
+    """The GitHub host ``gh`` reads the checkout's pull requests from, if it's just one.
+
+    ``gh`` picks among the remotes on hosts it knows: the one ``repo set-default`` marked,
+    else by its own order. Remotes on more than one such host have no single answer here.
+    """
+    rc, out, _ = _git(["remote"], cwd=root)
+    if rc != 0:
+        return None
+    hosts: set[str] = set()
+    resolved: set[str] = set()
+    for name in out.split():
+        # ``get-url`` applies ``insteadOf``, as git and gh do.
+        rc, url, _ = _git(["remote", "get-url", name], cwd=root)
+        host = host_of(url.strip()) if rc == 0 else None
+        if not host or not _known_github_host(host):
+            continue
+        hosts.add(host)
+        rc, marked, _ = _git(["config", "--get", f"remote.{name}.gh-resolved"], cwd=root)
+        if rc == 0 and marked.strip():
+            resolved.add(host)
+    for candidates in (resolved, hosts):
+        if len(candidates) == 1:
+            return next(iter(candidates))
+    return None
+
+
+# The scope of a step on the workspace's own pull request: the checkout's GitHub host,
+# read from the remotes where gh runs, and only when a gh call needs it.
+CHECKOUT_SCOPE = "<checkout>"
+
+
+def _gate(argv: list[str], scope: str | None, cwd: str | None) -> gh_argv.GhTarget:
     """The host ``argv`` sends to, checked before ``gh`` starts.
 
-    A host the argv names must be the call's scope, and the scope a host the user set up
-    for GitHub: a pull request URL can name any host, and ``gh`` would send it a token.
+    Every call runs in a host scope, on a host the user set up for GitHub: a pull request
+    URL can name any host, and ``gh`` would send it a token. The host the call goes to must
+    be the scope's, whether the argv names it, ``gh`` reads it from the checkout's remotes,
+    or it's ``GH_HOST`` or github.com. A sign-in listing checks each host as itself.
 
     :raises gh_argv.GhArgvRefused: For a call that mustn't run.
     """
     target = gh_argv.classify(argv)
-    if scope is not None and not _known_github_host(scope):
-        raise gh_argv.GhArgvRefused(f"{scope} isn't a host set up for GitHub")
-    if target.host is not None:
+    if scope is None:
+        raise gh_argv.GhArgvRefused("A gh call runs outside a host scope")
+    listing = target.host is None and target.command == ("auth", "status")
+    if scope == CHECKOUT_SCOPE and not listing:
+        scope = checkout_github_host(cwd) if cwd else None
         if scope is None:
-            raise gh_argv.GhArgvRefused(f"A gh call names {target.host} outside a host scope")
-        if target.host != scope:
-            raise gh_argv.GhArgvRefused(f"A gh call for {scope} names {target.host}")
+            raise gh_argv.GhArgvRefused("The checkout has no single GitHub host to read")
+    if scope != CHECKOUT_SCOPE and not _known_github_host(scope):
+        raise gh_argv.GhArgvRefused(f"{scope} isn't a host set up for GitHub")
+    if listing:
+        return target
+    if target.host is not None:
+        goes_to = target.host
+    elif target.from_checkout:
+        goes_to = checkout_github_host(cwd) if cwd else None
+    else:
+        goes_to = _default_github_host()
+    if goes_to != scope:
+        raise gh_argv.GhArgvRefused(
+            f"A gh call for {scope} goes to {goes_to or 'no single GitHub host'}"
+        )
     return target
 
 
-def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> GhInvocation:
+def _gh_invocation(
+    argv: list[str], *, token: str | None, host: str | None, cwd: str | None = None
+) -> GhInvocation:
     """Return the command and environment that run ``gh`` with *argv*.
 
     Every ``gh`` call the panel makes starts through here.
@@ -259,9 +314,10 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
     :param token: A GitHub token to run this one call as a chosen account, or ``None``.
     :param host: The code host the call is for, from :func:`gh_target_host_scope`, or
         ``None`` outside one.
+    :param cwd: Where ``gh`` runs, whose remotes it reads when the argv names no host.
     :raises gh_argv.GhArgvRefused: When the gate refuses the call; see :func:`_gate`.
     """
-    _gate(argv, host)
+    _gate(argv, host, cwd)
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -308,7 +364,7 @@ def _gh(
             return None, "", "gh deadline exceeded"
     scope = _gh_target_host.get()
     try:
-        invocation = _gh_invocation(argv, token=token, host=scope)
+        invocation = _gh_invocation(argv, token=token, host=scope, cwd=cwd)
     except gh_argv.GhArgvRefused as exc:
         # The reason names hosts and the command, never a token.
         _logger.warning("gh call refused before it started: %s", exc)
@@ -401,6 +457,11 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     when at least one account validates (``state == "success"``). Falls back to a
     plain ``gh auth status`` for the boolean on an older ``gh`` without ``--json``.
     """
+    with _own_scope(_default_github_host()):
+        return _listed_accounts(root)
+
+
+def _listed_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     _, out, _ = _gh(["auth", "status", "--json", "hosts"], cwd=root)
     try:
         data = json.loads(out)

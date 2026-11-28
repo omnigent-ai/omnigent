@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -24,10 +25,16 @@ RUNNER = Path(github_resource.__file__).parent
 
 @pytest.fixture
 def started(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Record the argv of each process ``_gh`` starts; two hosts are set up for GitHub."""
-    starts: list[list[str]] = []
+    """Record the argv of each ``gh`` process ``_gh`` starts; two hosts are set up for GitHub.
 
-    def run(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+    git still runs, so a test's checkout has real remotes.
+    """
+    starts: list[list[str]] = []
+    real_run = github_resource._run
+
+    def run(argv: list[str], **kwargs: object) -> tuple[int | None, str, str]:
+        if argv[0] == "git":
+            return real_run(argv, **kwargs)  # type: ignore[arg-type]
         starts.append(argv)
         if argv[1:4] == ["auth", "status", "--json"]:
             hosts = {
@@ -87,7 +94,6 @@ def test_a_refused_call_starts_no_process(
         ["pr", "view", "1", "-R", f"{KNOWN}/o/r"],
         ["api", "-X", "POST", f"https://{KNOWN}/api/uploads/user-attachments/assets"],
         ["auth", "status", "--json", "hosts"],
-        ["api", "repos/o/r/commits/abc/pulls"],
     ],
 )
 def test_a_call_naming_its_scopes_known_host_or_none_runs(
@@ -247,3 +253,121 @@ def test_a_pull_request_on_a_host_never_set_up_runs_no_gh_at_all(
         assert result is None
 
     assert started == []
+
+
+def _checkout(path: Path, remotes: dict[str, str], *, config: dict[str, str] | None = None) -> str:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    for name, url in remotes.items():
+        subprocess.run(["git", "-C", str(path), "remote", "add", name, url], check=True)
+    for key, value in (config or {}).items():
+        subprocess.run(["git", "-C", str(path), "config", key, value], check=True)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["api", "--hostname", KNOWN, "x"],
+        ["api", "x"],
+        ["auth", "status", "--json", "hosts"],
+        ["auth", "token"],
+        ["pr", "view", "--json", "number"],
+    ],
+)
+def test_nothing_reaches_gh_without_a_scope(started: list[list[str]], argv: list[str]) -> None:
+    rc, _, err = github_resource._gh(argv, cwd="/workspace")
+
+    assert (rc, started) == (1, [])
+    assert "outside a host scope" in err
+
+
+def test_a_call_naming_no_host_goes_to_gh_host_or_github_com_which_must_be_the_scope(
+    started: list[list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with github_resource.gh_target_host_scope(KNOWN):
+        github_resource._gh(["api", "repos/o/r/commits/abc/pulls"], cwd="/workspace")
+    with github_resource.gh_target_host_scope("github.com"):
+        github_resource._gh(["api", "repos/o/r/commits/abc/pulls"], cwd="/workspace")
+    assert started == [["gh", "api", "repos/o/r/commits/abc/pulls"]]
+
+    started.clear()
+    monkeypatch.setenv("GH_HOST", KNOWN)
+    with github_resource.gh_target_host_scope(KNOWN):
+        github_resource._gh(["api", "repos/o/r/commits/abc/pulls"], cwd="/workspace")
+    with github_resource.gh_target_host_scope("github.com"):
+        github_resource._gh(["api", "repos/o/r/commits/abc/pulls"], cwd="/workspace")
+    assert started == [["gh", "api", "repos/o/r/commits/abc/pulls"]]
+
+
+@pytest.mark.parametrize(
+    ("remotes", "config", "host"),
+    [
+        ({"origin": f"https://{KNOWN}/o/r.git"}, {}, KNOWN),
+        ({"origin": f"git@{KNOWN}:o/r.git"}, {}, KNOWN),
+        ({"origin": "https://github.com/o/r.git"}, {}, "github.com"),
+        # A remote on a host never set up isn't one gh would pick, and counts for nothing.
+        ({"origin": f"https://{KNOWN}/o/r.git", "other": f"https://{UNKNOWN}/o/r.git"}, {}, KNOWN),
+        ({"origin": f"https://{UNKNOWN}/o/r.git"}, {}, None),
+        # Two set-up hosts are ambiguous unless set-default marked one.
+        (
+            {"origin": "https://github.com/o/r.git", "upstream": f"https://{KNOWN}/o/r.git"},
+            {},
+            None,
+        ),
+        (
+            {"origin": "https://github.com/o/r.git", "upstream": f"https://{KNOWN}/o/r.git"},
+            {"remote.upstream.gh-resolved": "base"},
+            KNOWN,
+        ),
+        # insteadOf rewrites the URL gh reads.
+        ({"origin": "corp:o/r"}, {f"url.https://{UNKNOWN}/.insteadOf": "corp:"}, None),
+        ({"origin": "corp:o/r"}, {f"url.https://{KNOWN}/.insteadOf": "corp:"}, KNOWN),
+        ({}, {}, None),
+    ],
+)
+def test_the_checkouts_github_host_is_the_one_known_host_its_remotes_name(
+    started: list[list[str]],
+    tmp_path: Path,
+    remotes: dict[str, str],
+    config: dict[str, str],
+    host: str | None,
+) -> None:
+    assert (
+        github_resource.checkout_github_host(_checkout(tmp_path, remotes, config=config)) == host
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "view", "--json", "number"],
+        ["pr", "diff", "7"],
+        ["repo", "view", "--json", "nameWithOwner,url"],
+        ["repo", "set-default", "--view"],
+        ["repo", "set-default", "origin"],
+        ["repo", "set-default", "o/r"],
+        ["api", "repos/{owner}/{repo}/pulls/7/files?per_page=100&page=1"],
+    ],
+)
+def test_a_call_gh_aims_at_the_checkout_runs_only_where_the_checkouts_host_is_the_scope(
+    started: list[list[str]], tmp_path: Path, argv: list[str]
+) -> None:
+    root = _checkout(tmp_path, {"origin": f"https://{KNOWN}/o/r.git"})
+
+    for scope in (github_resource.CHECKOUT_SCOPE, KNOWN, OTHER_KNOWN, "github.com"):
+        with github_resource.gh_target_host_scope(scope):
+            github_resource._gh(argv, cwd=root)
+
+    assert started == [["gh", *argv]] * 2
+
+
+def test_a_checkout_with_no_single_github_host_runs_nothing_but_the_sign_in_listing(
+    started: list[list[str]], tmp_path: Path
+) -> None:
+    root = _checkout(tmp_path, {"origin": f"https://{UNKNOWN}/o/r.git"})
+
+    with github_resource.gh_target_host_scope(github_resource.CHECKOUT_SCOPE):
+        github_resource._gh(["pr", "view", "--json", "number"], cwd=root)
+        github_resource._gh(["auth", "status", "--json", "hosts"], cwd=root)
+
+    assert started == [["gh", "auth", "status", "--json", "hosts"]]
